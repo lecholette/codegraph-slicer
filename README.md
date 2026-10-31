@@ -57,7 +57,76 @@ Calls have opaque effects: argument and receiver reads are visible, but purity, 
 pip install git+https://github.com/lecholette/codegraph-slicer
 ```
 
-Or run `bin/codegraph-slicer` from a checkout. There are no runtime dependencies.
+Or run `bin/codegraph-slicer` from a checkout. There are no runtime dependencies. Python 3.12+.
+
+## Use it locally
+
+Index once, then query. Keep the database outside your repo or git-ignored (`*.sqlite`).
+
+```sh
+cd /path/to/your/project
+codegraph-slicer sync . --db ~/.cache/codegraph-slicer/myproject.sqlite
+export GRAPH=~/.cache/codegraph-slicer/myproject.sqlite
+
+codegraph-slicer map --db $GRAPH --max-tokens 1500 --format markdown           # ranked overview
+codegraph-slicer slice --db $GRAPH mypkg.module:func --format markdown         # one symbol in context
+codegraph-slicer flow --db $GRAPH mypkg.module:func --variable total --line 42 # where does `total` come from
+```
+
+Re-run `sync` after edits; it only reparses changed files. Queries refuse a stale index (exit 2).
+To review a branch, sync base and head into separate databases and compare them:
+
+```sh
+codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite
+codegraph-slicer sync . --db /tmp/head.sqlite
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite --format markdown
+```
+
+## Use it with Claude Code
+
+This repo ships a Claude Code skill at [`.claude/skills/codegraph-slicer/SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md).
+It tells Claude when to reach for the graph (callers, value provenance, blast radius, import cycles), how to index, and which limits to state.
+
+1. Install the CLI (above) so `codegraph-slicer` is on `PATH`.
+2. Install the skill for all your projects:
+
+   ```sh
+   mkdir -p ~/.claude/skills/codegraph-slicer
+   curl -fsSL -o ~/.claude/skills/codegraph-slicer/SKILL.md \
+     https://raw.githubusercontent.com/lecholette/codegraph-slicer/main/.claude/skills/codegraph-slicer/SKILL.md
+   ```
+
+   Or copy it into one project's `.claude/skills/codegraph-slicer/` to scope it to that repo.
+3. Optionally allow the read-only commands without prompts in `.claude/settings.json`:
+
+   ```json
+   {
+     "permissions": {
+       "allow": [
+         "Bash(codegraph-slicer sync:*)",
+         "Bash(codegraph-slicer map:*)",
+         "Bash(codegraph-slicer slice:*)",
+         "Bash(codegraph-slicer flow:*)",
+         "Bash(codegraph-slicer delta:*)"
+       ]
+     }
+   }
+   ```
+
+4. Optionally keep the index fresh at session start with a `SessionStart` hook in the same file:
+
+   ```json
+   {
+     "hooks": {
+       "SessionStart": [
+         { "hooks": [ { "type": "command",
+           "command": "mkdir -p ~/.cache/codegraph-slicer && codegraph-slicer sync \"$CLAUDE_PROJECT_DIR\" --db ~/.cache/codegraph-slicer/$(basename \"$CLAUDE_PROJECT_DIR\").sqlite >/dev/null 2>&1 || true" } ] }
+       ]
+     }
+   }
+   ```
+
+Then ask Claude things like "who calls `billing.charge`?", "where does `total` in `spend:admit` come from?" or "what does this branch break versus main?". Invoke it directly with `/codegraph-slicer`.
 
 ## Tests
 
