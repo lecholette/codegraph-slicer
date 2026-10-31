@@ -8,7 +8,8 @@ description: >-
 
 # codegraph-slicer
 
-Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecholette/codegraph-slicer`).
+Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecholette/codegraph-slicer`) and Python 3.12+.
+The indexer parses with the running interpreter, so use a Python at least as new as the indexed code.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
 ## Index first

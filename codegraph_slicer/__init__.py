@@ -1,3 +1,8 @@
+import sys
+
+if sys.version_info < (3, 12):
+    raise ImportError(f"codegraph-slicer requires Python 3.12+, found {sys.version.split()[0]}")
+
 from .ast_extractor import CodeGraphError as CodeGraphError
 from .ast_extractor import CodeGraphParseError as CodeGraphParseError
 from .ast_extractor import Edge as Edge

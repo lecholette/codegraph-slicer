@@ -57,7 +57,7 @@ Calls have opaque effects: argument and receiver reads are visible, but purity, 
 pip install git+https://github.com/lecholette/codegraph-slicer
 ```
 
-Or run `bin/codegraph-slicer` from a checkout. There are no runtime dependencies. Python 3.12+.
+Or run `bin/codegraph-slicer` from a checkout. There are no runtime dependencies. Requires Python 3.12+; tested on 3.12, 3.13 and 3.14. Indexing uses the running interpreter's parser, so run it on a Python at least as new as the code you index (3.14 syntax needs 3.14).
 
 ## Use it locally
 
