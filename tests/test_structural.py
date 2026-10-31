@@ -18,7 +18,7 @@ from codegraph_slicer import (
     RequiredAnchorOverflow,
 )
 from codegraph_slicer.cli import main
-from codegraph_slicer.slicer import serialized_tokens
+from codegraph_slicer.slicer import InvalidBudgetError
 
 
 def write(root, files):
@@ -216,6 +216,9 @@ def test_git_blob_cache_and_environment_are_isolated(tmp_path, monkeypatch):
 
 
 def test_slice_type_closure_line_anchors_and_exact_budget(tmp_path):
+    callee_signature = "def callee(" + ", ".join(
+        f"argument_{index:02d}: int" for index in range(30)
+    ) + "):\n    return 8\n\n"
     write(
         tmp_path,
         {
@@ -224,10 +227,7 @@ def test_slice_type_closure_line_anchors_and_exact_budget(tmp_path):
 class Value(Root):
     number: int
 
-def callee():
-    return 8
-
-def target(x: Value) -> Value:
+""" + callee_signature + """def target(x: Value) -> Value:
     callee()
     return x
 
@@ -252,22 +252,34 @@ def caller(x):
         ]
         assert [r["symbol"] for r in sections["upstream_callers"]] == ["m:caller"]
         assert [r["symbol"] for r in sections["target_implementations"]] == ["m:target"]
-        assert sections["downstream_dependencies"] == [
-            {"symbol": "m:callee", "text": "m.py:6-7\ndef callee():"}
-        ]
+        assert [row["symbol"] for row in sections["downstream_dependencies"]] == ["m:callee"]
+        assert sections["downstream_dependencies"][0]["text"].startswith("m.py:6-7\ndef callee(")
         assert slice_context(store, ["m.py:10"]) == result
-        assert result["tokens"] == serialized_tokens(sections)
-        required = {
-            name: rows
-            if name in {"types_and_schemas", "target_implementations"}
-            else []
+        assert result["tokens"] == (len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) + 1) // 4 + 1
+        required_sections = {
+            name: rows if name in {"types_and_schemas", "target_implementations"} else []
             for name, rows in sections.items()
         }
-        budget = serialized_tokens(required)
+        expected = {
+            "tokens": 0,
+            "sections": required_sections,
+            "omitted": {
+                "types_and_schemas": 0,
+                "upstream_callers": 1,
+                "target_implementations": 0,
+                "downstream_dependencies": 1,
+            },
+            "retrieve_details": "rerun with --max-tokens N",
+        }
+        while True:
+            budget = (len(json.dumps(expected, ensure_ascii=False, separators=(",", ":"))) + 1) // 4 + 1
+            if expected["tokens"] == budget:
+                break
+            expected["tokens"] = budget
         bounded = slice_context(store, ["m:target"], max_tokens=budget)
-        assert bounded == {"tokens": budget, "sections": required}
+        assert bounded == expected
         with pytest.raises(
-            RequiredAnchorOverflow, match=f"required definitions need {budget}"
+            RequiredAnchorOverflow, match="required definitions need .* including omission metadata"
         ):
             slice_context(store, ["m:target"], max_tokens=budget - 1)
         bodies = slice_context(store, ["m:target"], include_callee_bodies=True)
@@ -325,8 +337,9 @@ def test_map_budget_deduplication_and_unknown_seeds(tmp_path):
         store.sync_workspace(tmp_path)
         result = build_repo_map(store, seed_paths=["m.py"])
         assert [r["path"] for r in result["items"]] == ["m.py"]
-        assert result["tokens"] == serialized_tokens(result["items"])
-        assert build_repo_map(store, max_tokens=1) == {"tokens": 1, "items": []}
+        assert result["tokens"] == (len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) + 1) // 4 + 1
+        with pytest.raises(InvalidBudgetError, match="map omission metadata requires"):
+            build_repo_map(store, max_tokens=1)
         assert rank(store)["m:f"] > rank(store)["m:g"]
         assert sum(rank(store).values()) == pytest.approx(1)
         assert rank(store) == rank(store)

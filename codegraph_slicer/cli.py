@@ -10,7 +10,7 @@ import sqlite3
 from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
-from .slicer import slice_context
+from .slicer import slice_context, serialized_tokens, rendered_tokens
 from .delta import _printed_tokens, compute_delta, summarize_delta
 from .flow_query import query_flow
 
@@ -138,6 +138,12 @@ def _markdown(result):
         return _flow_markdown(result)
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
+        if "omitted" in result:
+            blocks.extend(
+                f"Omitted **{name.replace('_', ' ')}** records: {count}"
+                for name, count in result["omitted"].items()
+            )
+            blocks.append(result["retrieve_details"])
         for name, items in result["sections"].items():
             blocks.append("## " + name.replace("_", " "))
             for item in items:
@@ -153,12 +159,14 @@ def _markdown(result):
                 )
         return "\n\n".join(blocks)
     if "items" in result:
-        return _markdown(
-            {
-                "tokens": result["tokens"],
-                "sections": {"repository_map": result["items"]},
-            }
-        )
+        mapped = {
+            "tokens": result["tokens"],
+            "sections": {"repository_map": result["items"]},
+        }
+        if "omitted" in result:
+            mapped["omitted"] = result["omitted"]
+            mapped["retrieve_details"] = result["retrieve_details"]
+        return _markdown(mapped)
     return (
         "# Code graph report\n\n```json\n"
         + json.dumps(result, ensure_ascii=False, indent=2)
@@ -306,7 +314,12 @@ def main(argv=None):
                 elif args.cmd == "map":
                     if not args.snapshot:
                         store.assert_fresh()
-                    result = build_repo_map(store, args.seed, args.max_tokens)
+                    result = build_repo_map(
+                        store, args.seed, args.max_tokens,
+                        render_estimator=(
+                            lambda candidate: rendered_tokens(_markdown(candidate))
+                        ) if args.format == "markdown" else None,
+                    )
                 elif args.cmd == "flow":
                     if not args.snapshot:
                         store.assert_fresh()
@@ -319,11 +332,18 @@ def main(argv=None):
                     if not args.snapshot:
                         store.assert_fresh()
                     result = slice_context(
-                        store, args.anchors, args.max_tokens, args.include_callee_bodies
+                        store, args.anchors, args.max_tokens, args.include_callee_bodies,
+                        render_estimator=(
+                            lambda candidate: rendered_tokens(_markdown(candidate))
+                        ) if args.format == "markdown" else None,
                     )
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
+        if (args.cmd in ("map", "slice") and args.format == "markdown"
+                and rendered_tokens(rendered) > args.max_tokens):
+            from .slicer import InvalidBudgetError
+            raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
         if args.cmd == "delta":
             from .slicer import InvalidBudgetError
             if _printed_tokens(rendered) > args.max_tokens:

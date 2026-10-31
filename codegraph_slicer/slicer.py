@@ -1,4 +1,4 @@
-"""Bounded contexts. The budget counts compact JSON of the sections value."""
+"""Bounded contexts and output budget estimates."""
 
 import json
 from .ast_extractor import CodeGraphError
@@ -18,6 +18,26 @@ class RequiredAnchorOverflow(CodeGraphError):
 
 def serialized_tokens(value) -> int:
     return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"))) // 4 + 1
+
+
+def rendered_tokens(text: str) -> int:
+    """Estimate the exact printed text, including its trailing newline."""
+    return (len(text) + 1) // 4 + 1
+
+
+def _with_output_tokens(result, render_estimator=None):
+    result = dict(result)
+    result["tokens"] = 0
+    while True:
+        if render_estimator is None:
+            estimate = rendered_tokens(
+                json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            )
+        else:
+            estimate = render_estimator(result)
+        if result["tokens"] == estimate:
+            return result
+        result["tokens"] = estimate
 
 
 def _anchor(store, anchor):
@@ -42,7 +62,10 @@ def _anchor(store, anchor):
     raise AnchorNotFoundError(anchor)
 
 
-def slice_context(store, anchors, max_tokens=8000, include_callee_bodies=False):
+def slice_context(
+    store, anchors, max_tokens=8000, include_callee_bodies=False, *,
+    render_estimator=None,
+):
     if (
         not isinstance(max_tokens, int)
         or isinstance(max_tokens, bool)
@@ -103,11 +126,21 @@ def slice_context(store, anchors, max_tokens=8000, include_callee_bodies=False):
     sections["types_and_schemas"] = [
         item(row, True) for _, row in sorted(types.items())
     ]
-    required = serialized_tokens(sections)
-    if required > max_tokens:
-        raise RequiredAnchorOverflow(
-            f"required definitions need {required}, budget is {max_tokens}"
-        )
+    totals = {name: len(items) for name, items in sections.items()}
+    totals["upstream_callers"] = len(callers)
+    totals["downstream_dependencies"] = len(callees)
+
+    def result():
+        payload = {"tokens": 0, "sections": sections}
+        dropped = {
+            name: totals[name] - len(items)
+            for name, items in sections.items()
+        }
+        if any(dropped.values()):
+            payload["omitted"] = dropped
+            payload["retrieve_details"] = "rerun with --max-tokens N"
+        return _with_output_tokens(payload, render_estimator)
+
     from .pagerank import rank
 
     scores = rank(store)
@@ -117,12 +150,29 @@ def slice_context(store, anchors, max_tokens=8000, include_callee_bodies=False):
     ):
         for sid in sorted(candidates, key=lambda s: (-scores.get(s, 0), s)):
             full = name == "downstream_dependencies" and include_callee_bodies
+            sections[name].append(item(candidates[sid], full))
+    complete = result()
+    if complete["tokens"] <= max_tokens:
+        return complete
+    for name in ("upstream_callers", "downstream_dependencies"):
+        sections[name].clear()
+    required = result()
+    if required["tokens"] > max_tokens:
+        raise RequiredAnchorOverflow(
+            f"required definitions need {required['tokens']} tokens including omission metadata, budget is {max_tokens}"
+        )
+    for name, candidates in (
+        ("upstream_callers", callers),
+        ("downstream_dependencies", callees),
+    ):
+        for sid in sorted(candidates, key=lambda s: (-scores.get(s, 0), s)):
+            full = name == "downstream_dependencies" and include_callee_bodies
             candidate = item(candidates[sid], full)
             sections[name].append(candidate)
-            if serialized_tokens(sections) > max_tokens:
+            if result()["tokens"] > max_tokens:
                 sections[name].pop()
                 if full:
                     sections[name].append(item(candidates[sid], False))
-                    if serialized_tokens(sections) > max_tokens:
+                    if result()["tokens"] > max_tokens:
                         sections[name].pop()
-    return {"tokens": serialized_tokens(sections), "sections": sections}
+    return result()

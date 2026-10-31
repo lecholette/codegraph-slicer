@@ -95,8 +95,12 @@ codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
 rank from one or more indexed module names or source paths; with no seeds,
 ranking starts across the whole indexed repository. `--max-tokens` defaults to
 2000 and is a deterministic estimate, not a model tokenizer count. The map
-includes whole file skeletons in rank order while they fit; a budget too small
-for even the empty result is an error. `--format` defaults to JSON.
+includes whole file skeletons in rank order while they fit. When files are
+omitted, JSON and Markdown report the exact omitted count; emitted and omitted
+counts reconcile to the complete map. Increase `--max-tokens` to retrieve more.
+The budget includes complete
+printed output and its trailing newline in either format. A budget too small
+for required map metadata is an error. `--format` defaults to JSON.
 
 ```sh
 codegraph-slicer map --db /tmp/project.sqlite --seed package.module --max-tokens 1800
@@ -131,14 +135,16 @@ controls module names: indexing a project root containing `acme/run/core.py`
 gives `acme.run.core`, while indexing `acme/run` itself gives `core`. Beyond
 the pure `src/` layout (see `sync`), the tool does not infer package roots.
 
-`--max-tokens` defaults to 8000. It estimates compact JSON size as
-`len(compact_json) // 4 + 1`, counting Unicode characters directly. For a
-slice, the estimate covers the complete `sections` value: keys, IDs, locations,
-escaped source, and punctuation all count. Result metadata and Markdown
-rendering do not. Required anchors and required type definitions must fit or
-the command refuses the request; optional neighbors are added in rank order
-while they fit. `--include-callee-bodies` adds optional callee implementations
-instead of only their signatures. `--format` defaults to JSON.
+`--max-tokens` defaults to 8000. It estimates the complete printed output as
+`len(printed_output) // 4 + 1`, counting Unicode characters and the trailing
+newline. JSON and Markdown each include their complete output, including
+metadata. Required anchors and required type definitions must fit, as must
+exact omission counts when optional records are dropped, or the command
+refuses without printing a partial report. Increase `--max-tokens` to retrieve
+more optional records. `--include-callee-bodies` adds optional callee
+implementations instead of only their signatures; if a body does not fit, its
+signature may still be returned and is counted as an emitted record.
+`--format` defaults to JSON.
 
 When several anchors share required type definitions, those required types are
 kept in the required section and are not repeated as optional callee entries.

@@ -1,7 +1,7 @@
 """Deterministic personalized PageRank and one skeleton per indexed file."""
 
 from .ast_extractor import CodeGraphError
-from .slicer import InvalidBudgetError, serialized_tokens
+from .slicer import InvalidBudgetError, _with_output_tokens
 
 
 class UnknownSeedError(CodeGraphError):
@@ -44,7 +44,10 @@ def rank(store, seeds=(), alpha=0.85, iterations=40, *, seed_paths=(), seed_modu
     return dict(sorted(scores.items(), key=lambda pair: (-pair[1], pair[0])))
 
 
-def build_repo_map(store, seeds=(), max_tokens=2000, *, seed_paths=(), seed_modules=()):
+def build_repo_map(
+    store, seeds=(), max_tokens=2000, *, seed_paths=(), seed_modules=(),
+    render_estimator=None,
+):
     if (
         not isinstance(max_tokens, int)
         or isinstance(max_tokens, bool)
@@ -61,17 +64,34 @@ def build_repo_map(store, seeds=(), max_tokens=2000, *, seed_paths=(), seed_modu
     for sid, score in scores.items():
         file_scores[symbols[sid]["file_path"]] += score
     output = []
-    if serialized_tokens(output) > max_tokens:
-        raise InvalidBudgetError("budget cannot contain an empty map")
-    for path in sorted(file_scores, key=lambda p: (-file_scores[p], p)):
-        row = by_path[path]
-        output.append(
-            {
-                "symbol": row["module"] + ":",
-                "path": path,
-                "text": f"{path}:1\n{row['skeleton']}",
-            }
-        )
-        if serialized_tokens(output) > max_tokens:
+    total_files = len(file_scores)
+
+    def result(items):
+        payload = {"tokens": 0, "items": items}
+        omitted = total_files - len(items)
+        if omitted:
+            payload["omitted"] = {"files": omitted}
+            payload["retrieve_details"] = "rerun with --max-tokens N"
+        return _with_output_tokens(payload, render_estimator)
+
+    complete_items = [
+        {
+            "symbol": by_path[path]["module"] + ":",
+            "path": path,
+            "text": f"{path}:1\n{by_path[path]['skeleton']}",
+        }
+        for path in sorted(file_scores, key=lambda p: (-file_scores[p], p))
+    ]
+    complete = result(complete_items)
+    if complete["tokens"] <= max_tokens:
+        return complete
+    for item in complete_items:
+        output.append(item)
+        if result(output)["tokens"] > max_tokens:
             output.pop()
-    return {"tokens": serialized_tokens(output), "items": output}
+    final = result(output)
+    if final["tokens"] > max_tokens:
+        raise InvalidBudgetError(
+            f"map omission metadata requires {final['tokens']} tokens; budget is {max_tokens}"
+        )
+    return final
