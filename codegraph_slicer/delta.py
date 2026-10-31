@@ -204,3 +204,117 @@ def compute_delta(
         "test_coverage": coverage,
         "test_gap_note": "Static TESTS reachability and changed/selected source only; no execution or behavioral coverage is claimed.",
     }
+
+
+def summarize_delta(
+    result, max_tokens=8000, *, full=False, selected_tests=False, render_estimator=None
+):
+    """Render a stable, priority-ranked, compact delta within its JSON budget."""
+    from .slicer import InvalidBudgetError, serialized_tokens
+
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise InvalidBudgetError("max_tokens must be a positive integer")
+    kinds = (
+        "boundary_violations", "new_cycles", "complexity_drift", "added_edges",
+        "removed_edges", "modified_symbols", "affected_entrypoints",
+        "untested_modified_symbols", "test_coverage",
+    )
+    counts = {kind: len(result[kind]) for kind in kinds}
+    gaps = result["test_coverage"]
+    statuses = []
+    for item in gaps:
+        statuses.append(
+            "updated_or_selected_evidence" if item["updated_or_selected_tests"]
+            else "reachable_but_unselected" if item["reachable_tests"]
+            else "no_static_test_reaches"
+        )
+    imports = [
+        {"change": change, "source": edge[0], "target": edge[1], "line": edge[3]}
+        for change, edges in (("added", result["added_edges"]), ("removed", result["removed_edges"]))
+        for edge in edges if edge[2] == "IMPORTS"
+    ]
+    counts["import_changes"] = len(imports)
+    summary = {
+        "counts": counts,
+        "test_selection": "selected" if selected_tests else "none_selected",
+        "test_selection_note": (
+            "No test was selected; an unobserved requested path is refused as unknown."
+            if not selected_tests else "Requested test paths were resolved in the head snapshot."
+        ),
+        "test_gap_status_counts": {name: statuses.count(name) for name in (
+            "updated_or_selected_evidence", "reachable_but_unselected", "no_static_test_reaches"
+        )},
+        "test_gap_note": result["test_gap_note"],
+        "retrieve_details": "rerun with --full --max-tokens N",
+    }
+    if full:
+        payload = dict(result)
+        payload["omitted"] = {**{kind: 0 for kind in kinds}, "import_changes": 0}
+    else:
+        payload = {"summary": summary, "omitted": dict(counts)}
+        payload["omitted"]["added_edges"] = counts["added_edges"]
+        payload["omitted"]["removed_edges"] = counts["removed_edges"]
+        priority = (
+            ("boundary_violations", result["boundary_violations"]),
+            ("new_cycles", result["new_cycles"]),
+            ("complexity_drift", sorted(
+                (item for item in result["complexity_drift"] if item["threshold_exceeded"]),
+                key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
+            )),
+            ("import_changes", imports),
+            ("affected_entrypoints", result["affected_entrypoints"]),
+            ("untested_modified_symbols", result["untested_modified_symbols"]),
+            ("test_coverage", [
+                {**item, "status": status}
+                for item, status in zip(result["test_coverage"], statuses)
+            ]),
+            ("complexity_drift", sorted(
+                (item for item in result["complexity_drift"] if not item["threshold_exceeded"]),
+                key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
+            )),
+            ("modified_symbols", result["modified_symbols"]),
+        )
+        # Edge lists are intentionally not emitted in summary mode. Their exact
+        # counts remain in summary/omitted and are retrievable with --full.
+        payload["omitted"]["import_changes"] = len(imports)
+        if render_estimator is not None and render_estimator(
+            _with_serialized_tokens(payload)
+        ) > max_tokens:
+            raise InvalidBudgetError("delta summary metadata exceeds rendered Markdown budget")
+        for kind, values in priority:
+            key = kind
+            for value in values:
+                payload.setdefault(key, []).append(value)
+                payload["omitted"][kind] -= 1
+                candidate = _with_serialized_tokens(payload)
+                if serialized_tokens(candidate) > max_tokens or (
+                    render_estimator is not None and render_estimator(candidate) > max_tokens
+                ):
+                    payload[key].pop()
+                    if not payload[key]:
+                        del payload[key]
+                    payload["omitted"][kind] += 1
+                    continue
+        payload["omitted"]["import_changes"] = len(imports) - len(payload.get("import_changes", []))
+    payload["serialized_tokens"] = serialized_tokens(_with_serialized_tokens(payload))
+    if payload["serialized_tokens"] > max_tokens:
+        raise InvalidBudgetError(
+            f"delta summary metadata requires {payload['serialized_tokens']} tokens; budget is {max_tokens}"
+        )
+    if render_estimator is not None and render_estimator(payload) > max_tokens:
+        message = "complete delta payload exceeds rendered Markdown budget" if full else "delta summary metadata exceeds rendered Markdown budget"
+        raise InvalidBudgetError(message)
+    return payload
+
+
+def _with_serialized_tokens(payload):
+    """Return a copy with the compact-JSON estimate including its own field."""
+    from .slicer import serialized_tokens
+
+    result = dict(payload)
+    result["serialized_tokens"] = 0
+    while True:
+        estimate = serialized_tokens(result)
+        if result["serialized_tokens"] == estimate:
+            return result
+        result["serialized_tokens"] = estimate
