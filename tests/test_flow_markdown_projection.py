@@ -124,9 +124,71 @@ def test_markdown_prints_matching_source_hash_once(tmp_path, capsys):
 
 
 def test_markdown_reports_its_own_size(tmp_path, capsys):
-    markdown = _run(_db(tmp_path), capsys, "--format", "markdown")
-    stated = int(re.search(r"this view ≈ (\d+) tokens", markdown).group(1))
-    assert stated == len(markdown[:-1]) // 4 + 1
+    for padding in range(4):
+        case_dir = tmp_path / str(padding)
+        case_dir.mkdir()
+        db = _synced_source_db(
+            case_dir,
+            f'def render():\n    value = "{"x" * (3 + padding)}"\n    return value\n',
+        )
+        assert main(["flow", "render.py:render", "--db", str(db), "--format", "markdown"]) == 0
+        markdown = capsys.readouterr().out
+        stated = int(re.search(r"this view ≈ (\d+) tokens", markdown).group(1))
+        assert stated == len(markdown) // 4 + 1
+
+
+@pytest.mark.parametrize(
+    ("separator", "separator_text", "line_ending"),
+    [
+        ("LF", "\n", "\n"),
+        ("CR", "\r", "\n"),
+        ("VT", "\v", "\n"),
+        ("FF", "\f", "\n"),
+        ("NEL", "\x85", "\n"),
+        ("LINE SEPARATOR", "\u2028", "\n"),
+        ("PARAGRAPH SEPARATOR", "\u2029", "\n"),
+        ("CRLF", "\r\n", "\r\n"),
+    ],
+)
+def test_cli_markdown_splits_only_lf_and_preserves_other_separators(
+    tmp_path, capsys, separator, separator_text, line_ending
+):
+    source = (
+        f'def render():{line_ending}'
+        f'    value = ({line_ending}'
+        f'        """left{separator_text}right"""{line_ending}'
+        f'    ){line_ending}'
+        f'    return value{line_ending}'
+    )
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "render.py").write_bytes(source.encode("utf-8"))
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(root)
+
+    assert main(["flow", "render.py:render", "--db", str(db), "--format", "markdown"]) == 0
+    markdown = capsys.readouterr().out
+    middle = f'          """left{separator_text}right"""'
+    if separator in ("LF", "CRLF"):
+        middle = f'          """left{separator_text}  right"""'
+    expected = (
+        "  ```\n  value = ("
+        + line_ending
+        + middle
+        + line_ending
+        + "      )\n  ```"
+    )
+    assert expected in markdown
+
+
+def test_cli_markdown_keeps_bare_cr_in_inline_code(tmp_path, capsys):
+    db = _synced_source_db(
+        tmp_path, 'def render():\n    value = """left\rright"""\n    return value\n'
+    )
+    assert main(["flow", "render.py:render", "--db", str(db), "--format", "markdown"]) == 0
+    markdown = capsys.readouterr().out
+    assert ': `value = """left\rright"""`' in markdown
 
 
 def test_cli_markdown_uses_fence_longer_than_docstring_backtick_runs(tmp_path, capsys):
