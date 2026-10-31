@@ -209,8 +209,8 @@ def compute_delta(
 def summarize_delta(
     result, max_tokens=8000, *, full=False, selected_tests=False, render_estimator=None
 ):
-    """Render a stable, priority-ranked, compact delta within its JSON budget."""
-    from .slicer import InvalidBudgetError, serialized_tokens
+    """Render a stable, priority-ranked delta within its selected output budget."""
+    from .slicer import InvalidBudgetError
 
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise InvalidBudgetError("max_tokens must be a positive integer")
@@ -251,6 +251,8 @@ def summarize_delta(
         payload = dict(result)
         payload["import_changes"] = imports
         payload["omitted"] = {**{kind: 0 for kind in kinds}, "import_changes": 0}
+        payload["test_selection"] = summary["test_selection"]
+        payload["test_selection_note"] = summary["test_selection_note"]
     else:
         payload = {"summary": summary, "omitted": dict(counts)}
         payload["omitted"]["added_edges"] = counts["added_edges"]
@@ -288,7 +290,7 @@ def summarize_delta(
                 payload.setdefault(key, []).append(value)
                 payload["omitted"][kind] -= 1
                 candidate = _with_serialized_tokens(payload)
-                if serialized_tokens(candidate) > max_tokens or (
+                if candidate["serialized_tokens"] > max_tokens or (
                     render_estimator is not None and render_estimator(candidate) > max_tokens
                 ):
                     payload[key].pop()
@@ -297,7 +299,7 @@ def summarize_delta(
                     payload["omitted"][kind] += 1
                     continue
         payload["omitted"]["import_changes"] = len(imports) - len(payload.get("import_changes", []))
-    payload["serialized_tokens"] = serialized_tokens(_with_serialized_tokens(payload))
+    payload = _with_serialized_tokens(payload)
     if payload["serialized_tokens"] > max_tokens:
         raise InvalidBudgetError(
             f"delta summary metadata requires {payload['serialized_tokens']} tokens; budget is {max_tokens}"
@@ -309,13 +311,18 @@ def summarize_delta(
 
 
 def _with_serialized_tokens(payload):
-    """Return a copy with the compact-JSON estimate including its own field."""
-    from .slicer import serialized_tokens
+    """Return a copy with the printed compact-JSON estimate including its field."""
+    import json
 
     result = dict(payload)
     result["serialized_tokens"] = 0
     while True:
-        estimate = serialized_tokens(result)
+        estimate = _printed_tokens(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         if result["serialized_tokens"] == estimate:
             return result
         result["serialized_tokens"] = estimate
+
+
+def _printed_tokens(text):
+    """Estimate tokens for text printed with its terminating newline."""
+    return len(text + "\n") // 4 + 1

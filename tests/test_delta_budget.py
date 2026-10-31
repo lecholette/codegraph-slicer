@@ -5,7 +5,6 @@ import pytest
 
 from codegraph_slicer import GraphStore
 from codegraph_slicer.cli import main
-from codegraph_slicer.slicer import serialized_tokens
 
 
 def _snapshot(root, source, test_source=None):
@@ -52,14 +51,15 @@ def _delta(tmp_path, capsys, base_source, head_source, *options, test_source=Non
 def test_delta_summary_has_prioritized_counts_and_exact_omissions(tmp_path, capsys):
     base = "def target():\n    return 1\n\ndef caller():\n    return target()\n"
     head = "def target():\n    return 2\n\ndef caller():\n    return target()\n"
-    payload = json.loads(_delta(tmp_path, capsys, base, head, "--max-tokens", "1200"))
+    output = _delta(tmp_path, capsys, base, head, "--max-tokens", "1200")
+    payload = json.loads(output)
 
     assert payload["summary"]["counts"]["modified_symbols"] == 2
     assert payload["summary"]["counts"]["added_edges"] == 0
     assert payload["omitted"]["modified_symbols"] == 0
     assert payload["omitted"]["test_coverage"] == 0
     assert "added_edges" not in payload or payload["added_edges"] == []
-    assert payload["serialized_tokens"] == serialized_tokens(payload)
+    assert payload["serialized_tokens"] == _printed_token_estimate(output)
 
 
 def test_delta_full_preserves_raw_details_and_refuses_over_budget(tmp_path, capsys):
@@ -116,7 +116,8 @@ def test_delta_budget_omissions_are_exact_and_boundary_is_prioritized(tmp_path, 
     out = main(["delta", "--base-db", str(base_db), "--head-db", str(head_db),
                 "--forbid-import", "pkg", "pkg.secret", "--max-tokens", "500"])
     assert out == 0
-    payload = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr().out
+    payload = json.loads(output)
     assert payload["summary"]["counts"]["modified_symbols"] == 15
     assert payload["omitted"]["modified_symbols"] == 14
     assert len(payload["modified_symbols"]) == 1
@@ -128,7 +129,7 @@ def test_delta_budget_omissions_are_exact_and_boundary_is_prioritized(tmp_path, 
     assert payload["omitted"]["added_edges"] == payload["summary"]["counts"]["added_edges"]
     assert payload["summary"]["retrieve_details"] == "rerun with --full --max-tokens N"
     assert payload["serialized_tokens"] <= 500
-    assert payload["serialized_tokens"] == serialized_tokens(payload)
+    assert payload["serialized_tokens"] == _printed_token_estimate(output)
 
 
 def test_delta_markdown_is_readable_and_budgeted(tmp_path, capsys):
@@ -177,7 +178,7 @@ def test_delta_markdown_truncates_to_rendered_budget(tmp_path, capsys):
                  "--format", "markdown", "--max-tokens", "500"]) == 0
     markdown = capsys.readouterr().out
     assert markdown.startswith("# Static delta report")
-    assert serialized_tokens(markdown) <= 500
+    assert _printed_token_estimate(markdown) == 473
     assert "Omitted **modified symbols** records: 17" in markdown
     assert "Omitted **test coverage** records: 14" in markdown
 
@@ -282,7 +283,10 @@ def test_delta_full_emits_import_changes_and_accounts_for_every_kind(tmp_path, c
     for kind in ("added_edges", "removed_edges", "complexity_drift", "boundary_violations",
                  "modified_symbols", "untested_modified_symbols", "affected_entrypoints",
                  "new_cycles", "test_coverage", "import_changes"):
-        assert _markdown_section_count(markdown, kind.replace("_", " ").title()) == totals[kind]
+        title = kind.replace("_", " ").title()
+        if kind == "untested_modified_symbols":
+            title += " (none selected)"
+        assert _markdown_section_count(markdown, title) == totals[kind]
     assert "Omitted **import changes** records:" not in markdown
 
 
@@ -365,7 +369,7 @@ def test_delta_markdown_printed_text_respects_budget_and_hides_zero_omissions(
                  "--forbid-import", "pkg.a", "pkg.b", "--format", "markdown",
                  "--max-tokens", str(budget)]) == 0
     markdown = capsys.readouterr().out
-    assert serialized_tokens(markdown) <= budget
+    assert _printed_token_estimate(markdown) <= budget
     assert "Omitted **removed edges** records: 0" not in markdown
 
 
@@ -383,3 +387,94 @@ def test_delta_markdown_accounts_each_kind_and_names_empty_untested_selection(tm
     markdown = capsys.readouterr().out
     assert "**untested modified symbols (none selected):** 0" in markdown
     assert "## Untested Modified Symbols" not in markdown
+
+
+def _printed_token_estimate(text):
+    return len(text) // 4 + 1
+
+
+def test_delta_json_budget_counts_exact_printed_stdout_with_newline(tmp_path, capsys):
+    for value in range(20):
+        name = f"target_{value}"
+        base = _snapshot_files(tmp_path / f"json-base-{value}", {
+            "pkg/a.py": f"def {name}():\n    return 1\n",
+            "pkg/b.py": "def other():\n    return 2\n",
+        })
+        head = _snapshot_files(tmp_path / f"json-head-{value}", {
+            "pkg/a.py": f"def {name}():\n    return {value + 3}\n",
+            "pkg/b.py": f"def other():\n    return {value + 4}\n",
+        })
+        args = ["delta", "--base-db", str(base), "--head-db", str(head), "--full"]
+        assert main([*args, "--max-tokens", "100000"]) == 0
+        stdout = capsys.readouterr().out
+        printed_tokens = _printed_token_estimate(stdout)
+        payload = json.loads(stdout)
+        assert payload["serialized_tokens"] == printed_tokens
+
+        assert main([*args, "--max-tokens", str(printed_tokens)]) == 0
+        exact = capsys.readouterr().out
+        assert exact == stdout
+        assert _printed_token_estimate(exact) == printed_tokens
+        with pytest.raises(SystemExit, match="2"):
+            main([*args, "--max-tokens", str(printed_tokens - 1)])
+        assert "budget" in capsys.readouterr().err.lower()
+
+
+def test_delta_markdown_budget_counts_exact_printed_stdout(tmp_path, capsys):
+    base = _snapshot_files(tmp_path / "md-budget-base", {
+        "pkg/a.py": "def a():\n    return 1\n",
+        "pkg/b.py": "from pkg.a import a\n\ndef b():\n    return 1\n",
+        "pkg/c.py": "def c():\n    return 1\n",
+        "tests/test_a.py": "from pkg.a import a\ndef test_a():\n    assert a() == 1\n",
+    })
+    head = _snapshot_files(tmp_path / "md-budget-head", {
+        "pkg/a.py": "from pkg.b import b\n\ndef a():\n    return 2\n",
+        "pkg/b.py": "from pkg.c import c\n\ndef b():\n    return 2\n",
+        "pkg/c.py": "from pkg.a import a\n\ndef c():\n    return 2\n",
+        "tests/test_a.py": "from pkg.a import a\ndef test_a():\n    assert a() == 1\n",
+    })
+    assert main(["delta", "--base-db", str(base), "--head-db", str(head),
+                 "--forbid-import", "pkg.a", "pkg.b",
+                 "--format", "markdown", "--max-tokens", "500"]) == 0
+    markdown = capsys.readouterr().out
+    assert _printed_token_estimate(markdown) == 497
+    assert "Omitted **complexity drift** records: 2" in markdown
+    assert "Omitted **added edges** records: 6" in markdown
+    assert "Omitted **removed edges** records: 2" in markdown
+    assert "Omitted **modified symbols** records: 6" in markdown
+    assert "Omitted **import changes** records: 7" in markdown
+
+
+def test_delta_full_markdown_carries_observed_test_selection_state(tmp_path, capsys):
+    base = _snapshot_files(tmp_path / "full-md-base", {
+        "pkg/mod.py": "def target():\n    return 1\n\ndef isolated():\n    return 1\n",
+        "tests/test_mod.py": "from pkg.mod import target\ndef test_target():\n    assert target() == 2\n",
+    })
+    head = _snapshot_files(tmp_path / "full-md-head", {
+        "pkg/mod.py": "def target():\n    return 2\n\ndef isolated():\n    return 2\n",
+        "tests/test_mod.py": "from pkg.mod import target\ndef test_target():\n    assert target() == 2\n",
+    })
+    prefix = ["delta", "--base-db", str(base), "--head-db", str(head),
+              "--full", "--format", "markdown", "--max-tokens", "1000000"]
+    assert main(prefix) == 0
+    unselected = capsys.readouterr().out
+    assert "## Untested Modified Symbols (none selected)" in unselected
+    assert "Test selection requested: `none_selected`" in unselected
+    assert main([*prefix[:], "--format", "json"]) == 0
+    unselected_payload = json.loads(capsys.readouterr().out)
+    assert unselected_payload["test_selection"] == "none_selected"
+    assert unselected_payload["test_selection_note"] == (
+        "No test was selected; an unobserved requested path is refused as unknown."
+    )
+
+    assert main([*prefix, "--selected-test", "tests.test_mod:test_target"]) == 0
+    selected = capsys.readouterr().out
+    assert "Test selection requested: `selected`" in selected
+    assert "## Untested Modified Symbols\n" in selected
+    assert "## Untested Modified Symbols (none selected)" not in selected
+    assert main([*prefix, "--selected-test", "tests.test_mod:test_target", "--format", "json"]) == 0
+    selected_payload = json.loads(capsys.readouterr().out)
+    assert selected_payload["test_selection"] == "selected"
+    assert selected_payload["test_selection_note"] == (
+        "Requested test paths were resolved in the head snapshot."
+    )

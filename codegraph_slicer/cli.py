@@ -10,8 +10,8 @@ import sqlite3
 from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
-from .slicer import slice_context, serialized_tokens
-from .delta import compute_delta, summarize_delta
+from .slicer import slice_context
+from .delta import _printed_tokens, compute_delta, summarize_delta
 from .flow_query import query_flow
 
 
@@ -103,6 +103,11 @@ def _markdown(result):
                 + result["summary"]["test_gap_note"] + "\n\n"
                 + result["summary"]["retrieve_details"]
             )
+        elif "test_selection" in result:
+            blocks.append(
+                f"Test selection requested: `{result['test_selection']}`. "
+                + result["test_selection_note"]
+            )
         for kind, count in result.get("omitted", {}).items():
             if count:
                 blocks.append(f"Omitted **{kind.replace('_', ' ')}** records: {count}")
@@ -121,7 +126,10 @@ def _markdown(result):
                     else:
                         bullets.append("- " + str(item))
                 title = kind.replace("_", " ").title()
-                if kind == "untested_modified_symbols" and "summary" in result and result["summary"]["test_selection"] == "none_selected":
+                selection = result.get("summary", {}).get(
+                    "test_selection", result.get("test_selection")
+                )
+                if kind == "untested_modified_symbols" and selection == "none_selected":
                     title += " (none selected)"
                 blocks.append("## " + title + "\n\n" + "\n".join(bullets))
         blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
@@ -284,7 +292,7 @@ def main(argv=None):
                     result, args.max_tokens, full=args.full,
                     selected_tests=bool(args.selected_test),
                     render_estimator=(
-                        lambda candidate: serialized_tokens(_markdown(candidate) + "\n")
+                        lambda candidate: _printed_tokens(_markdown(candidate))
                     ) if args.format == "markdown" else None,
                 )
             else:
@@ -316,10 +324,11 @@ def main(argv=None):
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
-        if args.cmd == "delta" and args.format == "markdown":
+        if args.cmd == "delta":
             from .slicer import InvalidBudgetError
-            if serialized_tokens(rendered + "\n") > args.max_tokens:
-                raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
+            if _printed_tokens(rendered) > args.max_tokens:
+                label = "rendered Markdown" if args.format == "markdown" else "printed JSON"
+                raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
         print(rendered)
         return 0
     except (CodeGraphError, OSError, sqlite3.Error) as exc:
