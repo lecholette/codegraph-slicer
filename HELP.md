@@ -251,25 +251,59 @@ depend on the indexed source revision: use the actual path/qualname and line in
 your snapshot.
 
 The `python-local-cpg-v1` profile is statement-granularity and
-intraprocedural. It supports ordinary synchronous functions with assignments,
-annotated/augmented assignments, expressions, if/elif/else, for/while and loop
-else, break/continue, return/raise, assert/pass, and eagerly evaluated named
-expressions. Walrus expressions inside short-circuit or conditional expressions
-are refused because the definition may not execute. Potentially overlapping
-chained attribute/subscript targets, assignment writes that also rebind their
-receiver, and augmented memory targets that use a walrus-bound receiver are
-refused with a source location. Rebinding a receiver or subpath invalidates
-older direct-path facts where modeled; aliases remain unresolved.
+intraprocedural. These additions retain `python-local-cpg-v1`: previously
+accepted functions retain their graph output, apart from engine/Python identity.
+It supports synchronous and async functions (without explicit
+await), assignments, annotated/augmented assignments, expressions, if/elif/else,
+for/while and loop else, break/continue, return/raise, assert/pass, and eagerly
+evaluated named expressions. Walrus expressions inside short-circuit or
+conditional expressions are refused because the definition may not execute.
+Potentially overlapping chained attribute/subscript targets, assignment writes
+that also rebind their receiver, and augmented memory targets that use a
+walrus-bound receiver are refused with a source location. Rebinding a receiver
+or subpath invalidates older direct-path facts where modeled; aliases remain
+unresolved.
+
+`try`/`except`/`else`/`finally`, `except*`, `with`, and `async with` have
+conservative statement-level exceptional transfers. Every protected statement,
+including nested statements, may raise before or after its writes. This retains
+both pre-store and post-store reaching definitions, including partial bindings;
+it does not infer exception types or expression-level failure points. Only normal
+try-body completion enters `else`. Finalizers run on normal, exceptional,
+return, break, and continue paths, with separate copies for pending completions;
+a finalizer's abrupt completion replaces the pending completion. Handler aliases
+are bound on handler entry and deleted on every exit, including implicit errors.
+`except*` models possible matched-handler subsets in source order, preserving
+effects of earlier handlers even when they raise; unmatched or pending failures
+may propagate. Exception matching is an overapproximation.
+
+Context expressions evaluate left to right before their `as` bindings and body.
+Acquired managers exit in reverse order on all completions; failed acquisition
+does not exit that manager, but still unwinds earlier acquisitions. Each
+`__exit__`/`__aexit__` may raise. On exceptional completion it may also suppress
+the error and continue after the context statement, skipping the remaining suite.
+Suppression never directly converts return, break, or continue into normal flow.
+These are conservative possibilities, not inferred manager behavior or runtime
+execution; implicit async protocol operations are modeled without executing them.
+
+List/set/dict comprehensions and generator expressions collapse their reads into
+the enclosing statement. The first iterable reads the outer scope. All target
+names are local throughout the implicit scope after that first iterable, and
+neither targets nor access paths rooted in them leak into outer definitions or
+reads. Generator expressions are accepted only when deferred expressions have
+no outer-name captures (for example, `(item for item in items)`); deferred outer
+captures are refused because later assignments could affect them. Async
+comprehensions, comprehension walrus expressions, and targets other than names
+or name destructuring are refused.
 
 Boolean and other statement-level expression reads are conservative, not
 expression-path precise. Calls have opaque effects: arguments and receivers
-are visible, but purity, return values, implicit exception edges, and alias
-side effects are not inferred. Direct attribute/subscript writes are recorded;
-dynamic indexes, wildcard paths, and aliasing do not prove memory paths
-disjoint. Unsupported constructs (including `try`/`except`/`finally`, `with`,
-async/await, yield, comprehensions, lambdas, nested definitions, imports,
-global/nonlocal mutation, and deletion) refuse with a specific source location
-rather than disappear from the graph. Implicit exception flow is not modeled.
+are visible, but purity, return values, and alias side effects are not inferred.
+Direct attribute/subscript writes are recorded; dynamic indexes, wildcard paths,
+and aliasing do not prove memory paths disjoint. Explicit await, yield, lambdas,
+nested definitions, imports, global/nonlocal mutation, and deletion refuse with a
+specific source location. Functions without structured exception/context syntax
+retain the original graph behavior, which has no implicit exceptional transfers.
 
 `--max-tokens` defaults to 8000. It estimates the complete compact-JSON flow
 report as `len(compact_json) // 4 + 1`; this includes identity and graph data,

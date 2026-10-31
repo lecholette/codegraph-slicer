@@ -46,7 +46,7 @@ This is static syntax analysis, not runtime execution. Bounded local CFG and def
 
 ## Bounded local flow
 
-`flow` builds an intraprocedural statement graph on demand for one indexed function or method. It provides local CFG, reaching-definition and conservative mutation information (profile `python-local-cpg-v1`); it does not claim whole-program CPG coverage, runtime dispatch, alias precision, or execution behavior. Supported statements and explicit refusal cases are listed in [HELP.md](HELP.md).
+`flow` builds an intraprocedural statement graph on demand for one indexed function or method. It provides local CFG, reaching-definition and conservative mutation information (profile `python-local-cpg-v1`); it does not claim whole-program CPG coverage, runtime dispatch, alias precision, or execution behavior. The new supported syntax is additive and retains `python-local-cpg-v1`; previously accepted graphs remain unchanged apart from engine/Python identity. Supported statements and explicit refusal cases are listed in [HELP.md](HELP.md).
 
 ```sh
 codegraph-slicer sync examples --db /tmp/example.sqlite
@@ -60,7 +60,7 @@ The source is the full module text cached in the SQLite snapshot. The report inc
 
 The local profile supports assignments, annotated and augmented assignments, expressions, if/elif/else, for/while and their `else` blocks, break/continue, return/raise, assert/pass, and eagerly evaluated named expressions. Walrus expressions under short-circuit or conditional expressions are refused because their execution is conditional. Potentially overlapping chained attribute/subscript targets, writes whose receiver is rebound in the same assignment, and augmented memory targets that depend on a receiver walrus are refused rather than treated as independent writes. Rebinding a receiver or subpath invalidates older direct-path facts where modeled; aliases remain unresolved, so access paths are not proof of disjoint memory.
 
-Calls have opaque effects: argument and receiver reads are visible, but purity, return values, implicit exceptions, and alias side effects are not inferred. Statement-level expression reads are conservative. Attribute/subscript writes record the explicit path; dynamic indexes and aliases cannot establish disjoint memory. Unsupported syntax (including exception handlers, context managers, async/await, generators, comprehensions, lambdas, nested definitions, imports and global/nonlocal mutation) is refused with a location. Implicit exception edges are not modeled. This flow profile is bounded local evidence, not proof that unobserved effects are absent.
+Calls have opaque effects: argument and receiver reads are visible, while purity, return values, and alias side effects are not inferred. Statement-level expression reads are conservative. Structured exception handlers/finalizers and synchronous/async context managers model conservative pre/post-write errors, cleanup and possible suppression. Comprehensions preserve their implicit target scope; generators with deferred outer captures refuse. Explicit await, yield, lambdas, nested definitions, imports and global/nonlocal mutation still refuse with a location. See [HELP.md](HELP.md) for the exception, suppression, and comprehension contracts. This flow profile is bounded local evidence, not proof that unobserved effects are absent.
 
 ## Install
 

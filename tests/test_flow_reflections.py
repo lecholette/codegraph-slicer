@@ -255,6 +255,16 @@ def test_line_selection_requires_positive_nonbool_integer(line):
         slice_flow(graph, line=line)
 
 
-def test_async_selected_function_uses_unsupported_error_with_location():
-    with pytest.raises(UnsupportedFlowError, match=r"AsyncFunctionDef.*round3.py:1"):
-        analyze_flow("async def f():\n    return 1\n", "f", path="round3.py")
+def test_async_selected_function_refuses_await_via_synced_cli(tmp_path, capsys):
+    from codegraph_slicer import GraphStore
+    from codegraph_slicer.cli import main
+
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "sample.py").write_text("async def f():\n    return await get_value()\n")
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(root)
+    with pytest.raises(SystemExit, match="2"):
+        main(["flow", "sample.py:f", "--db", str(db), "--snapshot"])
+    assert "unsupported Await in sample.py:2" in capsys.readouterr().err
