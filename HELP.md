@@ -1,0 +1,322 @@
+# codegraph-slicer help
+
+`codegraph-slicer` indexes Python source into a SQLite snapshot, then builds a
+ranked repository map, extracts bounded context around symbols, compares two
+snapshots, or builds bounded local control/data-flow slices. It is static syntax
+analysis: it does not import or execute indexed code, execute tests, or infer
+runtime behavior.
+
+After `pip install`, the executable can be called by name from any working
+directory. Every query uses an existing database. The first
+example creates one; the later commands reuse that same index:
+
+```sh
+codegraph-slicer sync /path/to/project --db /tmp/project.sqlite
+codegraph-slicer map --db /tmp/project.sqlite
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run
+codegraph-slicer flow package.module:run --db /tmp/project.sqlite --variable total
+```
+
+To try it on the bundled example from a checkout:
+
+```sh
+codegraph-slicer sync examples --db /tmp/example.sqlite
+codegraph-slicer map --db /tmp/example.sqlite --max-tokens 500
+codegraph-slicer slice --db /tmp/example.sqlite spend:admit
+```
+
+`--help` on the command or a subcommand gives a short form; `README.md`
+describes the index model and known static-analysis limits.
+
+## Workflow
+
+1. Run `sync` once to create the snapshot database.
+2. Run `map` to see ranked file skeletons, or `slice` for context around one or
+   more anchors.
+3. To review changes, sync base and head source into separate databases and
+   run `delta --base-db BASE --head-db HEAD`.
+4. Inspect the report, then run any tests separately. `delta` only reports
+   static test-selection gaps; `--selected-test` does not execute or certify a
+   test.
+
+## Commands
+
+### `sync`
+
+```text
+codegraph-slicer sync ROOT --db DATABASE [--revision REVISION]
+```
+
+`ROOT` is a workspace directory or Git repository. Without `--revision`, sync
+indexes the workspace's current `.py` files. With `--revision`, it reads the
+specified Git commit tree instead. `DATABASE` is created or updated. A database
+holds one selected source root/snapshot: syncing another source replaces the
+current snapshot in that database. Keep base and head in separate database
+files when comparing them. Sync is the only command that writes a database.
+
+The parser cache is keyed by the actual `ast_extractor.py` and `store.py` bytes
+plus the Python major/minor version. Missing or stale identity triggers a full
+parse even if source blobs are unchanged; another sync with the same identity
+and unchanged source takes the normal cache path. Sync takes an immediate
+SQLite transaction before reading old hashes, parsing, and writing. A competing
+writer can receive `database is locked` and exit 2 rather than mix snapshots.
+
+Map, slice, and flow check the recorded source root before ordinary queries.
+They refuse when Python source has changed, the Git HEAD moved, metadata is
+missing, or freshness cannot be verified. Re-run sync to refresh. To explicitly
+inspect the historical cached snapshot, pass `--snapshot` to map, slice, or
+flow; this mode remains read-only and does not change the database.
+Parse or SQL errors roll back both graph data and cache identity.
+
+Sync detects the project layout; there is nothing to configure. Packages are
+the top-level directories holding an `__init__.py`. A pure `src/` layout (no
+top-level package and no `src/__init__.py`) is indexed by import name, so
+`src/acme/core.py` is module `acme.core`; otherwise `src/` stays part of the
+module name. A string constant whose first dotted part is a detected package
+(for example `"acme.plugins"` in a registry) becomes an `IMPORTS` edge. The
+sync result reports `source_root` and `packages`, and a layout change triggers
+a full parse.
+
+```sh
+codegraph-slicer sync /path/to/project --db /tmp/project.sqlite
+codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
+```
+
+Next, pass the created database to `map` or `slice`.
+
+### `map`
+
+```text
+codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
+                      [--max-tokens N] [--format json|markdown]
+```
+
+`--db` must name an existing index and is opened read-only. Repeat `--seed` to
+rank from one or more indexed module names or source paths; with no seeds,
+ranking starts across the whole indexed repository. `--max-tokens` defaults to
+2000 and is a deterministic estimate, not a model tokenizer count. The map
+includes whole file skeletons in rank order while they fit; a budget too small
+for even the empty result is an error. `--format` defaults to JSON.
+
+```sh
+codegraph-slicer map --db /tmp/project.sqlite --seed package.module --max-tokens 1800
+```
+
+Next, choose a symbol from the indexed repository and use `slice` to retrieve
+its implementation and related context.
+
+### `slice`
+
+```text
+codegraph-slicer slice --db DATABASE ANCHOR [ANCHOR ...]
+                       [--max-tokens N] [--include-callee-bodies]
+                       [--format json|markdown]
+```
+
+`--db` must be an existing index and is opened read-only. Supply one or more
+anchors in any of these forms:
+
+| Form | Meaning |
+| --- | --- |
+| `package.module:qualname` | A module-qualified symbol, such as `package.module:run` |
+| `path/to/file.py:qualname` | A symbol's source path and qualified name |
+| `path/to/file.py:line` | The innermost indexed definition containing that line |
+| `symbol_id` | An exact symbol ID returned in index/query results |
+| `package.module:` | The full source text of the module |
+
+For example, `package.module:Outer.run` names a nested qualified symbol, and
+`src/worker.py:42` selects the indexed definition containing line 42. Paths
+are relative to the indexed root and use `/` separators. The selected root
+controls module names: indexing a project root containing `acme/run/core.py`
+gives `acme.run.core`, while indexing `acme/run` itself gives `core`. Beyond
+the pure `src/` layout (see `sync`), the tool does not infer package roots.
+
+`--max-tokens` defaults to 8000. It estimates compact JSON size as
+`len(compact_json) // 4 + 1`, counting Unicode characters directly. For a
+slice, the estimate covers the complete `sections` value: keys, IDs, locations,
+escaped source, and punctuation all count. Result metadata and Markdown
+rendering do not. Required anchors and required type definitions must fit or
+the command refuses the request; optional neighbors are added in rank order
+while they fit. `--include-callee-bodies` adds optional callee implementations
+instead of only their signatures. `--format` defaults to JSON.
+
+When several anchors share required type definitions, those required types are
+kept in the required section and are not repeated as optional callee entries.
+
+```sh
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run --max-tokens 4000
+codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-callee-bodies --format markdown
+```
+
+Next, inspect the returned sections; if the anchor is unknown, choose an
+indexed symbol or module from the map/database.
+
+### `delta`
+
+```text
+codegraph-slicer delta --base-db DATABASE --head-db DATABASE
+                       [--forbid-import SOURCE TARGET ...]
+                       [--selected-test PATH ...] [--format json|markdown]
+```
+
+Both databases must already exist and are opened read-only. They should contain
+the base and head snapshots respectively. Repeat `--forbid-import SOURCE
+TARGET` for each forbidden module-prefix pair. Repeat `--selected-test PATH`
+to record selected test paths when analyzing static test gaps; selection is not
+evidence that a test ran or passed. `--format` defaults to JSON.
+
+```sh
+codegraph-slicer sync /path/to/repo --revision BASE_REV --db /tmp/base.sqlite
+codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
+  --forbid-import package.runtime package.execution \
+  --selected-test tests/test_runtime.py
+```
+
+Next, review the static change report and run relevant tests separately. There
+are no project-specific import boundaries unless supplied with
+`--forbid-import`.
+
+### `flow`
+
+```text
+codegraph-slicer flow ANCHOR --db DATABASE [--variable NAME_OR_ACCESS_PATH]
+                      [--line LINE] [--direction backward|forward]
+                      [--data-only] [--max-tokens N]
+                      [--format json|markdown]
+```
+
+`flow` requires one observed function or method; module/class and ambiguous
+definitions are refused. It reads full module source from the cached snapshot,
+analyzes one function on demand, and includes the observed symbol ID, file path,
+database blob identity, and analyzed source SHA-256. It never reads ambient
+workspace source during a query. Sync the database to observe later source
+edits; both cold indexing and incremental updates retain ordinary snapshot
+semantics. The database is opened read-only.
+
+With neither `--variable` nor `--line`, the report contains the complete
+function graph. A variable selects its observed definitions, or uses if no
+definition is modeled. A line selects modeled nodes at that line; combining
+both requires a node to match both. Unknown selections refuse. Traversal is
+backward by default; `--direction forward` follows dependencies outward from
+the selected values. Control dependencies are included by default;
+`--data-only` excludes them. The report keeps selected nodes, edge endpoints,
+relevant diagnostics, and graph-wide limitations. It records `query.variable`,
+`query.line`, `query.direction`, and `query.include_control`. With no selection
+criteria the full graph is returned with `seeds: []`, including its CFG and AST
+edges.
+
+```sh
+codegraph-slicer flow spend:admit --db /tmp/example.sqlite \
+  --variable total --line 15
+codegraph-slicer flow spend:admit --db /tmp/example.sqlite \
+  --variable new_estimate_cents --direction forward --data-only --format markdown
+```
+
+On `examples/spend.py`, the first is a backward slice at the `total` guardrail predicate, showing
+observed dependencies such as billed and new estimates, loop-carried liability,
+and relevant guard control. The second follows only data dependencies forward
+from `new_estimate_cents`, avoiding unrelated liability flows. These examples
+depend on the indexed source revision: use the actual path/qualname and line in
+your snapshot.
+
+The `python-local-cpg-v1` profile is statement-granularity and
+intraprocedural. It supports ordinary synchronous functions with assignments,
+annotated/augmented assignments, expressions, if/elif/else, for/while and loop
+else, break/continue, return/raise, assert/pass, and eagerly evaluated named
+expressions. Walrus expressions inside short-circuit or conditional expressions
+are refused because the definition may not execute. Potentially overlapping
+chained attribute/subscript targets, assignment writes that also rebind their
+receiver, and augmented memory targets that use a walrus-bound receiver are
+refused with a source location. Rebinding a receiver or subpath invalidates
+older direct-path facts where modeled; aliases remain unresolved.
+
+Boolean and other statement-level expression reads are conservative, not
+expression-path precise. Calls have opaque effects: arguments and receivers
+are visible, but purity, return values, implicit exception edges, and alias
+side effects are not inferred. Direct attribute/subscript writes are recorded;
+dynamic indexes, wildcard paths, and aliasing do not prove memory paths
+disjoint. Unsupported constructs (including `try`/`except`/`finally`, `with`,
+async/await, yield, comprehensions, lambdas, nested definitions, imports,
+global/nonlocal mutation, and deletion) refuse with a specific source location
+rather than disappear from the graph. Implicit exception flow is not modeled.
+
+`--max-tokens` defaults to 8000. It estimates the complete compact-JSON flow
+report as `len(compact_json) // 4 + 1`; this includes identity and graph data,
+not the outer `tokens` field or Markdown. If the selected dependencies do not
+fit, the command errors without trimming them. This is a deterministic size
+estimate, not a tokenizer count.
+
+Edge identity is `(source, target, kind)`. Each reported line is one
+representative occurrence, not a list of all call sites. Reachability uses
+both snapshots, but test candidates and explicit test selections come from
+observed HEAD test symbols. A test counts as updated only when its source
+symbol changed; an edge rebind by itself does not count. Selection says only
+that the test was selected, not that it ran. `affected_entrypoints` uses a
+heuristic: `__main__` modules, module paths containing `cli`, `scripts`, or
+`mcp`, and symbols named `main`. Arbitrary framework-decorated entrypoints are
+not discovered automatically.
+
+## Results and errors
+
+Commands print JSON by default; `--format markdown` produces a readable report
+where supported. Successful commands exit `0`. Invalid input, unreadable
+source/database, unsupported syntax, an unknown anchor/seed, or a budget that
+cannot hold required content reports an error on stderr and exits `2`.
+Successful empty results are still JSON/Markdown output with exit `0` (for
+example, an empty repository map when no files are indexed). The program does
+not turn an unknown anchor or invalid database into an empty result. A delta
+with no detected changes returns its report with empty change collections and
+exit `0`.
+
+To inspect unresolved references from Python, using the stdlib SQLite driver:
+
+```sh
+python3 - <<'PY'
+import sqlite3
+
+db = sqlite3.connect("file:/tmp/project.sqlite?mode=ro", uri=True)
+for row in db.execute(
+    "SELECT source_file,line,target,reason FROM diagnostics "
+    "ORDER BY source_file,line,target"
+):
+    print(*row, sep="\t")
+PY
+```
+
+This does not require the `sqlite3` shell executable. Diagnostics include
+unmatched, shadowed, external, or dynamic references; they are observations,
+not inferred definitions.
+
+## Analysis limits
+
+The repository index remains a static syntax model. `flow` adds only the
+bounded intraprocedural CFG, reaching-definition, and mutation profile described
+above; it does not provide whole-program CPG/CFG, runtime dispatch, arbitrary
+alias-flow, package-root inference beyond the `src/` layout, or runtime-import evaluation. The broader
+index still resolves lexical lambda, `global`, `nonlocal`, and comprehension
+scopes.
+
+Module-level re-exports resolve by one rule: `pkg.Name` resolves exactly when
+`pkg`'s own module-scope reference to `Name` would. That holds when the final
+module binding of `Name` is an unconditional import. A binding inside
+`if`/`try`/loops/`match`, a later assignment, `del`, `except ... as Name`, a
+match capture, or a function that declares `global Name` and binds it leaves the name
+unknown, both inside the module and through the re-export, even when
+another branch restores the import. The final binding
+wins over an earlier definition of the same name. A `global Name` declaration
+counts in function and class bodies alike, and so does a walrus in a decorator,
+default, base class or annotation (annotations count even where Python 3.14
+or `from __future__ import annotations` would not evaluate them). Import statements find their module
+path through the import system: `import pkg.sub` and `from pkg.sub import x`
+reach the submodule whatever `pkg` binds as `sub`, and `from pkg import sub`
+reads `pkg`'s binding first, then the submodule. Attribute access `pkg.sub`
+follows `pkg`'s binding, which wins over a same-named submodule, both inside
+the module and through the re-export. Not modelled, for
+in-module and re-exported names alike: `import pkg.sub` rebinding the
+package attribute `sub`, star imports, writes through
+`globals()`/`vars()`/`exec`/`eval`, `setattr` or assignment from another
+module (`pkg.Name = x`), module `__getattr__`, and `sys.modules` replacement.
+`CALLS` edges are static; runtime rebinding can falsify them. Budgets are deterministic size estimates,
+not exact model tokenizer counts. No speed or fixed compression-ratio guarantee
+is made.
