@@ -11,10 +11,19 @@ codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:thing --format markdo
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:42 --include-callee-bodies
 codegraph-slicer flow package.module:function --db /tmp/graph.sqlite --variable total --line 15
 codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
-  --forbid-import package.runtime package.execution --selected-test tests/test_runtime.py
+  --forbid-import package.runtime package.execution --selected-test tests/test_runtime.py \
+  --max-tokens 8000
 ```
 
 Every command supports `--format json|markdown`. Query commands require an existing database and open it read-only. `sync` is the only writer. Python APIs are exported by `codegraph_slicer`; use `with GraphStore(path) as store:` to close the connection.
+
+`delta` defaults to a compact, priority-ranked summary with an 8000-token budget.
+Its exact `serialized_tokens` estimate is based on the compact JSON payload;
+omitted counts identify detail records withheld by the budget. Use `--full` to
+request all raw delta details under the same hard limit. If the required counts
+or complete `--full` payload do not fit, the command refuses with a budget error.
+Markdown reports keep the same limit. Test selection and reachability are static
+signals only and never mean that tests were executed or passed.
 
 Workspace sync hashes `.py` files except `.git`, `.venv`, `venv` and `__pycache__` directories. Python source symlinks are refused. Git sync reads immutable commit trees with a sanitized Git environment, refuses nonregular Python entries, and uses native blob OIDs: a repeated commit sync neither reads blobs nor reparses files. Workspace and Git caches use distinct identity prefixes. Added/deleted definitions rebind retained references from unchanged files. The parse-cache identity hashes the actual `ast_extractor.py` and `store.py` bytes plus the Python major/minor version. Missing or stale identity forces a full parse even when source hashes match; after that, an unchanged snapshot under the same identity uses the normal cache. Sync begins an immediate SQLite transaction before reading old hashes, parsing, or writing. A competing writer may receive `database is locked` and CLI exit 2 rather than interleave snapshots. Parse or SQL errors roll back the graph and cache identity together. A database belongs to one selected source root/snapshot at a time; syncing another root replaces that snapshot.
 

@@ -156,21 +156,43 @@ indexed symbol or module from the map/database.
 ```text
 codegraph-slicer delta --base-db DATABASE --head-db DATABASE
                        [--forbid-import SOURCE TARGET ...]
-                       [--selected-test PATH ...] [--format json|markdown]
+                       [--selected-test PATH ...] [--max-tokens N] [--full]
+                       [--format json|markdown]
 ```
 
 Both databases must already exist and are opened read-only. They should contain
 the base and head snapshots respectively. Repeat `--forbid-import SOURCE
 TARGET` for each forbidden module-prefix pair. Repeat `--selected-test PATH`
 to record selected test paths when analyzing static test gaps; selection is not
-evidence that a test ran or passed. `--format` defaults to JSON.
+evidence that a test ran or passed. `--format` defaults to JSON. `--max-tokens`
+defaults to 8000 and bounds the compact serialized JSON payload. The default
+output is a priority-ranked summary with counts for every change kind, static
+test reachability and gap status, plus exact omitted-record counts. Boundaries,
+new cycles, complexity drift, import changes, affected entrypoints and test gaps
+rank before routine symbol details. Call/import edge lists are always omitted
+from summary mode; their counts and import-change samples are retained.
+`serialized_tokens` estimates the complete compact JSON payload, including that
+field. Complexity drift over its configured threshold appears before lower-risk
+drift. Each emitted test-coverage sample carries its own static status.
+
+Use `--full` to include all raw delta details. It obeys the same budget and
+refuses if the complete payload cannot fit. The command also refuses if summary
+counts and metadata do not fit. Markdown reports use readable headings and
+lists under the same budget. Static selected or reachable tests describe graph
+selection only; this command never claims tests ran or passed. It distinguishes
+whether tests were requested, updated-or-selected test evidence,
+reachable-but-unselected tests, and no reachable tests. A requested path that
+cannot be resolved is reported as unknown and refused. Summary output includes `--full --max-tokens N`
+guidance for retrieving full details.
 
 ```sh
 codegraph-slicer sync /path/to/repo --revision BASE_REV --db /tmp/base.sqlite
 codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
 codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
   --forbid-import package.runtime package.execution \
-  --selected-test tests/test_runtime.py
+  --selected-test tests/test_runtime.py --max-tokens 2400 --format markdown
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
+  --full --max-tokens 8000
 ```
 
 Next, review the static change report and run relevant tests separately. There

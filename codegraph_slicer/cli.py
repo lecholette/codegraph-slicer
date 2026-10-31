@@ -10,8 +10,8 @@ import sqlite3
 from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
-from .slicer import slice_context
-from .delta import compute_delta
+from .slicer import slice_context, serialized_tokens
+from .delta import compute_delta, summarize_delta
 from .flow_query import query_flow
 
 
@@ -71,6 +71,36 @@ def _flow_markdown(result):
 
 
 def _markdown(result):
+    if "summary" in result or "modified_symbols" in result and "serialized_tokens" in result:
+        blocks = ["# Static delta report"]
+        if "summary" in result:
+            blocks.append("## Summary\n\n" + "\n".join(
+                f"- **{name.replace('_', ' ')}:** {count}"
+                for name, count in result["summary"]["counts"].items()
+            ))
+            blocks.append(
+                f"Test selection requested: `{result['summary']['test_selection']}`. "
+                f"Static test gap statuses: {result['summary']['test_gap_status_counts']}.\n\n"
+                + result["summary"]["test_selection_note"] + "\n\n"
+                + result["summary"]["test_gap_note"] + "\n\n"
+                + result["summary"]["retrieve_details"]
+            )
+        for kind, count in result.get("omitted", {}).items():
+            blocks.append(f"Omitted **{kind.replace('_', ' ')}** records: {count}")
+        for kind in ("boundary_violations", "new_cycles", "complexity_drift", "import_changes", "modified_symbols", "affected_entrypoints", "untested_modified_symbols", "test_coverage", "added_edges", "removed_edges"):
+            values = result.get(kind, [])
+            if values:
+                bullets = []
+                for item in values:
+                    if isinstance(item, dict):
+                        bullets.append("- " + "; ".join(f"{key.replace('_', ' ')}: {value}" for key, value in item.items()))
+                    elif isinstance(item, list):
+                        bullets.append("- " + " · ".join(str(value) for value in item))
+                    else:
+                        bullets.append("- " + str(item))
+                blocks.append("## " + kind.replace("_", " ").title() + "\n\n" + "\n".join(bullets))
+        blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
+        return "\n\n".join(blocks)
     if "flow" in result:
         return _flow_markdown(result)
     if "sections" in result:
@@ -191,9 +221,14 @@ def main(argv=None):
         description=(
             "Compare independently indexed snapshots for static graph, import,\n"
             "call, complexity, and test-selection changes. Selected tests are\n"
-            "evidence for selection only; this command never executes tests."
+            "static evidence only; this command never executes tests. By default,\n"
+            "emit a priority-ranked summary within --max-tokens. Use --full to\n"
+            "request all details under the same hard budget."
         ),
-        epilog="Example: codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite\nNext: review reported changes and run the selected test suite separately.",
+        epilog=(
+            "Example: codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite --max-tokens 2400\n"
+            "Retrieve all detail with --full --max-tokens N. Next: review reported changes and run selected tests separately."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     delta.add_argument("--base-db", required=True, help="existing base snapshot database")
@@ -207,6 +242,8 @@ def main(argv=None):
         help="report imports from SOURCE to TARGET prefixes; repeatable (default: none)",
     )
     delta.add_argument("--selected-test", action="append", default=[], help="select a test path for static gap analysis; repeatable, does not run it (default: none)")
+    delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
+    delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
     for command in (sync, mapping, slicing, flow, delta):
         command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
@@ -217,6 +254,13 @@ def main(argv=None):
                 head = stack.enter_context(GraphStore(args.head_db, readonly=True))
                 result = compute_delta(
                     base, head, args.forbid_import, selected_tests=args.selected_test
+                )
+                result = summarize_delta(
+                    result, args.max_tokens, full=args.full,
+                    selected_tests=bool(args.selected_test),
+                    render_estimator=(
+                        lambda candidate: serialized_tokens(_markdown(candidate))
+                    ) if args.format == "markdown" else None,
                 )
             else:
                 store = stack.enter_context(GraphStore(args.db, readonly=args.cmd != "sync"))
@@ -244,11 +288,14 @@ def main(argv=None):
                     result = slice_context(
                         store, args.anchors, args.max_tokens, args.include_callee_bodies
                     )
-        print(
-            _markdown(result)
-            if args.format == "markdown"
-            else json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        rendered = _markdown(result) if args.format == "markdown" else json.dumps(
+            result, ensure_ascii=False, separators=(",", ":")
         )
+        if args.cmd == "delta" and args.format == "markdown":
+            from .slicer import InvalidBudgetError
+            if serialized_tokens(rendered) > args.max_tokens:
+                raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
+        print(rendered)
         return 0
     except (CodeGraphError, OSError, sqlite3.Error) as exc:
         parser.exit(2, f"codegraph-slicer: {type(exc).__name__}: {exc}\n")
