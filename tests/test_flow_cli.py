@@ -74,7 +74,7 @@ def test_flow_markdown_shows_nodes_and_source_identity(tmp_path, capsys):
     assert main(["flow", "sample.py:calculate", "--db", str(db), "--variable", "total", "--format", "markdown"]) == 0
     output = capsys.readouterr().out
     assert "# Python local flow: `calculate`" in output
-    assert "Source SHA-256:" in output
+    assert f"SHA-256 `{hashlib.sha256(SOURCE.encode()).hexdigest()}`" in output
     assert "billed = amount * 2" in output
     assert "## Limitations" in output
 
