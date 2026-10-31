@@ -3,6 +3,7 @@
 import argparse
 from contextlib import ExitStack
 import json
+from collections import Counter
 from pathlib import Path
 import re
 import sqlite3
@@ -14,26 +15,64 @@ from .delta import compute_delta
 from .flow_query import query_flow
 
 
+_DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
+_ENDPOINTS = ("entry", "exit")
+
+
+def _node_refs(nodes):
+    per_line = Counter(n["line"] for n in nodes if n["kind"] not in _ENDPOINTS)
+    return {n["id"]: n["kind"] if n["kind"] in _ENDPOINTS
+            else f"L{n['line']}" if per_line[n["line"]] == 1 else f"L{n['line']}#{n['id']}"
+            for n in nodes}
+
+
+def _flow_markdown(result):
+    graph = result["flow"]
+    identity = graph["identity"]
+    source_hash = graph["source_sha256"]
+    ref = _node_refs(graph["nodes"])
+    blocks = [f"# Python local flow: `{graph['function']}`",
+              f"Graph JSON ≈ {result['tokens']} tokens; this view ≈ 0 tokens · profile `{graph['profile']}` · Python {graph['python_version']}"]
+    if identity["blob_sha"] == f"sha256:{source_hash}":
+        blocks.append(f"Source: `{identity['path']}` · `{identity['symbol_id']}` · SHA-256 `{source_hash}`")
+    else:
+        blocks.append(f"Source: `{identity['path']}` · `{identity['symbol_id']}` · blob `{identity['blob_sha']}` · SHA-256 `{source_hash}`")
+    blocks.append("## Dependencies\n\nStatements in source order, keyed by line (`L7#n0012` when a line holds several). "
+                  "Each lists what it depends on as `source (label)`; `entry` is the function entry. "
+                  "`x[*]` means some unresolved element or attribute of `x`. "
+                  "CFG and AST edges are omitted; `--format json` has the full record.")
+    incoming = {}
+    for edge in graph["edges"]:
+        incoming.setdefault((edge["target"], edge["kind"]), []).append(edge)
+    for node in sorted((n for n in graph["nodes"] if n["kind"] not in _ENDPOINTS), key=lambda n: (n["line"], n["id"])):
+        flags = "".join(f" · {flag}" for flag, on in (("unreachable", not node["reachable"]), ("synthetic", node["synthetic"])) if on)
+        span = "" if node["line"] == node["end_line"] else f" (to L{node['end_line']})"
+        text = node["text"].splitlines() or [""]
+        lines = [f"- {ref[node['id']]} {node['kind']}{span}{flags}: `{text[0].strip()}`" if len(text) == 1
+                 else f"- {ref[node['id']]} {node['kind']}{span}{flags}:\n" + "\n".join(f"      {t}" for t in text)]
+        facts = "; ".join(f"{name}: {', '.join(values)}" for name, values in
+                          (("defines", node["defs"]), ("uses", node["uses"]), ("writes", node["mutation_targets"])) if values)
+        if facts:
+            lines.append(f"  - {facts}")
+        for kind, arrow in _DEPENDENCIES:
+            edges = incoming.get((node["id"], kind), [])
+            if edges:
+                lines.append(f"  - {arrow} " + ", ".join(f"{ref[e['source']]} ({e['label']})" for e in edges))
+        blocks.append("\n".join(lines))
+    blocks.append("## Diagnostics")
+    grouped = {}
+    for d in graph["diagnostics"]:
+        grouped.setdefault((d["code"], d["message"]), []).append(ref[d["node"]])
+    blocks.extend(f"- `{code}` {message}: {', '.join(where)}" for (code, message), where in grouped.items())
+    blocks.append("## Limitations")
+    blocks.extend(f"- {item}" for item in graph["limitations"])
+    text = "\n\n".join(blocks)
+    return text.replace("this view ≈ 0 tokens", f"this view ≈ {len(text) // 4 + 1} tokens", 1)
+
+
 def _markdown(result):
     if "flow" in result:
-        report = result["flow"]
-        graph = report.get("graph", report)
-        blocks = [f"# Python local flow: `{graph.get('function', 'function')}`",
-                  f"Estimated context tokens: {result['tokens']}",
-                  f"Profile: `{graph.get('profile', 'python-local-cpg-v1')}`"]
-        identity = graph.get("identity", {})
-        if identity:
-            blocks.append("Source identity: `" + "` · `".join(str(identity.get(k, "")) for k in ("path", "symbol_id", "blob_sha")) + "`")
-        blocks.append(f"Source SHA-256: `{graph.get('source_sha256', '')}`")
-        blocks.append("## Nodes")
-        for node in graph.get("nodes", []):
-            flags = " · unreachable" if node.get("reachable") is False else ""
-            blocks.append(f"- **{node.get('kind')}** `{node.get('id')}` · {node.get('line')}–{node.get('end_line')}{flags}\n  - {node.get('text', '')}\n  - defines: {', '.join(node.get('defs', [])) or '—'}; uses: {', '.join(node.get('uses', [])) or '—'}; writes: {', '.join(node.get('mutation_targets', [])) or '—'}")
-        blocks.append("## Diagnostics")
-        blocks.extend(f"- `{d.get('code')}` at line {d.get('line')}: {d.get('message')}" for d in report.get("diagnostics", graph.get("diagnostics", [])))
-        blocks.append("## Limitations")
-        blocks.extend(f"- {item}" for item in graph.get("limitations", []))
-        return "\n\n".join(blocks)
+        return _flow_markdown(result)
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
         for name, items in result["sections"].items():
@@ -208,7 +247,7 @@ def main(argv=None):
         print(
             _markdown(result)
             if args.format == "markdown"
-            else json.dumps(result, ensure_ascii=False, indent=2)
+            else json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         )
         return 0
     except (CodeGraphError, OSError, sqlite3.Error) as exc:
