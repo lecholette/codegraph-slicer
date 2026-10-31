@@ -1,12 +1,15 @@
+import ast
 import hashlib
 import json
 import os
 import subprocess
+
 import pytest
 
-from codegraph_slicer import FlowQueryError, GraphStore, UnsupportedFlowError, query_flow
+import codegraph_slicer.flow as flow_module
+from codegraph_slicer import FlowQueryError, GraphStore, query_flow
 from codegraph_slicer.cli import main
-
+from codegraph_slicer.flow import _structured_cleanup_depth
 
 SOURCE = """def calculate(amount):
     billed = amount * 2
@@ -17,6 +20,156 @@ SOURCE = """def calculate(amount):
     return total
 """
 
+
+BASE_DEPTH5_NODE_DIGEST = "e554d7daea377641049f78e6b435abd6ae30d643272d6ab696aa705f9cdb095f"
+BASE_DEPTH5_EDGES = [
+    ('n0000', 'n0002', 'AST', 'parameter'),
+    ('n0000', 'n0004', 'AST', 'body'),
+    ('n0000', 'n0014', 'AST', 'body'),
+    ('n0004', 'n0005', 'AST', 'body'),
+    ('n0005', 'n0007', 'AST', 'body'),
+    ('n0005', 'n0013', 'AST', 'finalbody'),
+    ('n0007', 'n0008', 'AST', 'body'),
+    ('n0008', 'n0010', 'AST', 'body'),
+    ('n0008', 'n0012', 'AST', 'finalbody'),
+    ('n0010', 'n0011', 'AST', 'body'),
+    ('n0000', 'n0002', 'CFG', 'parameter'),
+    ('n0002', 'n0015', 'CFG', 'next'),
+    ('n0003', 'n0001', 'CFG', 'raise-exit'),
+    ('n0003', 'n0017', 'CFG', 'next'),
+    ('n0004', 'n0016', 'CFG', 'evaluate-manager'),
+    ('n0005', 'n0018', 'CFG', 'next'),
+    ('n0006', 'n0020', 'CFG', 'next'),
+    ('n0006', 'n0035', 'CFG', 'finally-raise'),
+    ('n0007', 'n0019', 'CFG', 'evaluate-manager'),
+    ('n0008', 'n0021', 'CFG', 'next'),
+    ('n0009', 'n0023', 'CFG', 'next'),
+    ('n0009', 'n0027', 'CFG', 'finally-raise'),
+    ('n0010', 'n0022', 'CFG', 'evaluate-manager'),
+    ('n0011', 'n0024', 'CFG', 'context-raise'),
+    ('n0011', 'n0026', 'CFG', 'context-normal'),
+    ('n0012', 'n0032', 'CFG', 'context-raise'),
+    ('n0013', 'n0040', 'CFG', 'context-raise'),
+    ('n0014', 'n0001', 'CFG', 'raise-exit'),
+    ('n0014', 'n0001', 'CFG', 'return-exit'),
+    ('n0015', 'n0004', 'CFG', 'complete'),
+    ('n0016', 'n0001', 'CFG', 'raise-exit'),
+    ('n0016', 'n0003', 'CFG', 'complete'),
+    ('n0017', 'n0005', 'CFG', 'complete'),
+    ('n0018', 'n0007', 'CFG', 'complete'),
+    ('n0019', 'n0006', 'CFG', 'complete'),
+    ('n0019', 'n0035', 'CFG', 'finally-raise'),
+    ('n0020', 'n0008', 'CFG', 'complete'),
+    ('n0021', 'n0010', 'CFG', 'complete'),
+    ('n0022', 'n0009', 'CFG', 'complete'),
+    ('n0022', 'n0027', 'CFG', 'finally-raise'),
+    ('n0023', 'n0011', 'CFG', 'complete'),
+    ('n0023', 'n0024', 'CFG', 'context-raise'),
+    ('n0024', 'n0025', 'CFG', 'suppressed-exit'),
+    ('n0024', 'n0027', 'CFG', 'finally-raise'),
+    ('n0025', 'n0030', 'CFG', 'finally-normal'),
+    ('n0026', 'n0027', 'CFG', 'finally-raise'),
+    ('n0026', 'n0030', 'CFG', 'finally-normal'),
+    ('n0027', 'n0028', 'CFG', 'next'),
+    ('n0028', 'n0012', 'CFG', 'complete'),
+    ('n0028', 'n0032', 'CFG', 'context-raise'),
+    ('n0029', 'n0032', 'CFG', 'context-raise'),
+    ('n0029', 'n0034', 'CFG', 'context-normal'),
+    ('n0030', 'n0031', 'CFG', 'next'),
+    ('n0031', 'n0029', 'CFG', 'complete'),
+    ('n0031', 'n0032', 'CFG', 'context-raise'),
+    ('n0032', 'n0033', 'CFG', 'suppressed-exit'),
+    ('n0032', 'n0035', 'CFG', 'finally-raise'),
+    ('n0033', 'n0038', 'CFG', 'finally-normal'),
+    ('n0034', 'n0035', 'CFG', 'finally-raise'),
+    ('n0034', 'n0038', 'CFG', 'finally-normal'),
+    ('n0035', 'n0036', 'CFG', 'next'),
+    ('n0036', 'n0013', 'CFG', 'complete'),
+    ('n0036', 'n0040', 'CFG', 'context-raise'),
+    ('n0037', 'n0040', 'CFG', 'context-raise'),
+    ('n0037', 'n0042', 'CFG', 'context-normal'),
+    ('n0038', 'n0039', 'CFG', 'next'),
+    ('n0039', 'n0037', 'CFG', 'complete'),
+    ('n0039', 'n0040', 'CFG', 'context-raise'),
+    ('n0040', 'n0001', 'CFG', 'raise-exit'),
+    ('n0040', 'n0041', 'CFG', 'suppressed-exit'),
+    ('n0041', 'n0043', 'CFG', 'next'),
+    ('n0042', 'n0001', 'CFG', 'raise-exit'),
+    ('n0042', 'n0043', 'CFG', 'next'),
+    ('n0043', 'n0001', 'CFG', 'raise-exit'),
+    ('n0043', 'n0014', 'CFG', 'complete'),
+    ('n0003', 'n0005', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0007', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0017', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0018', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0019', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0008', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0010', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0020', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0021', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0022', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0006', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0006', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0009', 'n0023', 'CONTROL_DEP', 'next'),
+    ('n0009', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0009', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0009', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0011', 'n0024', 'CONTROL_DEP', 'context-raise'),
+    ('n0011', 'n0026', 'CONTROL_DEP', 'context-normal'),
+    ('n0016', 'n0003', 'CONTROL_DEP', 'complete'),
+    ('n0019', 'n0006', 'CONTROL_DEP', 'complete'),
+    ('n0019', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0019', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0019', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0022', 'n0009', 'CONTROL_DEP', 'complete'),
+    ('n0022', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0022', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0022', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0023', 'n0011', 'CONTROL_DEP', 'complete'),
+    ('n0023', 'n0024', 'CONTROL_DEP', 'context-raise'),
+    ('n0024', 'n0025', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0024', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0024', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0024', 'n0030', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0024', 'n0031', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0024', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0026', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0026', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0026', 'n0030', 'CONTROL_DEP', 'finally-normal'),
+    ('n0026', 'n0031', 'CONTROL_DEP', 'finally-normal'),
+    ('n0026', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0028', 'n0012', 'CONTROL_DEP', 'complete'),
+    ('n0029', 'n0032', 'CONTROL_DEP', 'context-raise'),
+    ('n0029', 'n0034', 'CONTROL_DEP', 'context-normal'),
+    ('n0031', 'n0029', 'CONTROL_DEP', 'complete'),
+    ('n0031', 'n0032', 'CONTROL_DEP', 'context-raise'),
+    ('n0032', 'n0033', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0032', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0032', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0032', 'n0038', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0032', 'n0039', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0032', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0034', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0034', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0034', 'n0038', 'CONTROL_DEP', 'finally-normal'),
+    ('n0034', 'n0039', 'CONTROL_DEP', 'finally-normal'),
+    ('n0034', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0036', 'n0013', 'CONTROL_DEP', 'complete'),
+    ('n0037', 'n0040', 'CONTROL_DEP', 'context-raise'),
+    ('n0037', 'n0042', 'CONTROL_DEP', 'context-normal'),
+    ('n0039', 'n0037', 'CONTROL_DEP', 'complete'),
+    ('n0039', 'n0040', 'CONTROL_DEP', 'context-raise'),
+    ('n0040', 'n0041', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0040', 'n0043', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0042', 'n0043', 'CONTROL_DEP', 'next'),
+    ('n0043', 'n0014', 'CONTROL_DEP', 'complete'),
+    ('n0002', 'n0003', 'DATA_DEP', 'manager'),
+    ('n0002', 'n0006', 'DATA_DEP', 'manager'),
+    ('n0002', 'n0009', 'DATA_DEP', 'manager'),
+    ('n0013', 'n0014', 'DATA_DEP', 'done'),
+    ('n0037', 'n0014', 'DATA_DEP', 'done'),
+]
 
 def _snapshot(tmp_path, source=SOURCE):
     root = tmp_path / "src"
@@ -42,13 +195,16 @@ def test_cli_flow_reads_cached_snapshot_readonly_and_emits_identity(tmp_path, ca
     assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
-def test_flow_refuses_class_anchor_and_unsupported_cached_source(tmp_path):
-    root, db = _snapshot(tmp_path, "class Worker:\n    def run(self):\n        try:\n            return 1\n        except ValueError:\n            return 2\n")
-    with GraphStore(db, readonly=True) as store:
-        with pytest.raises(FlowQueryError, match="function or method"):
-            query_flow(store, "sample.py:")
-        with pytest.raises(UnsupportedFlowError, match="Try.*sample.py:3"):
-            query_flow(store, "sample.py:Worker.run")
+def test_flow_refuses_class_anchor_and_unsupported_cached_source(tmp_path, capsys):
+    _root, db = _snapshot(tmp_path, "class Worker:\n    def run(self):\n        return lambda: 1\n")
+    with (
+        GraphStore(db, readonly=True) as store,
+        pytest.raises(FlowQueryError, match="function or method"),
+    ):
+        query_flow(store, "sample.py:")
+    with pytest.raises(SystemExit, match="2"):
+        main(["flow", "sample.py:Worker.run", "--db", str(db), "--snapshot"])
+    assert "unsupported Lambda in sample.py:3" in capsys.readouterr().err
 
 
 def test_flow_incremental_sync_changes_cached_source_identity(tmp_path, capsys):
@@ -344,3 +500,439 @@ def test_sync_to_new_root_refreshes_metadata_before_default_query(tmp_path, caps
     assert main(["flow", "sample.py:calculate", "--db", str(db), "--variable", "answer"]) == 0
     report = json.loads(capsys.readouterr().out)["flow"]
     assert report["source_sha256"] == hashlib.sha256((new_root / "sample.py").read_bytes()).hexdigest()
+
+
+def test_cli_flow_models_with_manager_and_suppression_paths(tmp_path, capsys):
+    source = """def managed(manager, value, flag):
+    before = value
+    with manager as resource:
+        inside = resource
+        if flag:
+            raise ValueError()
+    after = inside
+    return after
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:managed", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "json"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    nodes_by_id = {n["id"]: n for n in graph["nodes"]}
+    pairs = {(e["kind"], nodes_by_id[e["source"]]["text"], nodes_by_id[e["target"]]["text"], e["label"]) for e in graph["edges"]}
+    assert ("DATA_DEP", "manager", "manager", "manager") in pairs
+    assert ("DATA_DEP", "bind resource", "inside = resource", "resource") in pairs
+    assert ("DATA_DEP", "inside = resource", "after = inside", "inside") in pairs
+    assert ("CFG", "bind resource", "before Assign", "next") in pairs
+    assert ("CFG", "exit manager 1 (raise)", "suppressed exception", "suppressed-exit") in pairs
+
+
+def test_cli_flow_models_try_pre_and_post_state_handler_and_else(tmp_path, capsys):
+    source = """def guarded(value, operation):
+    value = 1
+    try:
+        value = operation()
+    except ValueError:
+        handled = value
+    else:
+        succeeded = value
+    return value
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:guarded", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "json"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    pairs = {(edge["kind"], by_id[edge["source"]]["text"], by_id[edge["target"]]["text"], edge["label"]) for edge in graph["edges"]}
+    assert ("DATA_DEP", "value = 1", "handled = value", "value") in pairs
+    assert ("DATA_DEP", "value = operation()", "handled = value", "value") in pairs
+    assert ("DATA_DEP", "value = operation()", "succeeded = value", "value") in pairs
+    assert ("CFG", "before Assign", "except ValueError", "exception-before-statement") in pairs
+
+
+def test_cli_flow_comprehension_targets_are_local_to_expression(tmp_path, capsys):
+    source = """def mapped(items, offset):
+    values = [item + offset for item in items]
+    return values
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:mapped", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "json"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    pairs = {(edge["kind"], by_id[edge["source"]]["text"], by_id[edge["target"]]["text"], edge["label"]) for edge in graph["edges"]}
+    assert ("DATA_DEP", "items", "values = [item + offset for item in items]", "items") in pairs
+    assert ("DATA_DEP", "offset", "values = [item + offset for item in items]", "offset") in pairs
+    statement = next(n for n in graph["nodes"] if n["text"] == "values = [item + offset for item in items]")
+    assert statement["defs"] == ["values"]
+    assert statement["uses"] == ["items", "offset"]
+    assert not any(d["code"] == "possibly-unbound-local" and "item" in d["message"] for d in graph["diagnostics"])
+    assert not any(node["text"] == "item" and "item" in node["defs"] for node in graph["nodes"])
+
+
+def test_cli_flow_async_with_models_manager_and_binding(tmp_path, capsys):
+    source = """async def managed(manager):
+    async with manager as resource:
+        result = resource
+    return result
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:managed", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "json"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    pairs = {(edge["kind"], by_id[edge["source"]]["text"], by_id[edge["target"]]["text"], edge["label"]) for edge in graph["edges"]}
+    assert ("DATA_DEP", "manager", "manager", "manager") in pairs
+    assert ("DATA_DEP", "bind resource", "result = resource", "resource") in pairs
+    assert ("CFG", "bind resource", "before Assign", "next") in pairs
+
+
+def test_cli_flow_try_star_keeps_sequential_handler_effects(tmp_path, capsys):
+    source = """def grouped(group):
+    try:
+        raise group
+    except* ValueError:
+        first = 1
+    except* TypeError:
+        second = first
+    return second
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:grouped", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "json"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    pairs = {(edge["kind"], by_id[edge["source"]]["text"], by_id[edge["target"]]["text"], edge["label"]) for edge in graph["edges"]}
+    assert ("CFG", "first = 1", "except TypeError", "except-star-next") in pairs
+    assert ("DATA_DEP", "first = 1", "second = first", "first") in pairs
+
+
+def test_cli_flow_runs_finally_before_return_exit(tmp_path, capsys):
+    source = """def closing():
+    try:
+        return 1
+    finally:
+        cleanup = 2
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:closing", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "json"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    pairs = {(edge["kind"], by_id[edge["source"]]["text"], by_id[edge["target"]]["text"], edge["label"]) for edge in graph["edges"]}
+    assert ("CFG", "return 1", "finally return", "finally-return") in pairs
+    assert ("CFG", "finally return", "before Assign", "next") in pairs
+    assert ("CFG", "before Assign", "cleanup = 2", "complete") in pairs
+    assert ("CFG", "return 1", "", "return-exit") not in pairs
+
+
+def _new_flow(tmp_path, capsys, source):
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    by_id = {node["id"]: node for node in graph["nodes"]}
+    pairs = {(e["kind"], by_id[e["source"]]["text"], by_id[e["target"]]["text"], e["label"]) for e in graph["edges"]}
+    return graph, pairs
+
+
+@pytest.mark.parametrize("action", ["break", "continue"])
+def test_cli_finally_routes_loop_completion(tmp_path, capsys, action):
+    _graph, pairs = _new_flow(tmp_path, capsys, f"""def f(items):
+    for item in items:
+        try:
+            {action}
+        finally:
+            cleanup = item
+    return 9
+""")
+    assert ("CFG", action, "finally " + action, "finally-" + action) in pairs
+    assert ("CFG", "finally " + action, "before Assign", "next") in pairs
+    assert ("CFG", "before Assign", "cleanup = item", "complete") in pairs
+    assert ("DATA_DEP", "bind item", "cleanup = item", "item") in pairs
+    assert ("CFG", "cleanup = item", "iterator test", "backedge") in pairs if action == "continue" else ("CFG", "cleanup = item", "before Return", "next") in pairs
+    assert ("CFG", action, "iterator test", action) not in pairs
+
+
+def test_cli_nested_finally_overrides_pending_return(tmp_path, capsys):
+    _graph, pairs = _new_flow(tmp_path, capsys, """def f():
+    try:
+        try:
+            return 1
+        finally:
+            return 2
+    finally:
+        cleanup = 3
+""")
+    assert ("CFG", "return 1", "finally return", "finally-return") in pairs
+    assert ("CFG", "return 2", "finally return", "finally-return") in pairs
+    assert ("CFG", "return 1", "", "return-exit") not in pairs
+    assert ("CFG", "return 2", "", "return-exit") not in pairs
+
+
+def test_cli_finalizer_exception_preserves_pre_store_state(tmp_path, capsys):
+    _graph, pairs = _new_flow(tmp_path, capsys, """def f(operation):
+    value = 1
+    try:
+        try:
+            return 2
+        finally:
+            value = operation()
+    except ValueError:
+        observed = value
+    return observed
+""")
+    assert ("DATA_DEP", "value = 1", "observed = value", "value") in pairs
+    assert ("DATA_DEP", "value = operation()", "observed = value", "value") in pairs
+    assert ("CFG", "before Assign", "except ValueError", "exception-before-statement") in pairs
+
+
+def test_cli_finally_copies_do_not_join_normal_and_return(tmp_path, capsys):
+    graph, pairs = _new_flow(tmp_path, capsys, """def f(flag):
+    value = 0
+    try:
+        if flag:
+            value = 1
+            return value
+        value = 2
+    finally:
+        cleanup = value
+    return value
+""")
+    by_id = {n["id"]: n for n in graph["nodes"]}
+    last = next(n["id"] for n in graph["nodes"] if n["kind"] == "return" and n["line"] == 10)
+    assert {(by_id[e["source"]]["text"], e["label"]) for e in graph["edges"] if e["kind"] == "DATA_DEP" and e["target"] == last} == {("value = 2", "value")}
+    assert ("CONTROL_DEP", "flag", "true", "true") in pairs
+
+
+def test_cli_context_cleanup_reverse_order_and_enter_failure(tmp_path, capsys):
+    _graph, pairs = _new_flow(tmp_path, capsys, """def f(first, second):
+    with first as left, second as right:
+        return right
+""")
+    assert ("CFG", "return right", "exit manager 2 (return)", "context-return") in pairs
+    assert ("CFG", "exit manager 2 (return)", "exit manager 1 (return)", "context-return") in pairs
+    assert ("CFG", "second", "exit manager 1 (raise)", "context-raise") in pairs
+    assert ("CFG", "second", "exit manager 2 (raise)", "context-raise") in pairs  # binding may fail after successful entry
+    assert ("CFG", "return right", "suppressed exception", "suppressed-exit") not in pairs
+    assert ("DATA_DEP", "bind right", "return right", "right") in pairs
+
+
+def test_cli_context_expression_walrus_defines_following_manager(tmp_path, capsys):
+    graph, pairs = _new_flow(tmp_path, capsys, """def f(factory):
+    with (manager := factory()), manager as resource:
+        result = resource
+    return manager
+""")
+    assert ("DATA_DEP", "manager := factory()", "manager", "manager") in pairs
+    assert ("DATA_DEP", "manager := factory()", "return manager", "manager") in pairs
+    assert {(d["code"], d["message"]) for d in graph["diagnostics"] if d["code"] == "possibly-unbound-local"} == set()
+
+
+@pytest.mark.parametrize("action", ["return error", "raise error", "break", "continue"])
+def test_cli_handler_alias_deleted_on_abrupt_completion(tmp_path, capsys, action):
+    _graph, pairs = _new_flow(tmp_path, capsys, f"""def f(items):
+    for item in items:
+        try:
+            raise ValueError()
+        except ValueError as error:
+            {action}
+    return 0
+""")
+    assert ("DATA_DEP", "except ValueError", action, "error") in pairs if "error" in action else ("CFG", action, "delete error", "implicit-delete") in pairs
+    assert ("CFG", action, "delete error", "implicit-delete") in pairs
+    assert ("CFG", action, "", "return-exit") not in pairs
+
+
+def test_cli_deleted_alias_is_unbound_after_handler(tmp_path, capsys):
+    graph, pairs = _new_flow(tmp_path, capsys, """def f():
+    try:
+        raise ValueError()
+    except ValueError as error:
+        saved = error
+    return error
+""")
+    assert ("DATA_DEP", "except ValueError", "saved = error", "error") in pairs
+    assert ("DATA_DEP", "except ValueError", "return error", "error") not in pairs
+    assert ("DATA_DEP", "delete error", "return error", "error") not in pairs
+    assert {(d["code"], d["message"]) for d in graph["diagnostics"] if d["line"] == 6} >= {("possibly-unbound-local", "local 'error' may have no reaching definition")}
+
+
+def test_cli_try_star_raised_handler_still_runs_later_subset(tmp_path, capsys):
+    _graph, pairs = _new_flow(tmp_path, capsys, """def f(group):
+    try:
+        raise group
+    except* ValueError:
+        first = 1
+        raise RuntimeError()
+    except* KeyError:
+        middle = 2
+    except* TypeError:
+        last = first
+    return last
+""")
+    assert ("CFG", "raise RuntimeError()", "except TypeError", "except-star-next") in pairs
+    assert ("DATA_DEP", "first = 1", "last = first", "first") in pairs
+
+
+@pytest.mark.parametrize("expression", [
+    "[item.field for item in items if item.ready]",
+    "{item.field for item in items}",
+    "{item.key: item.value for item in items}",
+    "(item for item in items)",
+    "[later for item in items if later for later in item.children]",
+    "[[child.field for child in item.children] for item in items]",
+])
+def test_cli_comprehension_scope_excludes_all_local_roots(tmp_path, capsys, expression):
+    statement = "values = " + expression
+    graph, pairs = _new_flow(tmp_path, capsys, f"def f(items, item, later):\n    {statement}\n    return item\n")
+    node = next(n for n in graph["nodes"] if n["text"] == statement)
+    assert node["defs"] == ["values"]
+    assert node["uses"] == ["items"]
+    assert ("DATA_DEP", "items", statement, "items") in pairs
+    assert ("DATA_DEP", "item", "return item", "item") in pairs
+    assert ("DATA_DEP", "later", statement, "later") not in pairs
+
+
+def test_flow_cleanup_depth_notice_and_graph_stability(tmp_path, capsys, monkeypatch):
+    source = """async def f(manager):
+    with manager:
+        try:
+            async with manager:
+                try:
+                    with manager:
+                        value = 1
+                finally:
+                    cleanup = 2
+        finally:
+            done = 3
+    return done
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    assert graph["limitations"][-1] == (
+        "Nested cleanup/context-manager depth is 5 (threshold 4) at sample.py:6; graph size grows exponentially with cleanup nesting depth."
+    )
+    assert hashlib.sha256(json.dumps(graph["nodes"], sort_keys=True, separators=(",", ":")).encode()).hexdigest() == BASE_DEPTH5_NODE_DIGEST
+    assert [(edge["source"], edge["target"], edge["kind"], edge["label"]) for edge in graph["edges"]] == BASE_DEPTH5_EDGES
+
+    monkeypatch.setattr(flow_module, "_structured_cleanup_depth", lambda _body: (0, None))
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    without_notice = json.loads(capsys.readouterr().out)["flow"]
+    assert graph["nodes"] == without_notice["nodes"]
+    assert graph["edges"] == without_notice["edges"]
+    assert graph["limitations"][:-1] == without_notice["limitations"]
+
+
+def test_flow_cleanup_depth_skips_nested_definitions():
+    tree = ast.parse("""def f(manager):
+    with manager:
+        def inner(manager):
+            with manager:
+                with manager:
+                    try:
+                        with manager:
+                            try:
+                                with manager:
+                                    pass
+                            finally:
+                                pass
+                    finally:
+                        pass
+        return 1
+""")
+    depth, location = _structured_cleanup_depth(tree.body[0].body)
+    assert depth == 1
+    assert location == (2, 4)
+
+
+def test_flow_cleanup_depth_four_has_no_notice_and_markdown_renders_depth_notice(tmp_path, capsys):
+    depth4 = """def f(manager):
+    with manager:
+        try:
+            with manager:
+                try:
+                    value = 1
+                finally:
+                    cleanup = 2
+        finally:
+            done = 3
+    return done
+"""
+    _, db = _snapshot(tmp_path, depth4)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    assert not any("Nested cleanup/context-manager depth" in item for item in graph["limitations"])
+
+    depth5 = depth4.replace("                    cleanup = 2", "                    with manager:\n                        cleanup = 2")
+    markdown_dir = tmp_path / "markdown"
+    markdown_dir.mkdir()
+    _, db = _snapshot(markdown_dir, depth5)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "markdown"]) == 0
+    output = capsys.readouterr().out
+    assert "- Nested cleanup/context-manager depth is 5 (threshold 4) at sample.py:8; graph size grows exponentially with cleanup nesting depth." in output
+
+
+@pytest.mark.parametrize("expression,message", [
+    ("(item + outside for item in items)", "deferred generator capture"),
+    ("[saved := item for item in items]", "named expression in comprehension"),
+    ("[item async for item in items]", "async comprehension"),
+    ("[holder.value for holder.value in items]", "comprehension target"),
+])
+def test_cli_refuses_unsound_comprehension_forms(tmp_path, capsys, expression, message):
+    _, db = _snapshot(tmp_path, f"async def f(items, outside, holder):\n    return {expression}\n")
+    with pytest.raises(SystemExit, match="2"):
+        main(["flow", "sample.py:f", "--db", str(db), "--snapshot"])
+    error = capsys.readouterr().err
+    assert message in error
+    assert "sample.py:2" in error
+
+
+def test_cli_manager_evaluation_failure_keeps_pre_walrus_value(tmp_path, capsys):
+    _graph, pairs = _new_flow(tmp_path, capsys, """def f(suppressor, old, make):
+    value = old
+    with suppressor:
+        with (value := make()):
+            pass
+    return value
+""")
+    assert ("CFG", "before manager 1", "exit manager 1 (raise)", "context-raise") in pairs
+    assert ("DATA_DEP", "value = old", "return value", "value") in pairs
+    assert ("DATA_DEP", "value := make()", "return value", "value") in pairs
+
+
+def test_cli_comprehension_first_iterable_uses_outer_shadowed_name(tmp_path, capsys):
+    graph, pairs = _new_flow(tmp_path, capsys, """def f(item):
+    values = [item.field for item in item]
+    return item
+""")
+    assert ("DATA_DEP", "item", "values = [item.field for item in item]", "item") in pairs
+    assert ("DATA_DEP", "item", "return item", "item") in pairs
+    node = next(n for n in graph["nodes"] if n["text"].startswith("values ="))
+    assert node["uses"] == ["item"]
+    assert node["defs"] == ["values"]
+
+
+def test_cli_nested_async_definition_still_refuses(tmp_path, capsys):
+    _, db = _snapshot(tmp_path, "def f():\n    async def inner():\n        return 1\n    return inner\n")
+    with pytest.raises(SystemExit, match="2"):
+        main(["flow", "sample.py:f", "--db", str(db), "--snapshot"])
+    assert "unsupported AsyncFunctionDef in sample.py:2" in capsys.readouterr().err
+
+
+def test_cli_structured_for_binding_tracks_access_write(tmp_path, capsys):
+    _graph, pairs = _new_flow(tmp_path, capsys, """def f(items, obj):
+    try:
+        for obj.field in items:
+            seen = obj.field
+    except ValueError:
+        observed = obj.field
+    return obj.field
+""")
+    assert ("DATA_DEP", "obj", "bind obj.field", "obj") in pairs
+    assert ("DATA_DEP", "bind obj.field", "seen = obj.field", "obj.field") in pairs
+    assert ("DATA_DEP", "bind obj.field", "observed = obj.field", "obj.field") in pairs
+
+
+def test_cli_default_comprehension_preserves_body_only_metadata(tmp_path, capsys):
+    graph, pairs = _new_flow(tmp_path, capsys, """def f(values=[x for x in seed]):
+    return values
+""")
+    assert ("DATA_DEP", "values", "return values", "values") in pairs
+    assert graph["profile"] == "python-local-cpg-v2"
+    assert graph["limitations"] == [
+        "Calls are opaque; aliases and unknown call side effects can affect memory dependencies.",
+        "Statement-level reads are conservative; wildcard object/subscript paths retain possible overlaps, but aliases are not resolved and implicit exception flow is not modeled.",
+    ]

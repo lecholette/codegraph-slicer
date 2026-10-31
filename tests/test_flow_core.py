@@ -44,15 +44,6 @@ def test_branch_join_keeps_both_definitions_and_backward_slice():
     }
 
 
-def test_unsupported_try_refuses_with_source_location():
-    with pytest.raises(UnsupportedFlowError, match=r"Try.*example.py:2"):
-        analyze_flow(
-            "def f():\n    try:\n        x = 1\n    except ValueError:\n        x = 2\n",
-            "f",
-            path="example.py",
-        )
-
-
 def test_false_early_return_guard_controls_continuation():
     graph = analyze_flow(
         "def f(flag):\n    if flag:\n        return 1\n    result = 2\n    return result\n",
