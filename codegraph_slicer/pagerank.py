@@ -3,7 +3,7 @@
 import json
 
 from .ast_extractor import CodeGraphError
-from .slicer import InvalidBudgetError, _with_output_tokens
+from .slicer import InvalidBudgetError, _with_output_tokens, tokens_for_length
 
 
 class UnknownSeedError(CodeGraphError):
@@ -118,7 +118,7 @@ def build_repo_map(
             # arithmetic includes it without constructing the output string.
             tokens = 0
             while True:
-                estimate = (size + len(str(tokens)) + 1) // 4 + 1
+                estimate = tokens_for_length(size + len(str(tokens)) + 1)
                 if estimate == tokens:
                     return estimate
                 tokens = estimate

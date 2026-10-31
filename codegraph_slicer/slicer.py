@@ -17,12 +17,19 @@ class RequiredAnchorOverflow(CodeGraphError):
 
 
 def serialized_tokens(value) -> int:
-    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"))) // 4 + 1
+    return tokens_for_length(
+        len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    )
+
+
+def tokens_for_length(n: int) -> int:
+    """Estimate tokens from a total printed character count."""
+    return n // 4 + 1
 
 
 def rendered_tokens(text: str) -> int:
     """Estimate the exact printed text, including its trailing newline."""
-    return (len(text) + 1) // 4 + 1
+    return tokens_for_length(len(text) + 1)
 
 
 def _with_output_tokens(result, render_estimator=None):

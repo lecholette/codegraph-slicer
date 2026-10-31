@@ -10,8 +10,8 @@ import sqlite3
 from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
-from .slicer import slice_context, rendered_tokens
-from .delta import _printed_tokens, compute_delta, summarize_delta
+from .slicer import slice_context, rendered_tokens, tokens_for_length
+from .delta import compute_delta, summarize_delta
 from .flow_query import query_flow
 
 
@@ -47,7 +47,7 @@ class _MapMarkdownEstimator:
         size += item_cost + 2 * item_count
         tokens = 0
         while True:
-            estimate = (size - len("0") + len(str(tokens)) + 1) // 4 + 1
+            estimate = tokens_for_length(size - len("0") + len(str(tokens)) + 1)
             if estimate == tokens:
                 return estimate
             tokens = estimate
@@ -112,10 +112,10 @@ def _flow_markdown(result):
     blocks.append("## Limitations")
     blocks.extend(f"- {item}" for item in graph["limitations"])
     text = "\n\n".join(blocks)
-    estimate = len(text + "\n") // 4 + 1
+    estimate = rendered_tokens(text)
     while True:
         rendered = text.replace("this view ≈ 0 tokens", f"this view ≈ {estimate} tokens", 1)
-        updated = len(rendered + "\n") // 4 + 1
+        updated = rendered_tokens(rendered)
         if updated == estimate:
             return rendered
         estimate = updated
@@ -325,7 +325,7 @@ def main(argv=None):
                     result, args.max_tokens, full=args.full,
                     selected_tests=bool(args.selected_test),
                     render_estimator=(
-                        lambda candidate: _printed_tokens(_markdown(candidate))
+                        lambda candidate: rendered_tokens(_markdown(candidate))
                     ) if args.format == "markdown" else None,
                 )
             else:
@@ -371,7 +371,7 @@ def main(argv=None):
             raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
         if args.cmd == "delta":
             from .slicer import InvalidBudgetError
-            if _printed_tokens(rendered) > args.max_tokens:
+            if rendered_tokens(rendered) > args.max_tokens:
                 label = "rendered Markdown" if args.format == "markdown" else "printed JSON"
                 raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
         print(rendered)
