@@ -1,6 +1,7 @@
 """Static graph differences; test reachability never asserts tests were executed."""
 
 from .ast_extractor import CodeGraphError, plain_target
+from .slicer import rendered_tokens
 
 
 def _cycles(graph):
@@ -317,12 +318,9 @@ def _with_serialized_tokens(payload):
     result = dict(payload)
     result["serialized_tokens"] = 0
     while True:
-        estimate = _printed_tokens(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        estimate = rendered_tokens(
+            json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        )
         if result["serialized_tokens"] == estimate:
             return result
         result["serialized_tokens"] = estimate
-
-
-def _printed_tokens(text):
-    """Estimate tokens for text printed with its terminating newline."""
-    return len(text + "\n") // 4 + 1
