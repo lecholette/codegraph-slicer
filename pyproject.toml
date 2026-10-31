@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codegraph-slicer"
+version = "0.1.0"
+description = "Stdlib-only static Python code graph: repo maps, symbol slices, local flow slices and base-vs-head deltas"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = []
+authors = [{name = "Chris Cholette"}]
+license-files = ["LICENSE", "NOTICE"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+
+[project.scripts]
+codegraph-slicer = "codegraph_slicer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/lecholette/codegraph-slicer"
+
+[tool.setuptools]
+packages = ["codegraph_slicer"]
