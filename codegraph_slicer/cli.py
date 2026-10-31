@@ -92,7 +92,8 @@ def _markdown(result):
         blocks = ["# Static delta report"]
         if "summary" in result:
             blocks.append("## Summary\n\n" + "\n".join(
-                f"- **{name.replace('_', ' ')}:** {count}"
+                f"- **{name.replace('_', ' ')}"
+                f"{' (none selected)' if name == 'untested_modified_symbols' and result['summary']['test_selection'] == 'none_selected' else ''}:** {count}"
                 for name, count in result["summary"]["counts"].items()
             ))
             blocks.append(
@@ -103,8 +104,12 @@ def _markdown(result):
                 + result["summary"]["retrieve_details"]
             )
         for kind, count in result.get("omitted", {}).items():
-            blocks.append(f"Omitted **{kind.replace('_', ' ')}** records: {count}")
-        for kind in ("boundary_violations", "new_cycles", "complexity_drift", "import_changes", "modified_symbols", "affected_entrypoints", "untested_modified_symbols", "test_coverage", "added_edges", "removed_edges"):
+            if count:
+                blocks.append(f"Omitted **{kind.replace('_', ' ')}** records: {count}")
+        kinds = ("boundary_violations", "new_cycles", "untested_modified_symbols", "test_coverage",
+                 "complexity_drift", "import_changes", "affected_entrypoints", "modified_symbols",
+                 "added_edges", "removed_edges")
+        for kind in kinds:
             values = result.get(kind, [])
             if values:
                 bullets = []
@@ -115,7 +120,10 @@ def _markdown(result):
                         bullets.append("- " + " · ".join(str(value) for value in item))
                     else:
                         bullets.append("- " + str(item))
-                blocks.append("## " + kind.replace("_", " ").title() + "\n\n" + "\n".join(bullets))
+                title = kind.replace("_", " ").title()
+                if kind == "untested_modified_symbols" and "summary" in result and result["summary"]["test_selection"] == "none_selected":
+                    title += " (none selected)"
+                blocks.append("## " + title + "\n\n" + "\n".join(bullets))
         blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
         return "\n\n".join(blocks)
     if "flow" in result:
@@ -276,7 +284,7 @@ def main(argv=None):
                     result, args.max_tokens, full=args.full,
                     selected_tests=bool(args.selected_test),
                     render_estimator=(
-                        lambda candidate: serialized_tokens(_markdown(candidate))
+                        lambda candidate: serialized_tokens(_markdown(candidate) + "\n")
                     ) if args.format == "markdown" else None,
                 )
             else:
@@ -310,7 +318,7 @@ def main(argv=None):
         )
         if args.cmd == "delta" and args.format == "markdown":
             from .slicer import InvalidBudgetError
-            if serialized_tokens(rendered) > args.max_tokens:
+            if serialized_tokens(rendered + "\n") > args.max_tokens:
                 raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
         print(rendered)
         return 0

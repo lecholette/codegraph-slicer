@@ -1,4 +1,5 @@
 import json
+import re
 
 import pytest
 
@@ -18,6 +19,23 @@ def _snapshot(root, source, test_source=None):
     with GraphStore(db) as store:
         store.sync_workspace(root)
     return db
+
+
+def _snapshot_files(root, files):
+    root.mkdir()
+    for name, source in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    db = root.parent / f"{root.name}.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(root)
+    return db
+
+
+def _markdown_section_count(markdown, title):
+    match = re.search(rf"(?ms)^## {re.escape(title)}\n\n(.*?)(?=^## |\Z)", markdown)
+    return 0 if match is None else sum(line.startswith("- ") for line in match.group(1).splitlines())
 
 
 def _delta(tmp_path, capsys, base_source, head_source, *options, test_source=None):
@@ -160,8 +178,8 @@ def test_delta_markdown_truncates_to_rendered_budget(tmp_path, capsys):
     markdown = capsys.readouterr().out
     assert markdown.startswith("# Static delta report")
     assert serialized_tokens(markdown) <= 500
-    assert "Omitted **modified symbols** records: 19" in markdown
-    assert "Omitted **test coverage** records: 16" in markdown
+    assert "Omitted **modified symbols** records: 17" in markdown
+    assert "Omitted **test coverage** records: 14" in markdown
 
 
 def test_delta_help_exposes_budget_and_full_retrieval(capsys):
@@ -190,3 +208,178 @@ def test_delta_default_budget_matches_explicit_8000_on_large_snapshot(tmp_path, 
     assert payload["serialized_tokens"] <= 8000
     assert payload["summary"]["counts"]["modified_symbols"] == 601
     assert payload["omitted"]["modified_symbols"] > 0
+
+
+def test_delta_prioritizes_untested_symbols_and_coverage_before_imports(tmp_path, capsys):
+    base = _snapshot_files(tmp_path / "base", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.a import target\n\ndef changed():\n    return 1\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    head = _snapshot_files(tmp_path / "head", {
+        "pkg/a.py": "from pkg.b import changed\n\ndef target():\n    return 1\n",
+        "pkg/b.py": "from pkg.c import other\n\ndef changed():\n    return 2\n",
+        "pkg/c.py": "from pkg.a import target\n\ndef other():\n    return 3\n",
+    })
+    assert main(["delta", "--base-db", str(base), "--head-db", str(head),
+                 "--forbid-import", "pkg.a", "pkg.b", "--max-tokens", "1200"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["boundary_violations"] == [
+        {"source": "pkg.a", "target": "pkg.b"},
+        {"source": "pkg.a", "target": "pkg.b.changed"},
+    ]
+    assert payload["new_cycles"] == [["pkg.a", "pkg.b", "pkg.c"]]
+    assert payload["untested_modified_symbols"] == ["pkg.a:", "pkg.b:", "pkg.b:changed", "pkg.c:"]
+    assert payload["omitted"]["untested_modified_symbols"] == 0
+    assert payload["test_coverage"] == [
+        {"symbol": symbol, "reachable_tests": [], "updated_or_selected_tests": [],
+         "status": "no_static_test_reaches"}
+        for symbol in ["pkg.a:", "pkg.b:", "pkg.b:changed", "pkg.c:"]
+    ]
+    assert payload["omitted"]["test_coverage"] == 0
+    assert len(payload["import_changes"]) == 8
+    emitted_order = [key for key in payload if key in {
+        "boundary_violations", "new_cycles", "untested_modified_symbols",
+        "test_coverage", "import_changes",
+    }]
+    assert emitted_order == ["boundary_violations", "new_cycles", "untested_modified_symbols",
+                             "test_coverage", "import_changes"]
+
+
+def test_delta_full_emits_import_changes_and_accounts_for_every_kind(tmp_path, capsys):
+    base = _snapshot_files(tmp_path / "base", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.a import target\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    head = _snapshot_files(tmp_path / "head", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.c import other\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    args = ["delta", "--base-db", str(base), "--head-db", str(head),
+            "--full", "--max-tokens", "10000000"]
+    assert main(args) == 0
+    full_json = json.loads(capsys.readouterr().out)
+    assert full_json["import_changes"] == [
+        {"change": "added", "source": "pkg.b:", "target": "pkg.c:", "line": 1},
+        {"change": "added", "source": "pkg.b:", "target": "pkg.c:other", "line": 1},
+        {"change": "removed", "source": "pkg.b:", "target": "pkg.a:", "line": 1},
+        {"change": "removed", "source": "pkg.b:", "target": "pkg.a:target", "line": 1},
+    ]
+    assert all(count == 0 for count in full_json["omitted"].values())
+    totals = {
+        "added_edges": 2, "removed_edges": 2, "complexity_drift": 0,
+        "boundary_violations": 0, "modified_symbols": 1,
+        "untested_modified_symbols": 1, "affected_entrypoints": 0,
+        "new_cycles": 0, "test_coverage": 1, "import_changes": 4,
+    }
+    for kind, total in totals.items():
+        assert len(full_json[kind]) + full_json["omitted"][kind] == total
+        assert len(full_json[kind]) == total
+    assert main([*args, "--format", "markdown"]) == 0
+    markdown = capsys.readouterr().out
+    for kind in ("added_edges", "removed_edges", "complexity_drift", "boundary_violations",
+                 "modified_symbols", "untested_modified_symbols", "affected_entrypoints",
+                 "new_cycles", "test_coverage", "import_changes"):
+        assert _markdown_section_count(markdown, kind.replace("_", " ").title()) == totals[kind]
+    assert "Omitted **import changes** records:" not in markdown
+
+
+@pytest.mark.parametrize("output_format", ["json", "markdown"])
+def test_delta_summary_emitted_plus_omitted_equals_total_for_every_kind(tmp_path, capsys, output_format):
+    base = _snapshot_files(tmp_path / "base", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.a import target\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    head = _snapshot_files(tmp_path / "head", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.c import other\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    args = ["delta", "--base-db", str(base), "--head-db", str(head), "--max-tokens", "1200"]
+    if output_format == "markdown":
+        args.extend(["--format", "markdown"])
+    assert main(args) == 0
+    output = capsys.readouterr().out
+    if output_format == "json":
+        payload = json.loads(output)
+        for kind, total in payload["summary"]["counts"].items():
+            assert len(payload.get(kind, [])) + payload["omitted"][kind] == total
+    else:
+        for kind in ("boundary_violations", "new_cycles", "complexity_drift", "added_edges",
+                     "removed_edges", "modified_symbols", "affected_entrypoints",
+                     "untested_modified_symbols", "test_coverage", "import_changes"):
+            label = kind.replace("_", " ")
+            suffix = r" \(none selected\)" if kind == "untested_modified_symbols" else ""
+            total_match = re.search(
+                rf"(?m)^- \*\*{re.escape(label)}{suffix}:\*\* (\d+)$", output
+            )
+            assert total_match is not None
+            total = int(total_match.group(1))
+            omitted_match = re.search(rf"Omitted \*\*{re.escape(label)}\*\* records: (\d+)", output)
+            omitted = 0 if omitted_match is None else int(omitted_match.group(1))
+            title = label.title() + (" (none selected)" if kind == "untested_modified_symbols" else "")
+            emitted = _markdown_section_count(output, title)
+            assert emitted + omitted == total, kind
+
+
+def test_delta_tight_budget_keeps_test_gaps_before_import_changes(tmp_path, capsys):
+    base = _snapshot_files(tmp_path / "base", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.a import target\n\ndef changed():\n    return 1\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    head = _snapshot_files(tmp_path / "head", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.c import other\n\ndef changed():\n    return 2\n",
+        "pkg/c.py": "def other():\n    return 3\n",
+    })
+    assert main(["delta", "--base-db", str(base), "--head-db", str(head),
+                 "--max-tokens", "300"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["untested_modified_symbols"] == ["pkg.b:", "pkg.b:changed"]
+    assert [item["symbol"] for item in payload["test_coverage"]] == ["pkg.b:", "pkg.b:changed"]
+    assert "import_changes" not in payload
+    assert payload["omitted"]["import_changes"] == 4
+    assert payload["omitted"]["untested_modified_symbols"] == 0
+    assert payload["omitted"]["test_coverage"] == 0
+
+
+@pytest.mark.parametrize("budget", [300, 301, 340, 342, 360])
+def test_delta_markdown_printed_text_respects_budget_and_hides_zero_omissions(
+    tmp_path, capsys, budget
+):
+    base = _snapshot_files(tmp_path / f"base-{budget}", {
+        "pkg/a.py": "def target():\n    return 1\n",
+        "pkg/b.py": "from pkg.a import target\ndef other():\n    return 3\n",
+        "tests/test_a.py": "from pkg.a import target\ndef test_hit():\n    assert target() == 1\ndef test_miss():\n    assert 1 == 1\n",
+    })
+    head = _snapshot_files(tmp_path / f"head-{budget}", {
+        "pkg/a.py": "from pkg.b import other\ndef target():\n    return 2\n",
+        "pkg/b.py": "from pkg.a import target\ndef other():\n    return 3\n",
+        "tests/test_a.py": "from pkg.a import target\ndef test_hit():\n    assert target() == 1\ndef test_miss():\n    assert 1 == 1\n",
+    })
+    assert main(["delta", "--base-db", str(base), "--head-db", str(head),
+                 "--forbid-import", "pkg.a", "pkg.b", "--format", "markdown",
+                 "--max-tokens", str(budget)]) == 0
+    markdown = capsys.readouterr().out
+    assert serialized_tokens(markdown) <= budget
+    assert "Omitted **removed edges** records: 0" not in markdown
+
+
+def test_delta_markdown_accounts_each_kind_and_names_empty_untested_selection(tmp_path, capsys):
+    base = _snapshot_files(tmp_path / "base", {
+        "pkg/mod.py": "def target():\n    return 1\n",
+        "tests/test_mod.py": "from pkg.mod import target\n\ndef test_target():\n    assert target() == 1\n",
+    })
+    head = _snapshot_files(tmp_path / "head", {
+        "pkg/mod.py": "def target():\n    return 2\n",
+        "tests/test_mod.py": "from pkg.mod import target\n\ndef test_target():\n    assert target() == 2\n",
+    })
+    assert main(["delta", "--base-db", str(base), "--head-db", str(head),
+                 "--format", "markdown", "--max-tokens", "10000"]) == 0
+    markdown = capsys.readouterr().out
+    assert "**untested modified symbols (none selected):** 0" in markdown
+    assert "## Untested Modified Symbols" not in markdown

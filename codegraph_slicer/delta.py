@@ -249,6 +249,7 @@ def summarize_delta(
     }
     if full:
         payload = dict(result)
+        payload["import_changes"] = imports
         payload["omitted"] = {**{kind: 0 for kind in kinds}, "import_changes": 0}
     else:
         payload = {"summary": summary, "omitted": dict(counts)}
@@ -257,17 +258,17 @@ def summarize_delta(
         priority = (
             ("boundary_violations", result["boundary_violations"]),
             ("new_cycles", result["new_cycles"]),
+            ("untested_modified_symbols", result["untested_modified_symbols"]),
+            ("test_coverage", [
+                {**item, "status": status}
+                for item, status in zip(result["test_coverage"], statuses)
+            ]),
             ("complexity_drift", sorted(
                 (item for item in result["complexity_drift"] if item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
             )),
             ("import_changes", imports),
             ("affected_entrypoints", result["affected_entrypoints"]),
-            ("untested_modified_symbols", result["untested_modified_symbols"]),
-            ("test_coverage", [
-                {**item, "status": status}
-                for item, status in zip(result["test_coverage"], statuses)
-            ]),
             ("complexity_drift", sorted(
                 (item for item in result["complexity_drift"] if not item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
