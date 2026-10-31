@@ -57,6 +57,114 @@ def test_map_json_counts_omitted_files_and_has_no_note_when_complete(tmp_path, c
     assert retry["omitted"] == {"files": 1}
 
 
+def test_map_cli_additive_accounting_preserves_ranked_selection_and_print_size(
+    tmp_path, capsys
+):
+    db = _snapshot(tmp_path / "ranked", {
+        "pkg/a.py": "def alpha():\n    return bravo()\n",
+        "pkg/b.py": "def bravo():\n    return 7\n",
+        "pkg/c.py": 'def charlie():\n    return "雪 `ticks`"\n',
+        "pkg/d.py": "def delta():\n    return charlie()\n",
+        "pkg/e.py": "def echo():\n    return 99\n",
+        "pkg/large.py": '"""' + "x" * 10000 + '"""\ndef huge():\n    return 4\n',
+    })
+    expected = {
+        "json": {
+            24: [],
+            45: ["pkg/a.py"],
+            65: ["pkg/a.py", "pkg/b.py"],
+            87: ["pkg/a.py", "pkg/b.py", "pkg/c.py"],
+            100: ["pkg/a.py", "pkg/b.py", "pkg/c.py"],
+            108: ["pkg/a.py", "pkg/b.py", "pkg/c.py", "pkg/d.py"],
+            128: ["pkg/a.py", "pkg/b.py", "pkg/c.py", "pkg/d.py", "pkg/e.py"],
+        },
+        "markdown": {
+            27: [],
+            42: ["pkg/a.py"],
+            57: ["pkg/a.py", "pkg/b.py"],
+            87: ["pkg/a.py", "pkg/b.py", "pkg/c.py", "pkg/d.py"],
+            102: ["pkg/a.py", "pkg/b.py", "pkg/c.py", "pkg/d.py", "pkg/e.py"],
+        },
+    }
+    expected_sizes = {
+        "json": {24: 24, 45: 45, 65: 65, 87: 87, 100: 87, 108: 108, 128: 128},
+        "markdown": {27: 27, 42: 42, 57: 57, 87: 87, 102: 102},
+    }
+    for output_format, cases in expected.items():
+        for budget, paths in cases.items():
+            printed = _invoke(capsys, [
+                "map", "--db", str(db), "--snapshot", "--format", output_format,
+                "--max-tokens", str(budget),
+            ])
+            stdout_tokens = len(printed) // 4 + 1
+            assert stdout_tokens == expected_sizes[output_format][budget]
+            if output_format == "json":
+                payload = json.loads(printed)
+                assert [item["path"] for item in payload["items"]] == paths
+                assert payload["tokens"] == stdout_tokens <= budget
+                assert len(payload["items"]) + payload.get("omitted", {}).get("files", 0) == 6
+            else:
+                import re
+
+                rendered_paths = re.findall(r"\n```python\n([^\n]+):1\n", printed)
+                assert rendered_paths == paths
+                estimate = int(re.search(r"Estimated context tokens: (\d+)", printed)[1])
+                assert estimate == stdout_tokens <= budget
+                omitted = re.search(r"Omitted \*\*files\*\* records: (\d+)", printed)
+                assert (int(omitted[1]) if omitted else 0) == 6 - len(paths)
+            assert "pkg/large.py" not in paths
+
+
+def test_map_json_accounting_closes_root_and_handles_omitted_digit_transition(
+    tmp_path, capsys
+):
+    files = {
+        f"pkg/f{index:02}.py": f"def item_{index}():\n    return {index}\n"
+        for index in range(12)
+    }
+    files["pkg/zz_large.py"] = '"""' + "x" * 10000 + '"""\ndef huge():\n    return 1\n'
+    db = _snapshot(tmp_path / "many", files)
+    expected = {
+        24: [],
+        46: [],
+        47: ["pkg/f00.py"],
+        91: ["pkg/f00.py", "pkg/f01.py"],
+        92: ["pkg/f00.py", "pkg/f01.py", "pkg/f02.py"],
+        114: ["pkg/f00.py", "pkg/f01.py", "pkg/f02.py", "pkg/f03.py"],
+        294: [f"pkg/f{index:02}.py" for index in range(11)],
+        295: [f"pkg/f{index:02}.py" for index in range(12)],
+    }
+    expected_sizes = {24: 24, 46: 24, 47: 47, 91: 69, 92: 92, 114: 114, 294: 272, 295: 295}
+    for budget, paths in expected.items():
+        printed = _invoke(capsys, [
+            "map", "--db", str(db), "--snapshot", "--max-tokens", str(budget),
+        ])
+        payload = json.loads(printed)
+        assert [item["path"] for item in payload["items"]] == paths
+        assert payload["tokens"] == len(printed) // 4 + 1 == expected_sizes[budget]
+        assert payload["tokens"] <= budget
+        assert len(paths) + payload["omitted"]["files"] == 13
+        assert "pkg/zz_large.py" not in paths
+
+    complete_db = _snapshot(tmp_path / "complete", {
+        f"pkg/f{index:02}.py": f"def item_{index}():\n    return {index}\n"
+        for index in range(12)
+    })
+    before_complete = json.loads(_invoke(capsys, [
+        "map", "--db", str(complete_db), "--snapshot", "--max-tokens", "276",
+    ]))
+    assert len(before_complete["items"]) == 11
+    assert before_complete["omitted"] == {"files": 1}
+    assert before_complete["tokens"] == 272
+    complete_text = _invoke(capsys, [
+        "map", "--db", str(complete_db), "--snapshot", "--max-tokens", "277",
+    ])
+    complete = json.loads(complete_text)
+    assert len(complete["items"]) == 12
+    assert "omitted" not in complete
+    assert complete["tokens"] == len(complete_text) // 4 + 1 == 277
+
+
 def test_slice_json_omissions_count_records_not_body_fallback(tmp_path, capsys):
     db = _snapshot(tmp_path / "src", {
         "pkg/target.py": "def target():\n    return helper()\n\ndef helper():\n" + "\n".join(f"    value_{i} = {i}" for i in range(200)) + "\n    return 7\n",

@@ -10,13 +10,47 @@ import sqlite3
 from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
-from .slicer import slice_context, serialized_tokens, rendered_tokens
+from .slicer import slice_context, rendered_tokens
 from .delta import _printed_tokens, compute_delta, summarize_delta
 from .flow_query import query_flow
 
 
 _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
+
+
+def _map_markdown_item(item):
+    fence = "`" * max(
+        3,
+        1 + max((len(run) for run in re.findall(r"`+", item["text"])), default=0),
+    )
+    return f"### {item['symbol']}\n\n{fence}python\n{item['text']}\n{fence}"
+
+
+class _MapMarkdownEstimator:
+    """Additive exact character accounting for the CLI map Markdown shape."""
+
+    def item_cost(self, item):
+        return len(_map_markdown_item(item))
+
+    def __call__(self, payload):
+        return rendered_tokens(_markdown(payload))
+
+    def estimate_map(self, item_cost, item_count, omitted):
+        fixed = ["Estimated context tokens: 0"]
+        if omitted:
+            fixed.extend(
+                [f"Omitted **files** records: {omitted}", "rerun with --max-tokens N"]
+            )
+        fixed.append("## repository_map")
+        size = sum(map(len, fixed)) + 2 * (len(fixed) - 1)
+        size += item_cost + 2 * item_count
+        tokens = 0
+        while True:
+            estimate = (size - len("0") + len(str(tokens)) + 1) // 4 + 1
+            if estimate == tokens:
+                return estimate
+            tokens = estimate
 
 
 def _node_refs(nodes):
@@ -147,16 +181,7 @@ def _markdown(result):
         for name, items in result["sections"].items():
             blocks.append("## " + name.replace("_", " "))
             for item in items:
-                fence = "`" * max(
-                    3,
-                    1
-                    + max(
-                        (len(run) for run in re.findall(r"`+", item["text"])), default=0
-                    ),
-                )
-                blocks.append(
-                    f"### {item['symbol']}\n\n{fence}python\n{item['text']}\n{fence}"
-                )
+                blocks.append(_map_markdown_item(item))
         return "\n\n".join(blocks)
     if "items" in result:
         mapped = {
@@ -317,7 +342,7 @@ def main(argv=None):
                     result = build_repo_map(
                         store, args.seed, args.max_tokens,
                         render_estimator=(
-                            lambda candidate: rendered_tokens(_markdown(candidate))
+                            _MapMarkdownEstimator()
                         ) if args.format == "markdown" else None,
                     )
                 elif args.cmd == "flow":

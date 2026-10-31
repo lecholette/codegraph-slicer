@@ -1,5 +1,7 @@
 """Deterministic personalized PageRank and one skeleton per indexed file."""
 
+import json
+
 from .ast_extractor import CodeGraphError
 from .slicer import InvalidBudgetError, _with_output_tokens
 
@@ -82,6 +84,64 @@ def build_repo_map(
         }
         for path in sorted(file_scores, key=lambda p: (-file_scores[p], p))
     ]
+    # The default JSON representation is additive: each item is encoded once,
+    # then candidate prefixes are measured from character counts. Keep the
+    # general estimator path below for callers with arbitrary renderers.
+    map_estimator = render_estimator if hasattr(render_estimator, "estimate_map") else None
+    if render_estimator is None or map_estimator is not None:
+        item_costs = (
+            [map_estimator.item_cost(item) for item in complete_items]
+            if map_estimator is not None
+            else [
+                len(json.dumps(item, ensure_ascii=False, separators=(",", ":")))
+                for item in complete_items
+            ]
+        )
+
+        def estimate_cost(item_cost, count):
+            if map_estimator is not None:
+                return map_estimator.estimate_map(item_cost, count, total_files - count)
+            # Match compact JSON key ordering and escaping exactly, including
+            # the token and omitted-count digit transitions and final newline.
+            size = (
+                len('{"tokens":') + len(",\"items\":[")
+                + item_cost + max(0, count - 1)
+                + len("]}")
+            )
+            omitted = total_files - count
+            if omitted:
+                size += (
+                    len(',"omitted":{"files":') + len(str(omitted))
+                    + len('},"retrieve_details":"rerun with --max-tokens N"')
+                )
+            # json output has one printed newline. rendered_tokens' integer
+            # arithmetic includes it without constructing the output string.
+            tokens = 0
+            while True:
+                estimate = (size + len(str(tokens)) + 1) // 4 + 1
+                if estimate == tokens:
+                    return estimate
+                tokens = estimate
+
+        complete_cost = sum(item_costs)
+        complete_count = len(complete_items)
+        complete_tokens = estimate_cost(complete_cost, complete_count)
+        if complete_tokens <= max_tokens:
+            return result(complete_items)
+        selected = []
+        selected_cost = 0
+        for index, item_cost in enumerate(item_costs):
+            candidate_count = len(selected) + 1
+            if estimate_cost(selected_cost + item_cost, candidate_count) <= max_tokens:
+                selected.append(complete_items[index])
+                selected_cost += item_cost
+        final = result(selected)
+        if final["tokens"] > max_tokens:
+            raise InvalidBudgetError(
+                f"map omission metadata requires {final['tokens']} tokens; budget is {max_tokens}"
+            )
+        return final
+
     complete = result(complete_items)
     if complete["tokens"] <= max_tokens:
         return complete
