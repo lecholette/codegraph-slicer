@@ -298,6 +298,9 @@ the error and continue after the context statement, skipping the remaining suite
 Suppression never directly converts return, break, or continue into normal flow.
 These are conservative possibilities, not inferred manager behavior or runtime
 execution; implicit async protocol operations are modeled without executing them.
+When nested `try` blocks with nonempty `finally` suites, `with`, and `async with`
+exceed depth 4 inside the selected function body, the report adds a limitation
+with the observed depth and deepest block location because graph size grows exponentially.
 
 List/set/dict comprehensions and generator expressions collapse their reads into
 the enclosing statement. The first iterable reads the outer scope. All target

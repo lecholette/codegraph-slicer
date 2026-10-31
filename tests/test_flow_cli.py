@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 import os
@@ -5,8 +6,10 @@ import subprocess
 
 import pytest
 
+import codegraph_slicer.flow as flow_module
 from codegraph_slicer import FlowQueryError, GraphStore, query_flow
 from codegraph_slicer.cli import main
+from codegraph_slicer.flow import _structured_cleanup_depth
 
 SOURCE = """def calculate(amount):
     billed = amount * 2
@@ -17,6 +20,156 @@ SOURCE = """def calculate(amount):
     return total
 """
 
+
+BASE_DEPTH5_NODE_DIGEST = "e554d7daea377641049f78e6b435abd6ae30d643272d6ab696aa705f9cdb095f"
+BASE_DEPTH5_EDGES = [
+    ('n0000', 'n0002', 'AST', 'parameter'),
+    ('n0000', 'n0004', 'AST', 'body'),
+    ('n0000', 'n0014', 'AST', 'body'),
+    ('n0004', 'n0005', 'AST', 'body'),
+    ('n0005', 'n0007', 'AST', 'body'),
+    ('n0005', 'n0013', 'AST', 'finalbody'),
+    ('n0007', 'n0008', 'AST', 'body'),
+    ('n0008', 'n0010', 'AST', 'body'),
+    ('n0008', 'n0012', 'AST', 'finalbody'),
+    ('n0010', 'n0011', 'AST', 'body'),
+    ('n0000', 'n0002', 'CFG', 'parameter'),
+    ('n0002', 'n0015', 'CFG', 'next'),
+    ('n0003', 'n0001', 'CFG', 'raise-exit'),
+    ('n0003', 'n0017', 'CFG', 'next'),
+    ('n0004', 'n0016', 'CFG', 'evaluate-manager'),
+    ('n0005', 'n0018', 'CFG', 'next'),
+    ('n0006', 'n0020', 'CFG', 'next'),
+    ('n0006', 'n0035', 'CFG', 'finally-raise'),
+    ('n0007', 'n0019', 'CFG', 'evaluate-manager'),
+    ('n0008', 'n0021', 'CFG', 'next'),
+    ('n0009', 'n0023', 'CFG', 'next'),
+    ('n0009', 'n0027', 'CFG', 'finally-raise'),
+    ('n0010', 'n0022', 'CFG', 'evaluate-manager'),
+    ('n0011', 'n0024', 'CFG', 'context-raise'),
+    ('n0011', 'n0026', 'CFG', 'context-normal'),
+    ('n0012', 'n0032', 'CFG', 'context-raise'),
+    ('n0013', 'n0040', 'CFG', 'context-raise'),
+    ('n0014', 'n0001', 'CFG', 'raise-exit'),
+    ('n0014', 'n0001', 'CFG', 'return-exit'),
+    ('n0015', 'n0004', 'CFG', 'complete'),
+    ('n0016', 'n0001', 'CFG', 'raise-exit'),
+    ('n0016', 'n0003', 'CFG', 'complete'),
+    ('n0017', 'n0005', 'CFG', 'complete'),
+    ('n0018', 'n0007', 'CFG', 'complete'),
+    ('n0019', 'n0006', 'CFG', 'complete'),
+    ('n0019', 'n0035', 'CFG', 'finally-raise'),
+    ('n0020', 'n0008', 'CFG', 'complete'),
+    ('n0021', 'n0010', 'CFG', 'complete'),
+    ('n0022', 'n0009', 'CFG', 'complete'),
+    ('n0022', 'n0027', 'CFG', 'finally-raise'),
+    ('n0023', 'n0011', 'CFG', 'complete'),
+    ('n0023', 'n0024', 'CFG', 'context-raise'),
+    ('n0024', 'n0025', 'CFG', 'suppressed-exit'),
+    ('n0024', 'n0027', 'CFG', 'finally-raise'),
+    ('n0025', 'n0030', 'CFG', 'finally-normal'),
+    ('n0026', 'n0027', 'CFG', 'finally-raise'),
+    ('n0026', 'n0030', 'CFG', 'finally-normal'),
+    ('n0027', 'n0028', 'CFG', 'next'),
+    ('n0028', 'n0012', 'CFG', 'complete'),
+    ('n0028', 'n0032', 'CFG', 'context-raise'),
+    ('n0029', 'n0032', 'CFG', 'context-raise'),
+    ('n0029', 'n0034', 'CFG', 'context-normal'),
+    ('n0030', 'n0031', 'CFG', 'next'),
+    ('n0031', 'n0029', 'CFG', 'complete'),
+    ('n0031', 'n0032', 'CFG', 'context-raise'),
+    ('n0032', 'n0033', 'CFG', 'suppressed-exit'),
+    ('n0032', 'n0035', 'CFG', 'finally-raise'),
+    ('n0033', 'n0038', 'CFG', 'finally-normal'),
+    ('n0034', 'n0035', 'CFG', 'finally-raise'),
+    ('n0034', 'n0038', 'CFG', 'finally-normal'),
+    ('n0035', 'n0036', 'CFG', 'next'),
+    ('n0036', 'n0013', 'CFG', 'complete'),
+    ('n0036', 'n0040', 'CFG', 'context-raise'),
+    ('n0037', 'n0040', 'CFG', 'context-raise'),
+    ('n0037', 'n0042', 'CFG', 'context-normal'),
+    ('n0038', 'n0039', 'CFG', 'next'),
+    ('n0039', 'n0037', 'CFG', 'complete'),
+    ('n0039', 'n0040', 'CFG', 'context-raise'),
+    ('n0040', 'n0001', 'CFG', 'raise-exit'),
+    ('n0040', 'n0041', 'CFG', 'suppressed-exit'),
+    ('n0041', 'n0043', 'CFG', 'next'),
+    ('n0042', 'n0001', 'CFG', 'raise-exit'),
+    ('n0042', 'n0043', 'CFG', 'next'),
+    ('n0043', 'n0001', 'CFG', 'raise-exit'),
+    ('n0043', 'n0014', 'CFG', 'complete'),
+    ('n0003', 'n0005', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0007', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0017', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0018', 'CONTROL_DEP', 'next'),
+    ('n0003', 'n0019', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0008', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0010', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0020', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0021', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0022', 'CONTROL_DEP', 'next'),
+    ('n0006', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0006', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0006', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0009', 'n0023', 'CONTROL_DEP', 'next'),
+    ('n0009', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0009', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0009', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0011', 'n0024', 'CONTROL_DEP', 'context-raise'),
+    ('n0011', 'n0026', 'CONTROL_DEP', 'context-normal'),
+    ('n0016', 'n0003', 'CONTROL_DEP', 'complete'),
+    ('n0019', 'n0006', 'CONTROL_DEP', 'complete'),
+    ('n0019', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0019', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0019', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0022', 'n0009', 'CONTROL_DEP', 'complete'),
+    ('n0022', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0022', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0022', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0023', 'n0011', 'CONTROL_DEP', 'complete'),
+    ('n0023', 'n0024', 'CONTROL_DEP', 'context-raise'),
+    ('n0024', 'n0025', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0024', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0024', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0024', 'n0030', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0024', 'n0031', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0024', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0026', 'n0027', 'CONTROL_DEP', 'finally-raise'),
+    ('n0026', 'n0028', 'CONTROL_DEP', 'finally-raise'),
+    ('n0026', 'n0030', 'CONTROL_DEP', 'finally-normal'),
+    ('n0026', 'n0031', 'CONTROL_DEP', 'finally-normal'),
+    ('n0026', 'n0032', 'CONTROL_DEP', 'finally-raise'),
+    ('n0028', 'n0012', 'CONTROL_DEP', 'complete'),
+    ('n0029', 'n0032', 'CONTROL_DEP', 'context-raise'),
+    ('n0029', 'n0034', 'CONTROL_DEP', 'context-normal'),
+    ('n0031', 'n0029', 'CONTROL_DEP', 'complete'),
+    ('n0031', 'n0032', 'CONTROL_DEP', 'context-raise'),
+    ('n0032', 'n0033', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0032', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0032', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0032', 'n0038', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0032', 'n0039', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0032', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0034', 'n0035', 'CONTROL_DEP', 'finally-raise'),
+    ('n0034', 'n0036', 'CONTROL_DEP', 'finally-raise'),
+    ('n0034', 'n0038', 'CONTROL_DEP', 'finally-normal'),
+    ('n0034', 'n0039', 'CONTROL_DEP', 'finally-normal'),
+    ('n0034', 'n0040', 'CONTROL_DEP', 'finally-raise'),
+    ('n0036', 'n0013', 'CONTROL_DEP', 'complete'),
+    ('n0037', 'n0040', 'CONTROL_DEP', 'context-raise'),
+    ('n0037', 'n0042', 'CONTROL_DEP', 'context-normal'),
+    ('n0039', 'n0037', 'CONTROL_DEP', 'complete'),
+    ('n0039', 'n0040', 'CONTROL_DEP', 'context-raise'),
+    ('n0040', 'n0041', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0040', 'n0043', 'CONTROL_DEP', 'suppressed-exit'),
+    ('n0042', 'n0043', 'CONTROL_DEP', 'next'),
+    ('n0043', 'n0014', 'CONTROL_DEP', 'complete'),
+    ('n0002', 'n0003', 'DATA_DEP', 'manager'),
+    ('n0002', 'n0006', 'DATA_DEP', 'manager'),
+    ('n0002', 'n0009', 'DATA_DEP', 'manager'),
+    ('n0013', 'n0014', 'DATA_DEP', 'done'),
+    ('n0037', 'n0014', 'DATA_DEP', 'done'),
+]
 
 def _snapshot(tmp_path, source=SOURCE):
     root = tmp_path / "src"
@@ -630,6 +783,86 @@ def test_cli_comprehension_scope_excludes_all_local_roots(tmp_path, capsys, expr
     assert ("DATA_DEP", "items", statement, "items") in pairs
     assert ("DATA_DEP", "item", "return item", "item") in pairs
     assert ("DATA_DEP", "later", statement, "later") not in pairs
+
+
+def test_flow_cleanup_depth_notice_and_graph_stability(tmp_path, capsys, monkeypatch):
+    source = """async def f(manager):
+    with manager:
+        try:
+            async with manager:
+                try:
+                    with manager:
+                        value = 1
+                finally:
+                    cleanup = 2
+        finally:
+            done = 3
+    return done
+"""
+    _, db = _snapshot(tmp_path, source)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    assert graph["limitations"][-1] == (
+        "Nested cleanup/context-manager depth is 5 (threshold 4) at sample.py:6; graph size grows exponentially with cleanup nesting depth."
+    )
+    assert hashlib.sha256(json.dumps(graph["nodes"], sort_keys=True, separators=(",", ":")).encode()).hexdigest() == BASE_DEPTH5_NODE_DIGEST
+    assert [(edge["source"], edge["target"], edge["kind"], edge["label"]) for edge in graph["edges"]] == BASE_DEPTH5_EDGES
+
+    monkeypatch.setattr(flow_module, "_structured_cleanup_depth", lambda _body: (0, None))
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    without_notice = json.loads(capsys.readouterr().out)["flow"]
+    assert graph["nodes"] == without_notice["nodes"]
+    assert graph["edges"] == without_notice["edges"]
+    assert graph["limitations"][:-1] == without_notice["limitations"]
+
+
+def test_flow_cleanup_depth_skips_nested_definitions():
+    tree = ast.parse("""def f(manager):
+    with manager:
+        def inner(manager):
+            with manager:
+                with manager:
+                    try:
+                        with manager:
+                            try:
+                                with manager:
+                                    pass
+                            finally:
+                                pass
+                    finally:
+                        pass
+        return 1
+""")
+    depth, location = _structured_cleanup_depth(tree.body[0].body)
+    assert depth == 1
+    assert location == (2, 4)
+
+
+def test_flow_cleanup_depth_four_has_no_notice_and_markdown_renders_depth_notice(tmp_path, capsys):
+    depth4 = """def f(manager):
+    with manager:
+        try:
+            with manager:
+                try:
+                    value = 1
+                finally:
+                    cleanup = 2
+        finally:
+            done = 3
+    return done
+"""
+    _, db = _snapshot(tmp_path, depth4)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000"]) == 0
+    graph = json.loads(capsys.readouterr().out)["flow"]
+    assert not any("Nested cleanup/context-manager depth" in item for item in graph["limitations"])
+
+    depth5 = depth4.replace("                    cleanup = 2", "                    with manager:\n                        cleanup = 2")
+    markdown_dir = tmp_path / "markdown"
+    markdown_dir.mkdir()
+    _, db = _snapshot(markdown_dir, depth5)
+    assert main(["flow", "sample.py:f", "--db", str(db), "--snapshot", "--max-tokens", "100000", "--format", "markdown"]) == 0
+    output = capsys.readouterr().out
+    assert "- Nested cleanup/context-manager depth is 5 (threshold 4) at sample.py:8; graph size grows exponentially with cleanup nesting depth." in output
 
 
 @pytest.mark.parametrize("expression,message", [

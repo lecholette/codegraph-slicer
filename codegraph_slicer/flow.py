@@ -22,6 +22,37 @@ class FlowBudgetExceeded(CodeGraphError):
     pass
 
 
+def _structured_cleanup_depth(body):
+    deepest = 0
+    deepest_location = None
+
+    def visit(statements, depth):
+        nonlocal deepest, deepest_location
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            counts = (
+                isinstance(statement, (ast.Try, ast.TryStar)) and bool(statement.finalbody)
+            ) or isinstance(statement, (ast.With, ast.AsyncWith))
+            child_depth = depth + int(counts)
+            location = (statement.lineno, statement.col_offset)
+            if counts and (
+                child_depth > deepest
+                or child_depth == deepest
+                and (deepest_location is None or location < deepest_location)
+            ):
+                deepest = child_depth
+                deepest_location = location
+            for child in ast.iter_child_nodes(statement):
+                if isinstance(child, ast.stmt):
+                    visit([child], child_depth)
+                elif isinstance(child, ast.ExceptHandler):
+                    visit(child.body, child_depth)
+
+    visit(body, 0)
+    return deepest, deepest_location
+
+
 _UNSUPPORTED = (
     ast.AsyncFor,
     ast.FunctionDef,
@@ -379,6 +410,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             f"expected exactly one synchronous function {qualname!r} in {path}"
         )
     fn = candidates[0]
+    structured_depth, deepest_structured = _structured_cleanup_depth(fn.body)
     for stmt in fn.body:
         _check(stmt, path)
     for parent in ast.walk(fn):
@@ -1166,6 +1198,10 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
         limitations[1] = "Statement-level exception transfers preserve pre-store and post-store possibilities; exception matching and context-manager suppression are conservative, aliases are not resolved."
     if any(isinstance(item, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) for statement in fn.body for item in ast.walk(statement)):
         limitations.append("Comprehensions collapse into enclosing statement reads; targets are scoped locally and deferred outer captures are refused.")
+    if structured_depth > 4:
+        limitations.append(
+            f"Nested cleanup/context-manager depth is {structured_depth} (threshold 4) at {path}:{deepest_structured[0]}; graph size grows exponentially with cleanup nesting depth."
+        )
     return {
         "profile": "python-local-cpg-v2",
         "path": path,
