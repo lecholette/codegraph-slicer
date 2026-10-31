@@ -47,9 +47,20 @@ def _flow_markdown(result):
     for node in sorted((n for n in graph["nodes"] if n["kind"] not in _ENDPOINTS), key=lambda n: (n["line"], n["id"])):
         flags = "".join(f" · {flag}" for flag, on in (("unreachable", not node["reachable"]), ("synthetic", node["synthetic"])) if on)
         span = "" if node["line"] == node["end_line"] else f" (to L{node['end_line']})"
-        text = node["text"].splitlines() or [""]
-        lines = [f"- {ref[node['id']]} {node['kind']}{span}{flags}: `{text[0].strip()}`" if len(text) == 1
-                 else f"- {ref[node['id']]} {node['kind']}{span}{flags}:\n" + "\n".join(f"      {t}" for t in text)]
+        statement = node["text"]
+        if "\n" not in statement and "\r" not in statement:
+            backticks = max((len(run) for run in re.findall(r"`+", statement)), default=0)
+            fence = "`" * (backticks + 1)
+            padding = " " if statement.startswith("`") or statement.endswith("`") else ""
+            code = f"{fence}{padding}{statement}{padding}{fence}"
+            lines = [f"- {ref[node['id']]} {node['kind']}{span}{flags}: {code}"]
+        else:
+            runs = re.findall(r"(`+|~+)", statement)
+            longest = max((len(run) for run in runs), default=0)
+            fence = "`" * max(3, longest + 1)
+            lines = [f"- {ref[node['id']]} {node['kind']}{span}{flags}:", "  " + fence]
+            lines.extend("  " + line for line in statement.splitlines())
+            lines.append("  " + fence)
         facts = "; ".join(f"{name}: {', '.join(values)}" for name, values in
                           (("defines", node["defs"]), ("uses", node["uses"]), ("writes", node["mutation_targets"])) if values)
         if facts:
@@ -67,7 +78,13 @@ def _flow_markdown(result):
     blocks.append("## Limitations")
     blocks.extend(f"- {item}" for item in graph["limitations"])
     text = "\n\n".join(blocks)
-    return text.replace("this view ≈ 0 tokens", f"this view ≈ {len(text) // 4 + 1} tokens", 1)
+    estimate = len(text) // 4 + 1
+    while True:
+        rendered = text.replace("this view ≈ 0 tokens", f"this view ≈ {estimate} tokens", 1)
+        updated = len(rendered) // 4 + 1
+        if updated == estimate:
+            return rendered
+        estimate = updated
 
 
 def _markdown(result):
