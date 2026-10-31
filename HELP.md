@@ -250,34 +250,47 @@ from `new_estimate_cents`, avoiding unrelated liability flows. These examples
 depend on the indexed source revision: use the actual path/qualname and line in
 your snapshot.
 
-The `python-local-cpg-v1` profile is statement-granularity and
-intraprocedural. These additions retain `python-local-cpg-v1`: previously
-accepted functions retain their graph output, apart from engine/Python identity.
+The `python-local-cpg-v2` profile is statement-granularity and
+intraprocedural. It replaces `python-local-cpg-v1` because ordered target reads
+change graphs for previously accepted functions, including annotated memory
+targets. Engine/Python identity remains explicit.
 It supports synchronous and async functions (without explicit
 await), assignments, annotated/augmented assignments, expressions, if/elif/else,
 for/while and loop else, break/continue, return/raise, assert/pass, and eagerly
 evaluated named expressions. Walrus expressions inside short-circuit or
 conditional expressions are refused because the definition may not execute.
 Potentially overlapping chained attribute/subscript targets, assignment writes
-that also rebind their receiver, and augmented memory targets that use a
-walrus-bound receiver are refused with a source location. Rebinding a receiver
-or subpath invalidates older direct-path facts where modeled; aliases remain
-unresolved.
+that also rebind their receiver, and memory targets whose own evaluation
+walrus-rebinds the receiver are refused with a source location. Rebinding a
+receiver or subpath invalidates older direct-path facts where modeled; aliases
+remain unresolved.
 
 `try`/`except`/`else`/`finally`, `except*`, `with`, and `async with` have
 conservative statement-level exceptional transfers. Every protected statement,
 including nested statements, may raise before or after its writes. This retains
 both pre-store and post-store reaching definitions, including partial bindings;
-it does not infer exception types or expression-level failure points. Only normal
-try-body completion enters `else`. Finalizers run on normal, exceptional,
-return, break, and continue paths, with separate copies for pending completions;
-a finalizer's abrupt completion replaces the pending completion. Handler aliases
-are bound on handler entry and deleted on every exit, including implicit errors.
+it does not infer exception types or expression-level failure points. Handler
+type expressions are evaluated in source order: walrus bindings in a type are
+available to that handler and to later handler type expressions and bodies, but
+not to earlier handlers. Only normal try-body completion enters `else`. Finalizers
+run on normal, exceptional, return, break, and continue paths, with separate
+copies for pending completions; a finalizer's abrupt completion replaces the
+pending completion. Handler aliases
+are bound only on the matched handler path and deleted on every exit, including
+implicit errors. Type lookup or matching may itself raise after any walrus
+bindings; those failures propagate outward with the bindings already made.
 `except*` models possible matched-handler subsets in source order, preserving
 effects of earlier handlers even when they raise; unmatched or pending failures
 may propagate. Exception matching is an overapproximation.
 
-Context expressions evaluate left to right before their `as` bindings and body.
+Context expressions evaluate left to right before their `as` bindings and body;
+walrus bindings in a manager expression are visible to its binding and later
+context expressions. Assignment evaluates its value before targets from left to
+right; annotated assignment does not locally evaluate its annotation, and
+augmented assignment evaluates its target once before its value. Loop iterable
+expressions run before target binding, whose target reads and walrus bindings are
+modeled on both ordinary and structured-control paths. A `raise` evaluates its
+exception expression before its cause.
 Acquired managers exit in reverse order on all completions; failed acquisition
 does not exit that manager, but still unwinds earlier acquisitions. Each
 `__exit__`/`__aexit__` may raise. On exceptional completion it may also suppress

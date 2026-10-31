@@ -698,7 +698,7 @@ def test_cli_default_comprehension_preserves_body_only_metadata(tmp_path, capsys
     return values
 """)
     assert ("DATA_DEP", "values", "return values", "values") in pairs
-    assert graph["profile"] == "python-local-cpg-v1"
+    assert graph["profile"] == "python-local-cpg-v2"
     assert graph["limitations"] == [
         "Calls are opaque; aliases and unknown call side effects can affect memory dependencies.",
         "Statement-level reads are conservative; wildcard object/subscript paths retain possible overlaps, but aliases are not resolved and implicit exception flow is not modeled.",

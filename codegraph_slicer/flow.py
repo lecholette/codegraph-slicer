@@ -125,6 +125,30 @@ def _target_names(node):
     return found
 
 
+def _plain_target_names(node):
+    """Names assigned by a target, excluding walruses inside its expressions."""
+    found = set()
+
+    def visit(n):
+        if isinstance(n, ast.NamedExpr):
+            return
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            found.add(n.id)
+        for child in ast.iter_child_nodes(n):
+            visit(child)
+
+    if node is not None:
+        visit(node)
+    return found
+
+
+def _walrus_names(node):
+    return {
+        child.target.id
+        for child in ast.walk(node) if isinstance(child, ast.NamedExpr)
+    } if node is not None else set()
+
+
 def _access_targets(node):
     targets = set()
     for n in ast.walk(node):
@@ -179,11 +203,57 @@ def _expression_events(node):
     return events
 
 
+def _target_events(node, *, read_only=False):
+    """Events from evaluating and storing a target, preserving target order."""
+    events = []
+
+    def visit(target):
+        if target is None:
+            return
+        if isinstance(target, ast.Name):
+            if read_only:
+                events.append(("load", target.id))
+            elif isinstance(target.ctx, ast.Store):
+                events.append(("store", target.id))
+            return
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                visit(element)
+            return
+        if isinstance(target, ast.Starred):
+            visit(target.value)
+            return
+        if isinstance(target, ast.Attribute):
+            events.extend(_expression_events(target.value))
+            return
+        if isinstance(target, ast.Subscript):
+            events.extend(_expression_events(target.value))
+            events.extend(_expression_events(target.slice))
+            return
+        events.extend(_expression_events(target))
+
+    visit(node)
+    return events
+
+
+def _target_write_events(node):
+    """Events for the final local-name store after an augmented target read."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+        return [("store", node.id)]
+    return []
+
+
+def _ordered_expression(*nodes):
+    """Return one event stream for expressions evaluated in the given order."""
+    return [event for node in nodes for event in _expression_events(node)]
+
+
 def _inline_name_flow(node):
     defined = set()
     reads_after = set()
     reads_before = set()
-    for kind, name in _expression_events(node):
+    events = node if isinstance(node, list) else _expression_events(node)
+    for kind, name in events:
         if kind == "store":
             defined.add(name)
         elif name in defined:
@@ -194,7 +264,12 @@ def _inline_name_flow(node):
 
 
 def _target_access_roots(node):
-    return _names(node)
+    if not isinstance(node, (ast.Attribute, ast.Subscript)):
+        return set()
+    root = node
+    while isinstance(root, (ast.Attribute, ast.Subscript)):
+        root = root.value
+    return {root.id} if isinstance(root, ast.Name) else set()
 
 
 def _dynamic_access_targets(node):
@@ -242,6 +317,14 @@ def _check(node, path):
     if isinstance(node, (ast.Yield, ast.YieldFrom, ast.Await, ast.Lambda)):
         raise UnsupportedFlowError(
             f"unsupported {type(node).__name__} in {path}:{node.lineno}"
+        )
+    if (
+        isinstance(node, (ast.Attribute, ast.Subscript))
+        and isinstance(node.ctx, ast.Store)
+        and _target_access_roots(node) & _walrus_names(node)
+    ):
+        raise UnsupportedFlowError(
+            f"unsupported target receiver rebinding in {path}:{node.lineno}"
         )
     if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
         for gen in node.generators:
@@ -321,7 +404,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                     )
     for stmt in ast.walk(fn):
         if isinstance(stmt, ast.Assign):
-            target_names = set().union(*(_target_names(t) for t in stmt.targets))
+            target_names = set().union(*(_plain_target_names(t) for t in stmt.targets))
             walrus_names = _target_names(stmt.value)
             for target in stmt.targets:
                 if isinstance(target, (ast.Attribute, ast.Subscript)):
@@ -404,16 +487,28 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                     handler_node = add(
                         "except_handler", handler,
                         "except " + (ast.unparse(handler.type) if handler.type else "BaseException"),
-                        defs=([handler.name] if handler.name else ()),
+                        defs=set([handler.name] if handler.name else ()) | _target_names(handler.type),
                         uses=_names(handler.type) | _paths(handler.type),
                     )
+                    if handler.type is not None:
+                        remember_inline(handler_node, handler.type)
+                        unmatched_node = add(
+                            "except_type_unmatched", handler,
+                            "unmatched " + ast.unparse(handler.type),
+                            defs=_target_names(handler.type),
+                            uses=_names(handler.type) | _paths(handler.type),
+                            synthetic=True,
+                        )
+                        remember_inline(unmatched_node, handler.type)
+                    else:
+                        unmatched_node = None
                     delete = bool(handler.name)
-                    handlers.append((handler, handler_node, delete))
+                    handlers.append((handler, handler_node, delete, unmatched_node))
                 nid = add("trystar" if isinstance(st, ast.TryStar) else "try", st, text="try*" if isinstance(st, ast.TryStar) else "try")
                 stmt_id[st] = nid
                 try_parts[st] = handlers
                 collect(st.body)
-                for handler, _, _ in handlers:
+                for handler, _, _, _ in handlers:
                     collect(handler.body)
                 collect(st.orelse)
                 collect(st.finalbody)
@@ -438,6 +533,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                             uses=_names(item.optional_vars) | _paths(item.optional_vars), synthetic=True,
                         )
                         weak_definitions[bind] = _dynamic_access_targets(item.optional_vars)
+                        remember_inline(bind, _target_events(item.optional_vars))
                         edge(manager, bind, "DATA_DEP", "context-value")
                     parts.append((manager, bind))
                 header = "async with " if isinstance(st, ast.AsyncWith) else "with "
@@ -478,8 +574,12 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                 collect(st.orelse)
             else:
                 d = _target_names(st) | _access_targets(st)
-                if isinstance(st, ast.AnnAssign) and st.value is None:
-                    d = set()
+                if isinstance(st, ast.AnnAssign):
+                    d = _target_names(st.target) | _access_targets(st.target)
+                    if st.value is not None:
+                        d |= _target_names(st.value)
+                    else:
+                        d = _walrus_names(st.target)
                 u = _names(st) | _paths(st)
                 if isinstance(st, ast.AnnAssign):
                     u = (
@@ -487,28 +587,34 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                         if st.value is not None
                         else set()
                     )
+                    u |= _names(st.target) | _paths(st.target)
                 if isinstance(st, ast.AugAssign):
-                    u |= _target_names(st.target) | _access_targets(st.target)
+                    u |= _plain_target_names(st.target) | _access_targets(st.target)
                 nid = add(type(st).__name__.lower(), st, defs=d, uses=u)
                 stmt_id[st] = nid
                 weak_definitions[nid] = _dynamic_access_targets(st)
                 expression = (
-                    st.value
-                    if isinstance(st, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                    _expression_events(st.value) + [
+                        event for target in st.targets for event in _target_events(target)
+                    ]
+                    if isinstance(st, ast.Assign)
+                    else _expression_events(st.value) + _target_events(st.target)
+                    if isinstance(st, ast.AnnAssign) and st.value is not None
+                    else _target_events(st.target, read_only=True)
+                    if isinstance(st, ast.AnnAssign)
+                    else _target_events(st.target, read_only=True)
+                    + _expression_events(st.value)
+                    + _target_write_events(st.target)
+                    if isinstance(st, ast.AugAssign)
                     else st.value
                     if isinstance(st, (ast.Expr, ast.Return))
-                    else st.exc
+                    else _ordered_expression(st.exc, st.cause)
                     if isinstance(st, ast.Raise)
                     else st.test
                     if isinstance(st, ast.Assert)
                     else None
                 )
-                prior = (
-                    _target_names(st.target) | _access_targets(st.target)
-                    if isinstance(st, ast.AugAssign)
-                    else ()
-                )
-                remember_inline(nid, expression, prior)
+                remember_inline(nid, expression)
                 writes = (
                     ast.walk(st)
                     if not isinstance(st, ast.AnnAssign) or st.value is not None
@@ -617,8 +723,11 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                         st,
                         f"bind {ast.unparse(st.target)}",
                         synthetic=True,
-                        defs=_target_names(st.target),
+                        defs=_target_names(st.target) | _access_targets(st.target),
+                        uses=_names(st.target) | _paths(st.target),
                     )
+                    weak_definitions[bind] = _dynamic_access_targets(st.target)
+                    remember_inline(bind, _target_events(st.target))
                     for machinery in (it, pred, bind):
                         nodes[int(machinery[1:])]["line"] = st.lineno
                         nodes[int(machinery[1:])]["end_line"] = getattr(
@@ -689,8 +798,10 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             for field in ("body", "orelse", "finalbody"):
                 for child in getattr(st, field, ()):
                     edge(n, stmt_id[child], "AST", field)
-            for handler, hn, deletion in try_parts.get(st, ()):
+            for handler, hn, deletion, unmatched in try_parts.get(st, ()):
                 edge(n, hn, "AST", "handler")
+                if unmatched:
+                    edge(n, unmatched, "AST", "handler-type-unmatched")
                 for child in handler.body:
                     edge(hn, stmt_id[child], "AST", "body")
             pending["raise"].update((pre, n))
@@ -708,6 +819,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                     pred = add("iterator_test", st, "iterator test", synthetic=True)
                     bind = add("target_binding", st, f"bind {ast.unparse(st.target)}", defs=_target_names(st.target) | _access_targets(st.target), uses=_names(st.target) | _paths(st.target), synthetic=True)
                     weak_definitions[bind] = _dynamic_access_targets(st.target)
+                    remember_inline(bind, _target_events(st.target))
                     edge(n, init, "CFG", "evaluate-iterable")
                     edge(init, pred, "CFG", "initialize")
                     edge(init, bind, "DATA_DEP", "iterator-value")
@@ -740,20 +852,41 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                     pending[key].update(tails)
                 handlers = try_parts[st]
                 star_previous = set()
-                for handler, hn, delete in handlers:
-                    for tail in exceptional:
-                        edge(tail, hn, "CFG", "exception-before-statement" if nodes[int(tail[1:])]["kind"] == "exception_point" else "exception-after-statement")
+                prior_unmatched = None
+                for handler, hn, delete, unmatched in handlers:
+                    if prior_unmatched is not None:
+                        edge(prior_unmatched, hn, "CFG", "exception-unmatched")
+                        if unmatched is not None:
+                            edge(prior_unmatched, unmatched, "CFG", "exception-unmatched")
+                    if prior_unmatched is None:
+                        for tail in exceptional:
+                            label = "exception-before-statement" if nodes[int(tail[1:])]["kind"] == "exception_point" else "exception-after-statement"
+                            edge(tail, hn, "CFG", label)
+                            if unmatched is not None:
+                                edge(tail, unmatched, "CFG", label)
                     if isinstance(st, ast.TryStar):
                         for tail in star_previous:
                             edge(tail, hn, "CFG", "except-star-next")
+                            if unmatched is not None:
+                                edge(tail, unmatched, "CFG", "except-star-next")
                     handled = structured_block(handler.body, {hn})
                     if delete:
                         handled = cleanup_delete(handled, handler)
                     if isinstance(st, ast.TryStar):
+                        if handler.type is not None and _target_names(handler.type):
+                            # Route older matched subsets through this type test
+                            # before they can reach later handlers, so its
+                            # walrus definitions cannot be bypassed.
+                            star_previous.clear()
                         star_previous.update(set().union(*handled.values()))
                     for key, tails in handled.items():
                         pending[key].update(tails)
-                if not any(handler.type is None for handler, _, _ in handlers):
+                    prior_unmatched = unmatched
+                    if unmatched is not None:
+                        # Type lookup and exception matching happen after any
+                        # walrus stores and can themselves raise outward.
+                        pending["raise"].add(unmatched)
+                if not any(handler.type is None for handler, _, _, _ in handlers):
                     pending["raise"].update(exceptional)
                 if st.finalbody:
                     pending = cleanup_finally(pending, st.finalbody)
@@ -978,7 +1111,6 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             "exit",
             "parameter",
             "iterator_test",
-            *(() if structured else ("target_binding",)),
         ):
             continue
         for name in n["uses"]:
@@ -1035,7 +1167,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
     if any(isinstance(item, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) for statement in fn.body for item in ast.walk(statement)):
         limitations.append("Comprehensions collapse into enclosing statement reads; targets are scoped locally and deferred outer captures are refused.")
     return {
-        "profile": "python-local-cpg-v1",
+        "profile": "python-local-cpg-v2",
         "path": path,
         "function": qualname,
         "source_sha256": digest,
