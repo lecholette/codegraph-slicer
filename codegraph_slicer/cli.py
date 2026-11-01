@@ -176,16 +176,25 @@ def _markdown(result):
         return _flow_markdown(result)
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
+        omission_blocks = []
         if "omitted" in result:
-            blocks.extend(
+            omission_blocks.extend(
                 f"Omitted **{name.replace('_', ' ')}** records: {count}"
                 for name, count in result["omitted"].items()
             )
-            blocks.append(result["retrieve_details"])
-        for name, items in result["sections"].items():
+            omission_blocks.append(result["retrieve_details"])
+        names = list(result["sections"])
+        if "target_implementations" in names:
+            names = ["target_implementations"] + [name for name in names if name != "target_implementations"]
+        else:
+            blocks.extend(omission_blocks)
+        for name in names:
+            items = result["sections"][name]
             blocks.append("## " + name.replace("_", " "))
             for item in items:
                 blocks.append(_map_markdown_item(item))
+            if name == "target_implementations":
+                blocks.extend(omission_blocks)
         return "\n\n".join(blocks)
     if "items" in result:
         mapped = {
@@ -369,6 +378,7 @@ def main(argv=None):
                         store.assert_fresh()
                     result = slice_context(
                         store, args.anchors, args.max_tokens, args.include_callee_bodies,
+                        database=args.db,
                         render_estimator=(
                             lambda candidate: rendered_tokens(_markdown(candidate))
                         ) if args.format == "markdown" else None,

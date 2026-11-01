@@ -144,6 +144,10 @@ refuses without printing a partial report. Increase `--max-tokens` to retrieve
 more optional records. `--include-callee-bodies` adds optional callee
 implementations instead of only their signatures; if a body does not fit, its
 signature may still be returned and is counted as an emitted record.
+Related class bodies whose combined size is larger than half the token budget
+are summarized to keep their APIs visible; the half-budget threshold reserves
+room for the selected target and other context when a set of class bodies
+dominates a slice.
 `--format` defaults to JSON.
 
 When several anchors share required type definitions, those required types are
