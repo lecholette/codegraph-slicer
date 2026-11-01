@@ -1,5 +1,7 @@
 """Read-only flow queries over the exact source observed by a GraphStore."""
 
+import ast
+
 from .flow import FlowQueryError, analyze_flow, slice_flow
 from .slicer import _anchor
 
@@ -24,5 +26,35 @@ def query_flow(store, anchor, *, variable=None, line=None, direction="backward",
         "path": row["file_path"],
         "blob_sha": files[0]["blob_sha"],
     }
-    return slice_flow(graph, variable=variable, line=line, direction=direction,
-                      include_control=include_control, max_tokens=max_tokens)
+    try:
+        return slice_flow(graph, variable=variable, line=line, direction=direction,
+                          include_control=include_control, max_tokens=max_tokens)
+    except FlowQueryError as error:
+        if variable is not None:
+            tree = ast.parse(modules[0]["body"], filename=row["file_path"])
+            target = next((node for node in ast.walk(tree)
+                           if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                           and min([node.lineno] + [decorator.lineno
+                                                    for decorator in node.decorator_list])
+                           == row["start_line"]
+                           and node.name == row["qualname"].rsplit(".", 1)[-1]), None)
+            lines = set()
+            if target is not None:
+                lines.update(arg.lineno for arg in (*target.args.posonlyargs,
+                              *target.args.args, *target.args.kwonlyargs,
+                              *((target.args.vararg,) if target.args.vararg else ()),
+                              *((target.args.kwarg,) if target.args.kwarg else ()))
+                             if arg.arg == variable)
+
+                def visit(node):
+                    for child in ast.iter_child_nodes(node):
+                        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                              ast.ClassDef, ast.Lambda)):
+                            continue
+                        if isinstance(child, ast.Name) and child.id == variable:
+                            lines.add(child.lineno)
+                        visit(child)
+
+                visit(target)
+            error.observed_lines = sorted(lines)[:5]
+        raise
