@@ -165,7 +165,7 @@ def test_map_json_accounting_closes_root_and_handles_omitted_digit_transition(
     assert complete["tokens"] == len(complete_text) // 4 + 1 == 277
 
 
-def test_slice_json_omissions_count_records_not_body_fallback(tmp_path, capsys):
+def test_slice_json_omissions_count_records_not_body_fallback(tmp_path, capsys, monkeypatch):
     db = _snapshot(tmp_path / "src", {
         "pkg/target.py": "def target():\n    return helper()\n\ndef helper():\n" + "\n".join(f"    value_{i} = {i}" for i in range(200)) + "\n    return 7\n",
         "pkg/callers.py": "from pkg.target import target\n\ndef caller_one():\n    return target()\n\ndef caller_two():\n    return target()\n",
@@ -175,26 +175,39 @@ def test_slice_json_omissions_count_records_not_body_fallback(tmp_path, capsys):
     assert "omitted" not in full
     assert counts["upstream_callers"] == 2
     assert counts["downstream_dependencies"] == 1
-    partial_text = _invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--max-tokens", "110", "--include-callee-bodies"])
+    partial_text = _invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--max-tokens", "171", "--include-callee-bodies"])
     partial = json.loads(partial_text)
     assert partial["omitted"] == {
         "types_and_schemas": 0, "upstream_callers": 2,
         "target_implementations": 0, "downstream_dependencies": 1,
     }
     assert partial["sections"]["downstream_dependencies"] == []
-    assert partial["retrieve_details"] == "rerun with --max-tokens N"
+    assert "Omitted: " in partial["retrieve_details"]
+    assert "pkg.callers:caller_one (10 tokens)" in partial["retrieve_details"]
+    assert "pkg.callers:caller_two (10 tokens)" in partial["retrieve_details"]
+    assert "pkg.target:helper (952 tokens)" in partial["retrieve_details"]
+    assert f"--db {db} pkg.callers:caller_one pkg.callers:caller_two pkg.target:helper --snapshot --max-tokens 1944" in partial["retrieve_details"]
     assert sum(map(len, partial["sections"].values())) + sum(partial["omitted"].values()) == sum(counts.values())
     assert partial["tokens"] == len(partial_text) // 4 + 1
-    fallback = json.loads(_invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--max-tokens", "150", "--include-callee-bodies"]))
-    assert "omitted" not in fallback
+    fallback = json.loads(_invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--max-tokens", "400", "--include-callee-bodies"]))
+    assert fallback["omitted"] == {
+        "types_and_schemas": 0,
+        "upstream_callers": 0,
+        "target_implementations": 0,
+        "downstream_dependencies": 0,
+    }
     fallback_callee = fallback["sections"]["downstream_dependencies"][0]["text"]
     assert "def helper():" in fallback_callee
     assert "value_199" not in fallback_callee and "return 7" not in fallback_callee
+    assert "Body summarized: pkg.target:helper (952 tokens)" in fallback["retrieve_details"]
     assert sum(map(len, fallback["sections"].values())) == sum(counts.values())
-    markdown = _invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--format", "markdown", "--max-tokens", "110"])
+    monkeypatch.chdir(tmp_path)
+    markdown = _invoke(capsys, ["slice", "--db", db.name, "pkg.target:target", "--format", "markdown", "--max-tokens", "164", "--include-callee-bodies"])
     assert "Omitted **upstream callers** records: 2" in markdown
     assert "Omitted **downstream dependencies** records: 1" in markdown
-    assert "rerun with --max-tokens N" in markdown
+    assert "pkg.callers:caller_one (10 tokens)" in markdown
+    assert "pkg.target:helper (952 tokens)" in markdown
+    assert markdown.index("## target implementations") < markdown.index("Omitted **upstream callers** records: 2")
 
 
 def test_map_and_slice_output_budgets_exact_and_refuse_without_stdout(tmp_path, capsys):

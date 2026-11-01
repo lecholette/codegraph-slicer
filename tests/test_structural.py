@@ -269,8 +269,17 @@ def caller(x):
                 "target_implementations": 0,
                 "downstream_dependencies": 1,
             },
-            "retrieve_details": "rerun with --max-tokens N",
+            "retrieve_details": "",
         }
+        omitted_rows = store.rows(
+            "SELECT symbol_id, body FROM symbols WHERE symbol_id IN ('m:caller', 'm:callee') ORDER BY CASE symbol_id WHEN 'm:caller' THEN 0 ELSE 1 END"
+        )
+        omitted_sizes = {row["symbol_id"]: len(row["body"]) // 4 + 1 for row in omitted_rows}
+        fetch_anchors = " ".join(omitted_sizes)
+        expected["retrieve_details"] = (
+            "Omitted: " + ", ".join(f"{sid} ({size} tokens)" for sid, size in omitted_sizes.items())
+            + f"; fetch with codegraph-slicer slice --db GRAPH {fetch_anchors} --snapshot --max-tokens {sum(omitted_sizes.values()) * 2}"
+        )
         while True:
             budget = (len(json.dumps(expected, ensure_ascii=False, separators=(",", ":"))) + 1) // 4 + 1
             if expected["tokens"] == budget:
