@@ -349,6 +349,12 @@ not turn an unknown anchor or invalid database into an empty result. A delta
 with no detected changes returns its report with empty change collections and
 exit `0`.
 
+Errors keep their original first diagnostic line and may add `hint:` lines
+with indexed anchor suggestions, observed flow-variable lines, or database
+open-state facts. Unsupported flow syntax suggests using `slice` for the
+resolved function. A missing flow variable or an already informative stale
+or budget error does not add an inferred suggestion.
+
 To inspect unresolved references from Python, using the stdlib SQLite driver:
 
 ```sh

@@ -7,12 +7,16 @@ from collections import Counter
 from pathlib import Path
 import re
 import sqlite3
+import os
+import stat
 from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
-from .slicer import slice_context, rendered_tokens, tokens_for_length
+from .slicer import (AnchorNotFoundError, slice_context,
+                     rendered_tokens, tokens_for_length)
 from .delta import compute_delta, summarize_delta
 from .flow_query import query_flow
+from .flow import FlowQueryError, UnsupportedFlowError
 
 
 _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
@@ -313,11 +317,16 @@ def main(argv=None):
     for command in (sync, mapping, slicing, flow, delta):
         command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
+    opening_db = True
+    opening_db_path = None
     try:
         with ExitStack() as stack:
             if args.cmd == "delta":
+                opening_db_path = str(Path(args.base_db).resolve())
                 base = stack.enter_context(GraphStore(args.base_db, readonly=True))
+                opening_db_path = str(Path(args.head_db).resolve())
                 head = stack.enter_context(GraphStore(args.head_db, readonly=True))
+                opening_db = False
                 result = compute_delta(
                     base, head, args.forbid_import, selected_tests=args.selected_test
                 )
@@ -329,7 +338,9 @@ def main(argv=None):
                     ) if args.format == "markdown" else None,
                 )
             else:
+                opening_db_path = str(Path(args.db).resolve())
                 store = stack.enter_context(GraphStore(args.db, readonly=args.cmd != "sync"))
+                opening_db = False
                 if args.cmd == "sync":
                     result = (
                         store.sync_git_tree(args.root, args.revision)
@@ -377,4 +388,34 @@ def main(argv=None):
         print(rendered)
         return 0
     except (CodeGraphError, OSError, sqlite3.Error) as exc:
-        parser.exit(2, f"codegraph-slicer: {type(exc).__name__}: {exc}\n")
+        message = f"codegraph-slicer: {type(exc).__name__}: {exc}\n"
+        hints = []
+        if isinstance(exc, AnchorNotFoundError):
+            hints.extend(f"hint: nearest anchor: {anchor}" for anchor in getattr(exc, "nearest_anchors", []))
+            revision = getattr(exc, "snapshot_revision", "")
+            if revision:
+                hints.append(f"hint: a symbol added on a branch is absent from a base-commit DB (recorded commit: {revision}); query a snapshot containing that symbol")
+        elif isinstance(exc, FlowQueryError) and getattr(exc, "observed_lines", []):
+            hints.append("hint: observed def/use lines for this variable in the selected function: " + ", ".join(map(str, exc.observed_lines)))
+        elif isinstance(exc, UnsupportedFlowError) and args.cmd == "flow":
+            hints.append("hint: use slice for this function")
+        elif (isinstance(exc, sqlite3.OperationalError) and opening_db
+              and str(exc) == "unable to open database file"):
+            db_path = Path(opening_db_path)
+            try:
+                try:
+                    db_path.stat()
+                    exists = True
+                except (FileNotFoundError, NotADirectoryError):
+                    exists = False
+                try:
+                    parent_mode = db_path.parent.stat().st_mode
+                except (FileNotFoundError, NotADirectoryError):
+                    parent_writable = False
+                else:
+                    parent_writable = stat.S_ISDIR(parent_mode) and os.access(db_path.parent, os.W_OK)
+            except OSError:
+                pass
+            else:
+                hints.append(f"hint: database {opening_db_path}; exists={exists}, parent_writable={parent_writable}")
+        parser.exit(2, message + "".join(line + "\n" for line in hints))

@@ -1,6 +1,7 @@
 """Bounded contexts and output budget estimates."""
 
 import json
+import difflib
 from .ast_extractor import CodeGraphError
 
 
@@ -66,7 +67,18 @@ def _anchor(store, anchor):
             )
         if len(rows) >= 1:
             return rows[0]
-    raise AnchorNotFoundError(anchor)
+    error = AnchorNotFoundError(anchor)
+    rows = store.rows("SELECT file_path,module,qualname FROM symbols ORDER BY file_path,qualname")
+    aliases = {}
+    for row in rows:
+        copyable = f"{row['file_path']}:{row['qualname']}"
+        aliases[copyable] = copyable
+        aliases[f"{row['module']}:{row['qualname']}"] = copyable
+    matches = difflib.get_close_matches(anchor, sorted(aliases), n=6, cutoff=0.25)
+    error.nearest_anchors = list(dict.fromkeys(aliases[item] for item in matches))[:3]
+    revision = store.rows("SELECT value FROM metadata WHERE key='snapshot_revision'")
+    error.snapshot_revision = revision[0]["value"] if revision else ""
+    raise error
 
 
 def slice_context(
