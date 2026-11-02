@@ -505,6 +505,11 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
     inline_after = {}
     inline_before = {}
     weak_definitions = {}
+    exception_origins = {}
+    active_exception_handler = []
+    has_exception_binding = any(
+        isinstance(node, ast.ExceptHandler) and node.name for node in ast.walk(fn)
+    )
 
     def remember_inline(nid, expression, before=()):
         after, earlier = _inline_name_flow(expression)
@@ -896,12 +901,25 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                             edge(tail, hn, "CFG", label)
                             if unmatched is not None:
                                 edge(tail, unmatched, "CFG", label)
+                    for tail in exceptional:
+                        for origin in exception_origins.get(tail, ()):
+                            if handler.name:
+                                edge(origin, hn, "DATA_DEP", "exception-value")
                     if isinstance(st, ast.TryStar):
                         for tail in star_previous:
                             edge(tail, hn, "CFG", "except-star-next")
                             if unmatched is not None:
                                 edge(tail, unmatched, "CFG", "except-star-next")
+                    handler_origins = (
+                        {hn} if handler.name else set().union(
+                            *(exception_origins.get(tail, set()) for tail in exceptional)
+                        )
+                    )
+                    active_exception_handler.append(
+                        (handler_origins, handler.name or "exception")
+                    )
                     handled = structured_block(handler.body, {hn})
+                    active_exception_handler.pop()
                     if delete:
                         handled = cleanup_delete(handled, handler)
                     if isinstance(st, ast.TryStar):
@@ -960,6 +978,15 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                 pending = acquire(0, {n})
             elif isinstance(st, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
                 pending[type(st).__name__.lower()].add(n)
+                if isinstance(st, ast.Raise):
+                    if st.exc is not None:
+                        exception_origins[n] = {n}
+                    elif active_exception_handler:
+                        origins, label = active_exception_handler[-1]
+                        if has_exception_binding:
+                            for origin in origins:
+                                edge(origin, n, "DATA_DEP", label)
+                        exception_origins[n] = {n}
             else:
                 pending["normal"].add(n)
             cur = pending.pop("normal", set())
@@ -975,6 +1002,8 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                 deletion = add("exception_name_delete", handler, f"delete {handler.name}", defs=[handler.name], synthetic=True)
                 for tail in tails:
                     edge(tail, deletion, "CFG", "implicit-delete")
+                    if tail in exception_origins:
+                        exception_origins.setdefault(deletion, set()).update(exception_origins[tail])
                 cleaned[key].add(deletion)
         return cleaned
 
@@ -991,8 +1020,21 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             bridge = add("finally_entry", suite[0], "finally " + key, synthetic=True)
             for tail in tails:
                 edge(tail, bridge, "CFG", "finally-" + key)
+                if tail in exception_origins:
+                    exception_origins.setdefault(bridge, set()).update(exception_origins[tail])
+            pushes_exception_context = key == "raise"
+            if pushes_exception_context:
+                active_exception_handler.append(
+                    (set(exception_origins.get(bridge, ())), "exception")
+                )
             final = structured_block(suite, {bridge})
-            cleaned[key].update(final.pop("normal", set()))
+            if pushes_exception_context:
+                active_exception_handler.pop()
+            normal_tails = final.pop("normal", set())
+            cleaned[key].update(normal_tails)
+            if bridge in exception_origins:
+                for tail in normal_tails:
+                    exception_origins.setdefault(tail, set()).update(exception_origins[bridge])
             for override, endings in final.items():
                 cleaned[override].update(endings)
             stmt_id.clear()
@@ -1203,7 +1245,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             f"Nested cleanup/context-manager depth is {structured_depth} (threshold 4) at {path}:{deepest_structured[0]}; graph size grows exponentially with cleanup nesting depth."
         )
     return {
-        "profile": "python-local-cpg-v2",
+        "profile": "python-local-cpg-v3",
         "path": path,
         "function": qualname,
         "source_sha256": digest,
