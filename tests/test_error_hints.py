@@ -1,4 +1,5 @@
 import subprocess
+import sqlite3
 
 import pytest
 
@@ -27,7 +28,10 @@ def _error(capsys, argv, name, message):
     return lines[1:]
 
 
-def test_anchor_error_has_three_nearest_anchors_and_snapshot_guidance(tmp_path, capsys):
+@pytest.mark.parametrize("guard_order_by", [False, True], ids=["normal", "guarded-connection"])
+def test_anchor_error_has_three_nearest_anchors_and_snapshot_guidance(
+    tmp_path, capsys, monkeypatch, guard_order_by
+):
     root = tmp_path / "src"
     root.mkdir()
     (root / "sample.py").write_text("""def calculate_total():\n    return 1\ndef calculate_tax():\n    return 2\ndef calculate_rate():\n    return 3\ndef calculate_fee():\n    return 4\n""")
@@ -41,6 +45,26 @@ def test_anchor_error_has_three_nearest_anchors_and_snapshot_guidance(tmp_path, 
     db = tmp_path / "graph.sqlite"
     with GraphStore(db) as store:
         store.sync_git_tree(root, "HEAD")
+    if guard_order_by:
+        original_init = GraphStore.__init__
+
+        class GuardedConnection:
+            def __init__(self, connection):
+                self._connection = connection
+
+            def execute(self, query, *args, **kwargs):
+                if "ORDER BY file_path,qualname" in query:
+                    raise sqlite3.OperationalError("disk I/O error")
+                return self._connection.execute(query, *args, **kwargs)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+        def guarded_init(instance, *args, **kwargs):
+            original_init(instance, *args, **kwargs)
+            instance.db = GuardedConnection(instance.db)
+
+        monkeypatch.setattr(GraphStore, "__init__", guarded_init)
     hints = _error(capsys, ["slice", "--db", str(db), "sample:calculate_totals"],
                    "AnchorNotFoundError", "sample:calculate_totals")
     candidates = [line for line in hints if line.startswith("hint: nearest anchor:")]
