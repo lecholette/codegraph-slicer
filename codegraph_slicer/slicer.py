@@ -71,7 +71,10 @@ def _anchor(store, anchor):
         if len(rows) >= 1:
             return rows[0]
     error = AnchorNotFoundError(anchor)
-    rows = store.rows("SELECT file_path,module,qualname FROM symbols ORDER BY file_path,qualname")
+    rows = sorted(
+        store.rows("SELECT file_path,module,qualname FROM symbols"),
+        key=lambda row: (row["file_path"], row["qualname"]),
+    )
     aliases = {}
     for row in rows:
         copyable = f"{row['file_path']}:{row['qualname']}"
