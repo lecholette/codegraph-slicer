@@ -57,12 +57,21 @@ def _anchor(store, anchor):
         return exact[0]
     path, separator, target = anchor.rpartition(":")
     if separator and path.endswith(".py"):
-        if target.isdigit() and int(target) > 0:
+        if target.isdigit():
+            try:
+                line = int(target)
+            except ValueError:
+                raise AnchorNotFoundError(anchor) from None
+            if line > 2**63 - 1:
+                raise AnchorNotFoundError(anchor)
+        else:
+            line = 0
+        if line > 0:
             rows = store.rows(
                 """SELECT * FROM symbols WHERE file_path=?
                 AND start_line<=? AND end_line>=?
                 ORDER BY end_line-start_line, length(qualname) DESC, symbol_id""",
-                (path, int(target), int(target)),
+                (path, line, line),
             )
         else:
             rows = store.rows(
@@ -152,8 +161,8 @@ def slice_context(
         item(row, True) for _, row in sorted(types.items())
     ]
     class_types = [(sid, row) for sid, row in sorted(types.items()) if row["kind"] == "class"]
-    class_body_tokens = sum(tokens_for_length(len(row["body"])) for _, row in class_types)
-    for sid, row in class_types if class_body_tokens > max_tokens / 2 else ():
+    summaries = {}
+    for sid, row in class_types:
         methods = store.rows(
             "SELECT * FROM symbols WHERE file_path=? AND kind='method' AND qualname LIKE ? ORDER BY start_line, symbol_id",
             (row["file_path"], row["qualname"] + ".%"),
@@ -180,12 +189,12 @@ def slice_context(
         item_record = item(row, False)
         full_size = tokens_for_length(len(row["body"]))
         item_record["text"] = f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n" + "\n".join(lines) + f"\nExpansion {sid} ({full_size} tokens): codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)}"
-        sections["types_and_schemas"] = [x for x in sections["types_and_schemas"] if x["symbol"] != sid]
-        sections["types_and_schemas"].append(item_record)
+        summaries[sid] = item_record
     totals = {name: len(items) for name, items in sections.items()}
     totals["upstream_callers"] = len(callers)
     totals["downstream_dependencies"] = len(callees)
     body_fallbacks = {}
+    omitted_detail_limit = None
 
     def result():
         payload = {"tokens": 0, "sections": sections}
@@ -209,7 +218,13 @@ def slice_context(
                         omitted_budget += size * 2
             if omitted_ids:
                 db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
-                notes.append(f"Omitted: {', '.join(omitted_details)}; fetch with codegraph-slicer slice --db {db_arg} {' '.join(omitted_ids)} --snapshot --max-tokens {omitted_budget}")
+                if omitted_detail_limit == 0:
+                    notes.append("Omitted records; rerun with --max-tokens N")
+                else:
+                    if omitted_detail_limit is not None:
+                        omitted_details = omitted_details[:omitted_detail_limit]
+                        omitted_ids = omitted_ids[:omitted_detail_limit]
+                    notes.append(f"Omitted: {', '.join(omitted_details)}; fetch with codegraph-slicer slice --db {db_arg} {' '.join(omitted_ids)} --snapshot --max-tokens {omitted_budget}")
             for sid, candidate in body_fallbacks.items():
                 size = tokens_for_length(len(candidate["body"]))
                 db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
@@ -230,9 +245,34 @@ def slice_context(
     complete = result()
     if complete["tokens"] <= max_tokens:
         return complete
+    for sid, summary in summaries.items():
+        original = next(entry for entry in sections["types_and_schemas"] if entry["symbol"] == sid)
+        sections["types_and_schemas"] = [
+            summary if entry["symbol"] == sid else entry
+            for entry in sections["types_and_schemas"]
+        ]
+        candidate = result()
+        if candidate["tokens"] < complete["tokens"]:
+            complete = candidate
+        else:
+            sections["types_and_schemas"] = [
+                original if entry["symbol"] == sid else entry
+                for entry in sections["types_and_schemas"]
+            ]
+    if complete["tokens"] <= max_tokens:
+        return complete
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
     required = result()
+    if required["tokens"] > max_tokens and any(
+        totals[name] > len(sections[name])
+        for name in ("upstream_callers", "downstream_dependencies")
+    ):
+        omitted_detail_limit = 2
+        while required["tokens"] > max_tokens and omitted_detail_limit >= 0:
+            required = result()
+            if required["tokens"] > max_tokens:
+                omitted_detail_limit -= 1
     if required["tokens"] > max_tokens:
         raise RequiredAnchorOverflow(
             f"required definitions need {required['tokens']} tokens including omission metadata, budget is {max_tokens}"
@@ -253,4 +293,9 @@ def slice_context(
                     if result()["tokens"] > max_tokens:
                         sections[name].pop()
                         body_fallbacks.pop(sid)
-    return result()
+    final = result()
+    if final["tokens"] > max_tokens:
+        raise RequiredAnchorOverflow(
+            f"required definitions need {final['tokens']} tokens including omission metadata, budget is {max_tokens}"
+        )
+    return final

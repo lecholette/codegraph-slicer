@@ -287,10 +287,19 @@ def caller(x):
             expected["tokens"] = budget
         bounded = slice_context(store, ["m:target"], max_tokens=budget)
         assert bounded == expected
+        below_budget = slice_context(store, ["m:target"], max_tokens=budget - 1)
+        assert below_budget["sections"]["target_implementations"] == sections["target_implementations"]
+        assert below_budget["omitted"] == {
+            "types_and_schemas": 0,
+            "upstream_callers": 1,
+            "target_implementations": 0,
+            "downstream_dependencies": 1,
+        }
+        assert below_budget["tokens"] <= budget - 1
         with pytest.raises(
             RequiredAnchorOverflow, match="required definitions need .* including omission metadata"
         ):
-            slice_context(store, ["m:target"], max_tokens=budget - 1)
+            slice_context(store, ["m:target"], max_tokens=1)
         bodies = slice_context(store, ["m:target"], include_callee_bodies=True)
         assert "return 8" in bodies["sections"]["downstream_dependencies"][0]["text"]
 
