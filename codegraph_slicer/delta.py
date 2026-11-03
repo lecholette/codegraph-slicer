@@ -329,8 +329,8 @@ def project_delta_v2(
     """Return a filtered, sampled delta with one authoritative total per record kind."""
     from .slicer import InvalidBudgetError
 
-    if not isinstance(edge_sample_limit, int) or isinstance(edge_sample_limit, bool) or edge_sample_limit < 0:
-        raise InvalidBudgetError("edge sample limit must be a non-negative integer")
+    if not isinstance(edge_sample_limit, int) or isinstance(edge_sample_limit, bool) or edge_sample_limit < 1:
+        raise InvalidBudgetError("edge sample limit must be a positive integer")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise InvalidBudgetError("max_tokens must be a positive integer")
     categories = (

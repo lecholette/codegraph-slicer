@@ -4,8 +4,9 @@ import pytest
 
 from codegraph_slicer import GraphStore
 from codegraph_slicer.cli import main
+from codegraph_slicer.cli import _markdown
 from codegraph_slicer.delta import project_delta_v2
-from codegraph_slicer.slicer import rendered_tokens
+from codegraph_slicer.slicer import InvalidBudgetError, rendered_tokens
 
 
 def _snapshot(root, files):
@@ -24,6 +25,28 @@ def _run(capsys, base, head, *options):
     assert main(["delta", "--base-db", str(base), "--head-db", str(head),
                  "--projection", "v2", *options]) == 0
     return capsys.readouterr().out
+
+
+def test_legacy_map_and_slice_json_match_base_budget_goldens(tmp_path, capsys):
+    db = _snapshot(tmp_path / "legacy", {
+        "pkg/a.py": "def alpha():\n    return 1\n",
+    })
+
+    assert main(["map", "--db", str(db), "--snapshot", "--max-tokens", "27"]) == 0
+    assert capsys.readouterr().out == (
+        '{"tokens":27,"items":[{"symbol":"pkg.a:","path":"pkg/a.py",'
+        '"text":"pkg/a.py:1\\ndef alpha():\\n    ...\\n"}]}\n'
+    )
+
+    assert main([
+        "slice", "--db", str(db), "pkg.a:alpha", "--snapshot", "--max-tokens", "51",
+    ]) == 0
+    assert capsys.readouterr().out == (
+        '{"tokens":51,"sections":{"types_and_schemas":[],"upstream_callers":[],'
+        '"target_implementations":[{"symbol":"pkg.a:alpha",'
+        '"text":"pkg/a.py:1-2\\ndef alpha():\\n    return 1"}],'
+        '"downstream_dependencies":[]}}\n'
+    )
 
 
 def test_v2_filters_and_bounded_edge_samples_keep_filtered_totals(tmp_path, capsys):
@@ -54,7 +77,7 @@ def test_v2_filters_and_bounded_edge_samples_keep_filtered_totals(tmp_path, caps
     assert payload["samples"]["added_edges"] == [["pkg.use:caller", "pkg.a:target", "CALLS", 4]]
     assert payload["omitted"]["added_edges"] == 1
     assert payload["totals"]["import_changes"] == 0
-    assert payload["serialized_tokens"] == rendered_tokens(text.rstrip("\n"))
+    assert payload["serialized_tokens"] == len(text) // 4 + 1
     assert payload["serialized_tokens"] <= 1600
 
     assert main(["delta", "--base-db", str(base), "--head-db", str(head), "--full",
@@ -86,22 +109,21 @@ def test_v2_import_projection_and_markdown_are_versioned_and_budgeted(tmp_path, 
         "pkg/use.py": "from pkg.a import new\n",
     })
     markdown = _run(capsys, base, head, "--anchor", "pkg.use:", "--kind", "IMPORTS",
-                    "--edge-sample-limit", "0", "--format", "markdown", "--max-tokens", "1600")
+                    "--edge-sample-limit", "1", "--format", "markdown", "--max-tokens", "1600")
     assert markdown.startswith("# Static delta report (python-delta-v2)")
     assert "- **import changes:** 2" in markdown
-    assert "Omitted **import changes** records: 2" in markdown
+    assert "Omitted **import changes** records: 1" in markdown
     assert "Estimated compact JSON tokens:" in markdown
     assert rendered_tokens(markdown.rstrip("\n")) <= 1600
 
     json_text = _run(capsys, base, head, "--anchor", "pkg.use:", "--kind", "IMPORTS",
-                     "--max-tokens", "1600")
+                     "--edge-sample-limit", "1", "--max-tokens", "1600")
     payload = json.loads(json_text)
     assert payload["totals"]["import_changes"] == 2
     assert payload["totals"]["added_edges"] == 0
     assert payload["totals"]["removed_edges"] == 0
     assert payload["samples"]["import_changes"] == [
         {"change": "added", "source": "pkg.use:", "target": "pkg.a:new", "line": 1},
-        {"change": "removed", "source": "pkg.use:", "target": "pkg.a:old", "line": 1},
     ]
     with pytest.raises(SystemExit, match="2") as error:
         main(["delta", "--base-db", str(base), "--head-db", str(head), "--projection", "v2", "--full"])
@@ -110,6 +132,32 @@ def test_v2_import_projection_and_markdown_are_versioned_and_budgeted(tmp_path, 
         main(["delta", "--base-db", str(base), "--head-db", str(head),
               "--projection", "legacy", "--anchor", "pkg.use:"])
     assert error.value.code == 2
+
+
+def test_v2_markdown_shows_test_selection_and_static_gap_note():
+    markdown = _markdown({
+        "schema": "python-delta-v2",
+        "filters": {"anchors": [], "kinds": []},
+        "totals": {}, "samples": {}, "omitted": {},
+        "test_selection": "selected",
+        "test_gap_note": "Static TESTS reachability only; tests were not executed.",
+        "serialized_tokens": 1,
+    })
+
+    assert "Test selection requested: `selected`." in markdown
+    assert "Static TESTS reachability only; tests were not executed." in markdown
+
+
+def test_v2_edge_sample_limit_must_be_at_least_one(tmp_path, capsys):
+    with pytest.raises(InvalidBudgetError, match="positive integer"):
+        project_delta_v2({}, edge_sample_limit=0)
+    base = _snapshot(tmp_path / "base", {"pkg/a.py": "VALUE = 1\n"})
+    head = _snapshot(tmp_path / "head", {"pkg/a.py": "VALUE = 1\n"})
+    with pytest.raises(SystemExit) as error:
+        main(["delta", "--base-db", str(base), "--head-db", str(head),
+              "--projection", "v2", "--edge-sample-limit", "0"])
+    assert error.value.code == 2
+    assert "--edge-sample-limit must be at least 1" in capsys.readouterr().err
 
 
 def test_v2_projection_deduplicates_identical_import_records():
