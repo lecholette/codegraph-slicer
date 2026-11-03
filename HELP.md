@@ -198,19 +198,22 @@ indexed symbol or module from the map/database.
 
 ```text
 codegraph-slicer impact ANCHOR --db DATABASE [--max-depth N] [--max-nodes N]
-                         [--max-tokens N] [--snapshot] [--format json|markdown]
+                         [--unknown-boundaries N] [--max-tokens N]
+                         [--snapshot] [--format json|markdown]
 ```
 
 `impact` follows resolved `CALLS` edges backward from one indexed function or
 method. `--max-depth` defaults to 3 caller hops and `--max-nodes` defaults to
-200 returned caller nodes. Each caller includes a witness edge (`from`, `to`,
-`kind`, and source line). `truncated` is true when the depth or node bound cuts
-off additional reachable callers. All unresolved `CALLS` references in the
-indexed snapshot are listed as potential boundaries in `unknown_boundaries`;
-they cannot be linked to the selected anchor, so this is explicit uncertainty,
-not an assertion that they call the anchor. At most `--max-nodes` boundary
-records are emitted; `unknown_boundaries_omitted` reports the remainder. The
-JSON output identifies its shape with the `python-call-impact-v1` profile.
+200 returned caller nodes. Each caller record includes its witness edge
+(`from`, `to`, `kind`, and source line). `truncated` is true when the depth or
+node bound cuts off additional reachable callers. By default, the report gives
+the total unresolved `CALLS` count and its indexed-snapshot scope without
+listing boundary records. Use `--unknown-boundaries N` to include a deterministic
+sample of at most N records; this limit is independent of `--max-nodes`, and
+`unknown_boundaries_omitted` reports the remaining count. Unresolved calls
+cannot be linked to the selected anchor, so this is explicit uncertainty, not
+an assertion that they call the anchor. The JSON output identifies its shape
+with the `python-call-impact-v1` profile.
 
 This query reports static call reachability. It does not trace values, prove a
 call executes at runtime, or establish that the result is a complete impact

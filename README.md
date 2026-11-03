@@ -19,7 +19,7 @@ codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
 
 Every command supports `--format json|markdown`. Query commands require an existing database and open it read-only. `sync` is the only writer. Python APIs are exported by `codegraph_slicer`; use `with GraphStore(path) as store:` to close the connection.
 
-`impact` walks resolved `CALLS` edges backward to find bounded transitive callers. Each returned caller has a witness edge. All unresolved `CALLS` references in the indexed snapshot are reported as potential unknown boundaries (at most `--max-nodes`, with any remainder counted); they are not linked to the selected anchor. This is static reachability, not value flow, proof of runtime execution, or a complete list of callers when the depth or node bound truncates the walk. JSON output uses the `python-call-impact-v1` profile.
+`impact` walks resolved `CALLS` edges backward to find bounded transitive callers. Each caller record contains its witness edge. By default, the report gives the count and scope of unresolved `CALLS` references across the indexed snapshot without listing them. `--unknown-boundaries N` includes a deterministic sample of at most N records, independently of `--max-nodes`; any remaining count is reported. Unresolved calls are not linked to the selected anchor. This is static reachability, not value flow, proof of runtime execution, or a complete list of callers when the depth or node bound truncates the walk. JSON output uses the `python-call-impact-v1` profile.
 
 `delta` defaults to a compact, priority-ranked summary with an 8000-token budget.
 Its `serialized_tokens` estimate covers the complete printed JSON, including

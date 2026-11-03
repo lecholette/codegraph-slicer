@@ -90,7 +90,7 @@ def test_impact_walks_three_caller_hops_with_witness_edges(tmp_path, capsys):
         "impactmod:three": 3,
         "impactmod:noisy": 1,
     }
-    witnesses = {edge["from"]: edge for edge in result["witnesses"]}
+    witnesses = {entry["symbol"]: entry["witness"] for entry in result["callers"]}
     assert (witnesses["impactmod:one"]["to"], witnesses["impactmod:one"]["kind"]) == (
         "impactmod:leaf", "CALLS"
     )
@@ -100,7 +100,7 @@ def test_impact_walks_three_caller_hops_with_witness_edges(tmp_path, capsys):
     assert (witnesses["impactmod:three"]["to"], witnesses["impactmod:three"]["kind"]) == (
         "impactmod:two", "CALLS"
     )
-    assert all(edge["line"] > 0 for edge in result["witnesses"])
+    assert all(edge["line"] > 0 for edge in witnesses.values())
 
 
 def test_impact_marks_depth_and_node_bound_truncation(tmp_path, capsys):
@@ -112,7 +112,8 @@ def test_impact_marks_depth_and_node_bound_truncation(tmp_path, capsys):
         db, capsys, "impactmod:leaf", "--max-depth", "3", "--max-nodes", "1"
     )
     assert len(bounded["callers"]) == 1
-    assert len(bounded["witnesses"]) == 1
+    assert len(bounded["callers"]) == 1
+    assert bounded["callers"][0]["witness"]["kind"] == "CALLS"
     assert bounded["truncated"] is True
 
 
@@ -120,11 +121,11 @@ def test_impact_keeps_sibling_callers_when_one_branch_hits_depth_bound(tmp_path,
     result = _impact(
         _db(tmp_path), capsys, "impactmod:branch_target", "--max-depth", "2"
     )
-    assert result["callers"] == [
-        {"symbol": "impactmod:branch_alpha", "depth": 1},
-        {"symbol": "impactmod:branch_beta", "depth": 1},
-        {"symbol": "impactmod:branch_parent_alpha", "depth": 2},
-        {"symbol": "impactmod:branch_parent_beta", "depth": 2},
+    assert [(item["symbol"], item["depth"]) for item in result["callers"]] == [
+        ("impactmod:branch_alpha", 1),
+        ("impactmod:branch_beta", 1),
+        ("impactmod:branch_parent_alpha", 2),
+        ("impactmod:branch_parent_beta", 2),
     ]
     assert result["truncated"] is True
 
@@ -146,18 +147,74 @@ def test_impact_cycle_terminates_without_returning_anchor_as_caller(tmp_path, ca
     result = _impact(
         _db(tmp_path), capsys, "impactmod:cycle_left", "--max-depth", "8", "--max-nodes", "20"
     )
-    assert result["callers"] == [{"symbol": "impactmod:cycle_right", "depth": 1}]
-    assert result["witnesses"] == [{
-        "from": "impactmod:cycle_right",
-        "to": "impactmod:cycle_left",
-        "kind": "CALLS",
-        "line": 20,
+    assert result["callers"] == [{
+        "symbol": "impactmod:cycle_right",
+        "depth": 1,
+        "witness": {
+            "from": "impactmod:cycle_right",
+            "to": "impactmod:cycle_left",
+            "kind": "CALLS",
+            "line": 20,
+        },
     }]
 
 
 def test_impact_reports_unresolved_callee_boundary(tmp_path, capsys):
-    result = _impact(_db(tmp_path), capsys, "impactmod:leaf")
+    result = _impact(
+        _db(tmp_path), capsys, "impactmod:leaf", "--unknown-boundaries", "20"
+    )
     boundaries = {(item["from"], item["target"], item["kind"]) for item in result["unknown_boundaries"]}
     assert ("impactmod:noisy", "?missing", "CALLS") in boundaries
     assert ("impactmod:unrelated", "?never_observed", "CALLS") in boundaries
+    assert result["unknown_boundary_count"] == 2
     assert result["unknown_boundary_scope"] == "indexed_snapshot; unresolved calls are not linked to the anchor"
+
+
+def test_impact_embeds_witness_and_summarizes_unknowns_by_default(tmp_path, capsys):
+    result = _impact(
+        _db(tmp_path), capsys, "impactmod:leaf", "--max-depth", "1", "--max-nodes", "3"
+    )
+    caller = next(item for item in result["callers"] if item["symbol"] == "impactmod:one")
+    assert caller == {
+        "symbol": "impactmod:one",
+        "depth": 1,
+        "witness": {
+            "from": "impactmod:one",
+            "to": "impactmod:leaf",
+            "kind": "CALLS",
+            "line": 5,
+        },
+    }
+    assert result["unknown_boundary_count"] == 2
+    assert result["unknown_boundary_scope"] == (
+        "indexed_snapshot; unresolved calls are not linked to the anchor"
+    )
+    assert result["unknown_boundaries"] == []
+    assert result["unknown_boundaries_omitted"] == 2
+
+
+def test_impact_unknown_boundary_sample_has_independent_bound(tmp_path, capsys):
+    result = _impact(
+        _db(tmp_path), capsys, "impactmod:leaf", "--max-nodes", "1",
+        "--unknown-boundaries", "2",
+    )
+    assert len(result["callers"]) == 1
+    assert result["callers"][0]["witness"]["to"] == "impactmod:leaf"
+    assert result["unknown_boundary_count"] == 2
+    assert result["unknown_boundaries"] == [
+        {
+            "from": "impactmod:noisy",
+            "target": "?missing",
+            "kind": "CALLS",
+            "line": 14,
+            "reason": "external, dynamic, shadowed, or unobserved reference",
+        },
+        {
+            "from": "impactmod:unrelated",
+            "target": "?never_observed",
+            "kind": "CALLS",
+            "line": 41,
+            "reason": "external, dynamic, shadowed, or unobserved reference",
+        },
+    ]
+    assert result["unknown_boundaries_omitted"] == 0

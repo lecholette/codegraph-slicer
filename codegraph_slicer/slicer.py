@@ -96,12 +96,20 @@ def _anchor(store, anchor):
     raise error
 
 
-def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
+def query_call_impact(
+    store, anchor, *, max_depth=3, max_nodes=200, unknown_boundary_limit=0
+):
     """Return bounded transitive callers over resolved CALLS edges only."""
     if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth <= 0:
         raise InvalidBudgetError("max_depth must be a positive integer")
     if not isinstance(max_nodes, int) or isinstance(max_nodes, bool) or max_nodes <= 0:
         raise InvalidBudgetError("max_nodes must be a positive integer")
+    if (
+        not isinstance(unknown_boundary_limit, int)
+        or isinstance(unknown_boundary_limit, bool)
+        or unknown_boundary_limit < 0
+    ):
+        raise InvalidBudgetError("unknown boundary limit must be a non-negative integer")
     target = _anchor(store, anchor)
     if target["kind"] not in {"function", "async_function", "method"}:
         raise AnchorNotFoundError(f"impact requires an observed function or method anchor: {anchor}")
@@ -109,7 +117,6 @@ def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
     anchor_id = target["symbol_id"]
     visited = {anchor_id}
     callers = []
-    witnesses = []
     frontier = [(anchor_id, 0)]
     node_limit_hit = False
     depth_boundary_nodes = set()
@@ -132,12 +139,15 @@ def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
                     node_limit_hit = True
                     break
                 visited.add(caller)
-                callers.append({"symbol": caller, "depth": depth + 1})
-                witnesses.append({
-                    "from": caller,
-                    "to": edge["target_id"],
-                    "kind": edge["kind"],
-                    "line": edge["line"],
+                callers.append({
+                    "symbol": caller,
+                    "depth": depth + 1,
+                    "witness": {
+                        "from": caller,
+                        "to": edge["target_id"],
+                        "kind": edge["kind"],
+                        "line": edge["line"],
+                    },
                 })
                 if depth + 1 < max_depth:
                     next_frontier.append((caller, depth + 1))
@@ -169,8 +179,8 @@ def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
     boundary_count = boundary_count_rows[0]["count"]
     rows = store.rows(
         """SELECT source_id,target,kind,line,reason FROM diagnostics
-            WHERE kind='CALLS' ORDER BY source_id,line,target LIMIT ?""",
-        (max_nodes,),
+            WHERE kind='CALLS' ORDER BY source_id,line,target,kind,reason LIMIT ?""",
+        (unknown_boundary_limit,),
     )
     unknown_boundaries = [
         {
@@ -180,16 +190,20 @@ def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
             "line": row["line"],
             "reason": row["reason"],
         }
-        for row in rows[:max_nodes]
+        for row in rows
     ]
     unknown_boundaries_omitted = max(0, boundary_count - len(unknown_boundaries))
     return {
         "profile": "python-call-impact-v1",
         "anchor": anchor_id,
-        "query": {"max_depth": max_depth, "max_nodes": max_nodes},
+        "query": {
+            "max_depth": max_depth,
+            "max_nodes": max_nodes,
+            "unknown_boundaries": unknown_boundary_limit,
+        },
         "callers": callers,
-        "witnesses": witnesses,
         "unknown_boundaries": unknown_boundaries,
+        "unknown_boundary_count": boundary_count,
         "unknown_boundaries_omitted": unknown_boundaries_omitted,
         "unknown_boundary_scope": "indexed_snapshot; unresolved calls are not linked to the anchor",
         "truncated": node_limit_hit or depth_limit_hit,

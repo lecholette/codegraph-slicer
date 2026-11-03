@@ -269,19 +269,18 @@ def _markdown(result):
         )
     if "flow" in result:
         return _flow_markdown(result)
-    if "callers" in result and "witnesses" in result and "unknown_boundaries" in result:
+    if "callers" in result and "unknown_boundaries" in result and "unknown_boundary_count" in result:
         blocks = [
             f"# Call impact: `{result['anchor']}`",
             f"Profile `{result['profile']}`. Reachability only; not value flow. "
             + f"Depth ≤ {result['query']['max_depth']}; "
             + f"caller-node bound {result['query']['max_nodes']}; truncated: {str(result['truncated']).lower()}.",
-            "Unknown boundary scope: unresolved CALLS across the indexed snapshot; "
-            + "these records are not linked to this anchor.",
+            f"Unknown call boundaries across the indexed snapshot: {result['unknown_boundary_count']}. "
+            + "They are not linked to this anchor.",
             "## Transitive callers",
         ]
-        witnesses = {edge["from"]: edge for edge in result["witnesses"]}
         for caller in result["callers"]:
-            edge = witnesses[caller["symbol"]]
+            edge = caller["witness"]
             blocks.append(
                 f"- `{caller['symbol']}` (depth {caller['depth']}) via "
                 f"`{edge['from']} → {edge['to']}` ({edge['kind']}, line {edge['line']})"
@@ -295,7 +294,7 @@ def _markdown(result):
             )
         if result["unknown_boundaries_omitted"]:
             blocks.append(
-                f"Unknown call boundaries omitted: {result['unknown_boundaries_omitted']}"
+                f"Unknown call boundary records omitted: {result['unknown_boundaries_omitted']}"
             )
         return "\n\n".join(blocks)
     if "sections" in result:
@@ -416,6 +415,10 @@ def main(argv=None):
     impact.add_argument("--snapshot", action="store_true", help="query cached historical bytes without checking source freshness")
     impact.add_argument("--max-depth", type=int, default=3, help="maximum number of caller hops (default: 3)")
     impact.add_argument("--max-nodes", type=int, default=200, help="maximum returned caller nodes (default: 200)")
+    impact.add_argument(
+        "--unknown-boundaries", type=int, default=0,
+        help="include up to N unresolved CALLS records (default: count only)",
+    )
     impact.add_argument("--max-tokens", type=int, default=8000, help="maximum printed output estimate (default: 8000)")
     flow = sub.add_parser(
         "flow", help="query bounded local Python control/data flow",
@@ -574,6 +577,7 @@ def main(argv=None):
                         store, args.anchor,
                         max_depth=args.max_depth,
                         max_nodes=args.max_nodes,
+                        unknown_boundary_limit=args.unknown_boundaries,
                     )
                 else:
                     if not args.snapshot:
@@ -596,6 +600,16 @@ def main(argv=None):
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
+        if args.cmd == "impact":
+            while (
+                result["unknown_boundaries"]
+                and rendered_tokens(rendered) > args.max_tokens
+            ):
+                result["unknown_boundaries"].pop()
+                result["unknown_boundaries_omitted"] += 1
+                rendered = _markdown(result) if args.format == "markdown" else json.dumps(
+                    result, ensure_ascii=False, separators=(",", ":")
+                )
         if args.cmd in ("map", "slice", "impact", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
             from .slicer import InvalidBudgetError
             if args.cmd == "flow":
