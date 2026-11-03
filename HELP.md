@@ -254,7 +254,8 @@ from `new_estimate_cents`, avoiding unrelated liability flows. These examples
 depend on the indexed source revision: use the actual path/qualname and line in
 your snapshot.
 
-The `python-local-cpg-v2` profile is statement-granularity and
+The `python-local-cpg-v3` profile adds explicit raised-value data provenance into exception bindings, including cleanup and bare re-raises.
+The profile is statement-granularity and
 intraprocedural. It replaces `python-local-cpg-v1` because ordered target reads
 change graphs for previously accepted functions, including annotated memory
 targets. Engine/Python identity remains explicit.
