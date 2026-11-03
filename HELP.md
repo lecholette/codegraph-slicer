@@ -273,6 +273,7 @@ are no project-specific import boundaries unless supplied with
 codegraph-slicer flow ANCHOR --db DATABASE [--variable NAME_OR_ACCESS_PATH]
                       [--line LINE] [--direction backward|forward]
                       [--data-only] [--max-tokens N]
+                      [--compact]
                       [--format json|markdown]
 ```
 
@@ -296,11 +297,27 @@ relevant diagnostics, and graph-wide limitations. It records `query.variable`,
 criteria the full graph is returned with `seeds: []`, including its CFG and AST
 edges.
 
+`--compact` is an additive, versioned JSON representation for smaller flow
+payloads. It emits schema `python-local-cpg-flow-compact-v1`: shared function,
+path, source/blob/engine identity, query, and seeds appear once; nodes and edges
+use a `columns` list with positional `rows`; diagnostics group repeated
+`code`/`message` pairs and retain each node ID and line as an occurrence.
+Node rows are never merged by source location, so distinct cleanup nodes on the
+same line remain distinct. Node columns retain IDs, kinds, source spans and
+text, reachability, synthetic status, definitions, uses, and mutation targets;
+the compact projection therefore keeps the data and mutation facts available
+in the full graph. Use ordinary JSON without `--compact` as the recovery path
+when consumers need the original named-field records. The token budget applies
+to the selected representation. With `--format markdown`, the compact schema
+is shown as a formatted JSON block rather than expanded into the named-field
+flow view.
+
 ```sh
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite \
   --variable total --line 15
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite \
   --variable new_estimate_cents --direction forward --data-only --format markdown
+codegraph-slicer flow spend:admit --db /tmp/example.sqlite --compact
 ```
 
 On `examples/spend.py`, the first is a backward slice at the `total` guardrail predicate, showing

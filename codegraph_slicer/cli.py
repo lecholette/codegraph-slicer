@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .ast_extractor import CodeGraphError
 from .delta import compute_delta, summarize_delta
-from .flow import FlowQueryError, UnsupportedFlowError
+from .flow import FlowQueryError, UnsupportedFlowError, compact_flow_result
 from .flow_query import query_flow
 from .pagerank import build_repo_map, build_repo_outline
 from .slicer import (
@@ -229,6 +229,14 @@ def _markdown(result):
                 blocks.append("## " + title + "\n\n" + "\n".join(bullets))
         blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
         return "\n\n".join(blocks)
+    if result.get("flow", {}).get("schema") == "python-local-cpg-flow-compact-v1":
+        return (
+            "# Compact Python local flow\n\n"
+            f"Estimated context tokens: {result['tokens']}\n\n"
+            "```json\n"
+            + json.dumps(result["flow"], ensure_ascii=False, indent=2)
+            + "\n```"
+        )
     if "flow" in result:
         return _flow_markdown(result)
     if "callers" in result and "witnesses" in result and "unknown_boundaries" in result:
@@ -398,6 +406,7 @@ def main(argv=None):
     flow.add_argument("--line", type=int, help="source line to seed")
     flow.add_argument("--direction", choices=("backward", "forward"), default="backward", help="dependency traversal direction (default: backward)")
     flow.add_argument("--data-only", action="store_true", help="exclude control-dependence edges")
+    flow.add_argument("--compact", action="store_true", help="emit versioned columnar flow JSON; full JSON is the recovery path")
     flow.add_argument("--max-tokens", type=int, default=8000, help="estimated printed flow output budget (default: 8000)")
     delta = sub.add_parser(
         "delta",
@@ -484,7 +493,7 @@ def main(argv=None):
                     result = query_flow(
                         store, args.anchor, variable=args.variable, line=args.line,
                         direction=args.direction, include_control=not args.data_only,
-                        max_tokens=args.max_tokens,
+                        max_tokens=(2**63 - 1) if args.compact else args.max_tokens,
                         render_estimator=(
                             (lambda candidate: rendered_tokens(_markdown(candidate)))
                             if args.format == "markdown"
@@ -493,6 +502,17 @@ def main(argv=None):
                             )))
                         ),
                     )
+                    if args.compact:
+                        result = compact_flow_result(
+                            result,
+                            (
+                                (lambda candidate: rendered_tokens(_markdown(candidate)))
+                                if args.format == "markdown"
+                                else (lambda candidate: rendered_tokens(json.dumps(
+                                    candidate, ensure_ascii=False, separators=(",", ":")
+                                )))
+                            ),
+                        )
                 elif args.cmd == "impact":
                     if not args.snapshot:
                         store.assert_fresh()

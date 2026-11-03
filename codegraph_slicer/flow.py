@@ -36,6 +36,55 @@ def _flow_output_tokens(report, render_estimator):
         result["tokens"] = estimate
 
 
+def compact_flow_result(result, render_estimator=None):
+    """Return the versioned, columnar JSON projection of a full flow result."""
+    graph = result["flow"]
+    node_columns = [
+        "id", "kind", "line", "end_line", "text", "reachable", "synthetic",
+        "defs", "uses", "mutation_targets",
+    ]
+    edge_columns = ["source", "target", "kind", "label"]
+    compact = {
+        "schema": "python-local-cpg-flow-compact-v1",
+        "profile": graph["profile"],
+        "function": graph["function"],
+        "identity": {
+            **graph["identity"],
+            "path": graph["path"],
+            "source_sha256": graph["source_sha256"],
+            "engine_sha256": graph["engine_sha256"],
+            "python_version": graph["python_version"],
+        },
+        "query": graph["query"],
+        "seeds": graph["seeds"],
+        "nodes": {
+            "columns": node_columns,
+            # Never collapse nodes by location: cleanup paths can legitimately
+            # produce distinct nodes with the same source line.
+            "rows": [[node[column] for column in node_columns] for node in graph["nodes"]],
+        },
+        "edges": {
+            "columns": edge_columns,
+            "rows": [[edge[column] for column in edge_columns] for edge in graph["edges"]],
+        },
+        "diagnostics": {
+            "columns": ["code", "message", "occurrences"],
+            "rows": [],
+        },
+        "limitations": graph["limitations"],
+    }
+    grouped = defaultdict(list)
+    for diagnostic in graph["diagnostics"]:
+        grouped[(diagnostic["code"], diagnostic["message"])].append(
+            [diagnostic["node"], diagnostic["line"]]
+        )
+    compact["diagnostics"]["rows"] = [
+        [code, message, occurrences]
+        for (code, message), occurrences in sorted(grouped.items())
+    ]
+    return {"tokens": _flow_output_tokens(compact, render_estimator), "flow": compact}
+
+
 def _structured_cleanup_depth(body):
     deepest = 0
     deepest_location = None
