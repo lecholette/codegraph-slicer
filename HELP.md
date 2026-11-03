@@ -116,8 +116,9 @@ per-path counts, `omitted.edges` counts eligible edges with at least one
 unselected endpoint, and the single `omitted.max_tokens` value is the
 complete-candidate budget that admits all omitted records. Seeded zero-score
 files are outside the outline candidate set. Required seed entities must fit;
-otherwise the command refuses without printing output. If required omission
-metadata does not fit, the command also refuses.
+otherwise the command refuses without printing output and reports the smallest
+admitting `--max-tokens` value. If required omission metadata does not fit, the
+command also refuses.
 The budget includes complete
 printed output and its trailing newline in either format. A budget too small
 for required map metadata is an error. `--format` defaults to JSON.

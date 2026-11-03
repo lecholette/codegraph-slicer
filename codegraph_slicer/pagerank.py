@@ -526,10 +526,13 @@ def build_repo_outline(
     }
     # Seed entities are mandatory whenever a seeded outline is requested. Test
     # the complete seed set alone before filling the remaining rank order.
-    if seed_pairs and estimate_selected(seed_pairs, complete_tokens) > max_tokens:
+    seed_required_tokens = estimate_selected(seed_pairs, complete_tokens)
+    if seed_pairs and seed_required_tokens > max_tokens:
+        retry_tokens = min(complete_tokens, seed_required_tokens)
         raise InvalidBudgetError(
             f"required outline metadata: seed entities need more than the "
-            f"{max_tokens}-token budget"
+            f"{max_tokens}-token budget; rerun with --max-tokens "
+            f"{retry_tokens}"
         )
     selected.update(seed_pairs)
     for path, entity in ordered_entities:
