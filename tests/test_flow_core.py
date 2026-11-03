@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -85,6 +86,15 @@ def test_slice_budget_refuses_complete_causal_report():
     )
     with pytest.raises(FlowBudgetExceeded, match="needs"):
         slice_flow(graph, variable="y", max_tokens=1)
+
+
+def test_public_slice_flow_token_count_covers_json_envelope_and_newline():
+    graph = analyze_flow(
+        "def f(x):\n    y = x + 1\n    return y\n", "f", path="example.py"
+    )
+    result = slice_flow(graph)
+    printed = json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
+    assert result["tokens"] == len(printed) // 4 + 1
 
 
 def test_loop_carried_definition_and_zero_iteration_target_diagnostic():

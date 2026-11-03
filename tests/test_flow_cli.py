@@ -249,7 +249,26 @@ def test_flow_cli_refuses_complete_graph_that_exceeds_budget(tmp_path, capsys):
     with pytest.raises(SystemExit, match="2") as error:
         main(["flow", "sample.py:calculate", "--db", str(db), "--max-tokens", "1"])
     assert error.value.code == 2
-    assert "budget" in capsys.readouterr().err.lower()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "budget" in captured.err.lower()
+
+
+def test_flow_markdown_budget_counts_the_printed_selected_format(tmp_path, capsys):
+    _, db = _snapshot(tmp_path)
+    args = ["flow", "sample.py:calculate", "--db", str(db), "--snapshot", "--format", "markdown"]
+    assert main([*args, "--max-tokens", "8000"]) == 0
+    full = capsys.readouterr().out
+    budget = len(full) // 4 + 1
+    assert main([*args, "--max-tokens", str(budget)]) == 0
+    exact = capsys.readouterr().out
+    assert len(exact) // 4 + 1 == budget
+    assert f"this view ≈ {budget} tokens" in exact
+    with pytest.raises(SystemExit, match="2"):
+        main([*args, "--max-tokens", str(budget - 1)])
+    refused = capsys.readouterr()
+    assert refused.out == ""
+    assert "budget" in refused.err.lower()
 
 
 def test_flow_cli_rejects_invalid_direction_before_query(tmp_path, capsys):

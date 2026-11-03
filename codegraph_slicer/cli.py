@@ -13,7 +13,7 @@ from .ast_extractor import CodeGraphError
 from .store import GraphStore
 from .pagerank import build_repo_map
 from .slicer import (AnchorNotFoundError, slice_context,
-                     rendered_tokens, tokens_for_length)
+                     rendered_tokens, serialized_tokens, tokens_for_length)
 from .delta import compute_delta, summarize_delta
 from .flow_query import query_flow
 from .flow import FlowQueryError, UnsupportedFlowError
@@ -70,7 +70,7 @@ def _flow_markdown(result):
     source_hash = graph["source_sha256"]
     ref = _node_refs(graph["nodes"])
     blocks = [f"# Python local flow: `{graph['function']}`",
-              f"Graph JSON ≈ {result['tokens']} tokens; this view ≈ 0 tokens · profile `{graph['profile']}` · Python {graph['python_version']}"]
+              f"Graph JSON ≈ {serialized_tokens(graph)} tokens; this view ≈ 0 tokens · profile `{graph['profile']}` · Python {graph['python_version']}"]
     if identity["blob_sha"] == f"sha256:{source_hash}":
         blocks.append(f"Source: `{identity['path']}` · `{identity['symbol_id']}` · SHA-256 `{source_hash}`")
     else:
@@ -293,7 +293,7 @@ def main(argv=None):
     flow.add_argument("--line", type=int, help="source line to seed")
     flow.add_argument("--direction", choices=("backward", "forward"), default="backward", help="dependency traversal direction (default: backward)")
     flow.add_argument("--data-only", action="store_true", help="exclude control-dependence edges")
-    flow.add_argument("--max-tokens", type=int, default=8000, help="estimated complete flow JSON budget (default: 8000)")
+    flow.add_argument("--max-tokens", type=int, default=8000, help="estimated printed flow output budget (default: 8000)")
     delta = sub.add_parser(
         "delta",
         help="compare indexed base and head snapshots",
@@ -372,6 +372,13 @@ def main(argv=None):
                         store, args.anchor, variable=args.variable, line=args.line,
                         direction=args.direction, include_control=not args.data_only,
                         max_tokens=args.max_tokens,
+                        render_estimator=(
+                            (lambda candidate: rendered_tokens(_markdown(candidate)))
+                            if args.format == "markdown"
+                            else (lambda candidate: rendered_tokens(json.dumps(
+                                candidate, ensure_ascii=False, separators=(",", ":")
+                            )))
+                        ),
                     )
                 else:
                     if not args.snapshot:
@@ -386,15 +393,13 @@ def main(argv=None):
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
-        if (args.cmd in ("map", "slice") and args.format == "markdown"
-                and rendered_tokens(rendered) > args.max_tokens):
+        if args.cmd in ("map", "slice", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
             from .slicer import InvalidBudgetError
-            raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
-        if args.cmd == "delta":
-            from .slicer import InvalidBudgetError
-            if rendered_tokens(rendered) > args.max_tokens:
+            if args.cmd == "flow":
+                label = "printed flow output"
+            else:
                 label = "rendered Markdown" if args.format == "markdown" else "printed JSON"
-                raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
+            raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
         print(rendered)
         return 0
     except (CodeGraphError, OSError, sqlite3.Error) as exc:
