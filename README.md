@@ -52,6 +52,26 @@ Delta reports edge additions/removals, new module-import and symbol-call SCCs, f
 
 This is static syntax analysis, not runtime execution. Bounded local CFG and def-use/state-mutation slices are available through `flow`; their scope and limits are described below. The broader index still does not provide whole-program CPG/CFG, runtime dispatch, arbitrary alias flow, package-root inference beyond the `src/` layout or runtime-import evaluation. Qualified `self`/`cls` calls identify the lexical class method, not the eventual runtime implementation. Branch complexity counts each supported branch AST node once and excludes nested definitions. Module-level re-exports resolve exactly when the defining module's own reference to the name would (see HELP.md "Analysis limits"). Conditional bindings and external dependencies can remain unresolved; star imports, dynamic namespace writes and cross-module assignment are not modelled. Repeated ordinary/overload definitions retain the final binding and a diagnostic; property accessor source spans retain getter/setter definitions. No speed or fixed compression ratio is claimed. Unsupported syntax and invalid source fail explicitly.
 
+Delta's default output remains the legacy schema. `--projection v2` selects the
+additive `python-delta-v2` projection, with repeatable `--anchor` and `--kind`
+filters and a `--edge-sample-limit` (default 20) for added/removed edges and
+import changes;
+using any of those filters selects v2 automatically.
+Its `totals` object contains each filtered count once; `samples` provides
+bounded details and `omitted` reports unsampled records. Anchor filters match
+the requested symbol and qualified descendants. Kind filters accept report
+categories or relationship kinds such as `CALLS` and `IMPORTS`. Import change
+records are deduplicated in v2 and reported only in `import_changes`, not also
+in added/removed edge totals; the sample limit applies to import changes too.
+`--full` is refused with v2. Both output formats stay within the complete
+printed-output token budget.
+
+```sh
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
+  --projection v2 --anchor package.runtime:run --kind CALLS \
+  --edge-sample-limit 10 --max-tokens 2400
+```
+
 ## Bounded local flow
 
 `flow` builds an intraprocedural statement graph on demand for one indexed function or method. It provides local CFG, reaching-definition and conservative mutation information (profile `python-local-cpg-v1`); it does not claim whole-program CPG coverage, runtime dispatch, alias precision, or execution behavior. The new supported syntax is additive and retains `python-local-cpg-v1`; previously accepted graphs remain unchanged apart from engine/Python identity. Supported statements and explicit refusal cases are listed in [HELP.md](HELP.md).

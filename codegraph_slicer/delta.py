@@ -73,12 +73,17 @@ def compute_delta(
     selected_tests=(),
     cx_threshold=10,
     fan_out_threshold=10,
+    _earliest_edge_lines=False,
 ):
     def edges(store):
-        return {
-            (r["source_id"], r["target_id"], r["kind"]): r["line"]
-            for r in store.rows("SELECT source_id,target_id,kind,line FROM edges")
-        }
+        rows = store.rows("SELECT source_id,target_id,kind,line FROM edges")
+        if not _earliest_edge_lines:
+            return {(r["source_id"], r["target_id"], r["kind"]): r["line"] for r in rows}
+        found = {}
+        for r in rows:
+            key = (r["source_id"], r["target_id"], r["kind"])
+            found[key] = min(found.get(key, r["line"]), r["line"])
+        return found
 
     def fanout(store):
         return {
@@ -308,6 +313,124 @@ def summarize_delta(
     if render_estimator is not None and render_estimator(payload) > max_tokens:
         message = "complete delta payload exceeds rendered Markdown budget" if full else "delta summary metadata exceeds rendered Markdown budget"
         raise InvalidBudgetError(message)
+    return payload
+
+
+def project_delta_v2(
+    result,
+    max_tokens=8000,
+    *,
+    anchors=(),
+    kinds=(),
+    edge_sample_limit=20,
+    selected_tests=False,
+    render_estimator=None,
+):
+    """Return a filtered, sampled delta with one authoritative total per record kind."""
+    from .slicer import InvalidBudgetError
+
+    if not isinstance(edge_sample_limit, int) or isinstance(edge_sample_limit, bool) or edge_sample_limit < 0:
+        raise InvalidBudgetError("edge sample limit must be a non-negative integer")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise InvalidBudgetError("max_tokens must be a positive integer")
+    categories = (
+        "boundary_violations", "new_cycles", "complexity_drift", "added_edges",
+        "removed_edges", "modified_symbols", "affected_entrypoints",
+        "untested_modified_symbols", "test_coverage", "import_changes",
+    )
+    requested_anchors = tuple(anchors)
+    requested_kinds = tuple(k.upper() for k in kinds)
+    rows = {name: list(result[name]) for name in categories if name != "import_changes"}
+    rows["import_changes"] = [
+        {"change": change, "source": edge[0], "target": edge[1], "line": edge[3]}
+        for change, edges in (("added", result["added_edges"]), ("removed", result["removed_edges"]))
+        for edge in edges if edge[2] == "IMPORTS"
+    ]
+    # In v2 each changed import has one home: the richer import_changes bucket.
+    rows["added_edges"] = [edge for edge in rows["added_edges"] if edge[2] != "IMPORTS"]
+    rows["removed_edges"] = [edge for edge in rows["removed_edges"] if edge[2] != "IMPORTS"]
+
+    def has_anchor(value):
+        if not requested_anchors:
+            return True
+        if isinstance(value, str):
+            return any(
+                value == anchor
+                or (anchor.endswith(":") and value.startswith(anchor))
+                or value.startswith((anchor + ".", anchor + ":"))
+                for anchor in requested_anchors
+            )
+        if isinstance(value, dict):
+            return any(has_anchor(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(has_anchor(item) for item in value)
+        return False
+
+    edge_categories = {"added_edges", "removed_edges", "import_changes"}
+    for name in categories:
+        filtered = []
+        for item in rows[name]:
+            if not has_anchor(item):
+                continue
+            if requested_kinds:
+                if name in edge_categories:
+                    if name.upper() not in requested_kinds:
+                        edge_kind = item[2] if name != "import_changes" else "IMPORTS"
+                        if edge_kind not in requested_kinds:
+                            continue
+                elif name.upper() not in requested_kinds:
+                    continue
+            filtered.append(item)
+        rows[name] = filtered
+
+    # Collapse identical import projection rows; legacy output retains its historical rows.
+    rows["import_changes"] = list({
+        (item["change"], item["source"], item["target"], item["line"]): item
+        for item in rows["import_changes"]
+    }.values())
+    totals = {name: len(values) for name, values in rows.items()}
+    samples = {name: list(values) for name, values in rows.items()}
+    for name in ("added_edges", "removed_edges", "import_changes"):
+        samples[name] = samples[name][:edge_sample_limit]
+    omitted = {name: totals[name] - len(samples[name]) for name in categories}
+    payload = {
+        "schema": "python-delta-v2",
+        "filters": {"anchors": list(requested_anchors), "kinds": list(requested_kinds)},
+        "totals": totals,
+        "samples": samples,
+        "omitted": omitted,
+        "test_selection": "selected" if selected_tests else "none_selected",
+        "test_gap_note": result["test_gap_note"],
+    }
+    payload = _with_serialized_tokens(payload)
+    while (
+        payload["serialized_tokens"] > max_tokens
+        or (render_estimator is not None and render_estimator(payload) > max_tokens)
+    ) and any(samples[name] for name in categories):
+        # Preserve all required totals and trim optional detail in stable category order.
+        name = next(
+            (
+                n for n in (
+                    "added_edges", "removed_edges", "import_changes", "complexity_drift",
+                    "modified_symbols", "affected_entrypoints", "test_coverage",
+                    "untested_modified_symbols", "new_cycles", "boundary_violations",
+                ) if samples[n]
+            ),
+            None,
+        )
+        if name is None:
+            break
+        samples[name].pop()
+        omitted[name] += 1
+        payload["samples"] = samples
+        payload["omitted"] = omitted
+        payload = _with_serialized_tokens(payload)
+    if payload["serialized_tokens"] > max_tokens:
+        raise InvalidBudgetError(
+            f"delta v2 required metadata requires {payload['serialized_tokens']} tokens; budget is {max_tokens}"
+        )
+    if render_estimator is not None and render_estimator(payload) > max_tokens:
+        raise InvalidBudgetError("delta v2 required metadata exceeds rendered Markdown budget")
     return payload
 
 

@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from .ast_extractor import CodeGraphError
-from .delta import compute_delta, summarize_delta
+from .delta import compute_delta, project_delta_v2, summarize_delta
 from .flow import FlowQueryError, UnsupportedFlowError, compact_flow_result
 from .flow_query import query_flow
 from .pagerank import build_repo_map, build_repo_outline
@@ -182,6 +182,35 @@ def _markdown(result):
                 f"rerun with --max-tokens {item['max_tokens']}"
                 for item in records
             )
+        return "\n\n".join(blocks)
+    if result.get("schema") == "python-delta-v2":
+        blocks = ["# Static delta report (python-delta-v2)"]
+        blocks.append("Filters: " + json.dumps(result["filters"], ensure_ascii=False, sort_keys=True))
+        blocks.append("## Totals\n\n" + "\n".join(
+            f"- **{name.replace('_', ' ')}:** {count}"
+            for name, count in result["totals"].items()
+        ))
+        for name, records in result["samples"].items():
+            if records:
+                rendered = []
+                for row in records:
+                    if isinstance(row, dict):
+                        detail = "; ".join(
+                            f"{key.replace('_', ' ')}: {value}"
+                            for key, value in row.items()
+                        )
+                    elif isinstance(row, list):
+                        detail = " · ".join(map(str, row))
+                    else:
+                        detail = str(row)
+                    rendered.append("- " + detail)
+                blocks.append(
+                    "## " + name.replace("_", " ").title() + "\n\n" + "\n".join(rendered)
+                )
+        for name, count in result["omitted"].items():
+            if count:
+                blocks.append(f"Omitted **{name.replace('_', ' ')}** records: {count}")
+        blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
         return "\n\n".join(blocks)
     if "summary" in result or "modified_symbols" in result and "serialized_tokens" in result:
         blocks = ["# Static delta report"]
@@ -435,6 +464,10 @@ def main(argv=None):
         help="report imports from SOURCE to TARGET prefixes; repeatable (default: none)",
     )
     delta.add_argument("--selected-test", action="append", default=[], help="select a test path for static gap analysis; repeatable, does not run it (default: none)")
+    delta.add_argument("--projection", choices=("legacy", "v2"), help="output schema; v2 adds filters and bounded edge samples while preserving filtered totals (default: legacy)")
+    delta.add_argument("--anchor", action="append", default=[], help="v2 projection: retain records mentioning this exact symbol or its qualified descendants; repeatable")
+    delta.add_argument("--kind", action="append", default=[], help="v2 projection: retain this report category or edge kind (for example CALLS or IMPORTS); repeatable")
+    delta.add_argument("--edge-sample-limit", type=int, help="v2 projection: maximum added/removed edge samples per direction (default: 20)")
     delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
     for command in (sync, mapping, slicing, impact, flow, delta):
@@ -445,21 +478,41 @@ def main(argv=None):
     try:
         with ExitStack() as stack:
             if args.cmd == "delta":
+                has_v2_options = bool(args.anchor) or bool(args.kind) or args.edge_sample_limit is not None
+                if args.projection == "legacy" and has_v2_options:
+                    parser.error("v2 filters require --projection v2")
+                use_v2 = args.projection == "v2" or (
+                    args.projection is None and has_v2_options
+                )
+                if args.full and use_v2:
+                    parser.error("--full cannot be combined with the v2 projection or its filters")
                 opening_db_path = str(Path(args.base_db).resolve())
                 base = stack.enter_context(GraphStore(args.base_db, readonly=True))
                 opening_db_path = str(Path(args.head_db).resolve())
                 head = stack.enter_context(GraphStore(args.head_db, readonly=True))
                 opening_db = False
                 result = compute_delta(
-                    base, head, args.forbid_import, selected_tests=args.selected_test
+                    base, head, args.forbid_import, selected_tests=args.selected_test,
+                    _earliest_edge_lines=use_v2,
                 )
-                result = summarize_delta(
-                    result, args.max_tokens, full=args.full,
-                    selected_tests=bool(args.selected_test),
-                    render_estimator=(
-                        lambda candidate: rendered_tokens(_markdown(candidate))
-                    ) if args.format == "markdown" else None,
-                )
+                markdown_budget = (
+                    lambda candidate: rendered_tokens(_markdown(candidate))
+                ) if args.format == "markdown" else None
+                if use_v2:
+                    result = project_delta_v2(
+                        result, args.max_tokens, anchors=args.anchor, kinds=args.kind,
+                        edge_sample_limit=(
+                            20 if args.edge_sample_limit is None else args.edge_sample_limit
+                        ),
+                        selected_tests=bool(args.selected_test),
+                        render_estimator=markdown_budget,
+                    )
+                else:
+                    result = summarize_delta(
+                        result, args.max_tokens, full=args.full,
+                        selected_tests=bool(args.selected_test),
+                        render_estimator=markdown_budget,
+                    )
             else:
                 opening_db_path = str(Path(args.db).resolve())
                 store = stack.enter_context(GraphStore(args.db, readonly=args.cmd != "sync"))

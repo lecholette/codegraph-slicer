@@ -223,6 +223,8 @@ external references may leave unknown boundaries.
 codegraph-slicer delta --base-db DATABASE --head-db DATABASE
                        [--forbid-import SOURCE TARGET ...]
                        [--selected-test PATH ...] [--max-tokens N] [--full]
+                       [--projection legacy|v2] [--anchor SYMBOL ...]
+                       [--kind KIND ...] [--edge-sample-limit N]
                        [--format json|markdown]
 ```
 
@@ -253,6 +255,25 @@ reachable-but-unselected tests, and no reachable tests. A requested path that
 cannot be resolved is reported as unknown and refused. Summary output includes `--full --max-tokens N`
 guidance for retrieving full details.
 
+The default `legacy` projection keeps the existing output unchanged. Add
+`--projection v2` for the additive `python-delta-v2` schema; using `--anchor`,
+`--kind`, or `--edge-sample-limit` also selects v2 automatically. In v2, repeat
+`--anchor SYMBOL` to retain records mentioning an exact symbol or a qualified
+descendant, and repeat `--kind KIND` to retain a report category (such as
+`complexity_drift`) or a relationship kind (such as `CALLS` or `IMPORTS`).
+Filters apply before totals and samples are computed. The v2 `totals` object is
+the one authoritative count per record kind; `samples` contains emitted
+records, while `omitted` records the difference. Import relationships appear
+only in `import_changes`; `added_edges` and `removed_edges` contain the other
+relationship kinds. `--edge-sample-limit N`
+defaults to 20 and bounds added and removed edge samples independently; zero
+keeps totals while suppressing those samples. The same limit bounds import
+change samples. Import change rows in this versioned projection are
+deduplicated. `--full` is supported only by the
+legacy projection and is refused with v2. Explicit `--projection legacy` cannot
+be combined with v2 filters. The token budget covers complete JSON or Markdown
+output, including its final newline.
+
 ```sh
 codegraph-slicer sync /path/to/repo --revision BASE_REV --db /tmp/base.sqlite
 codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
@@ -261,6 +282,9 @@ codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
   --selected-test tests/test_runtime.py --max-tokens 2400 --format markdown
 codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
   --full --max-tokens 8000
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
+  --projection v2 --anchor package.runtime:run --kind CALLS \
+  --edge-sample-limit 10 --max-tokens 2400
 ```
 
 Next, review the static change report and run relevant tests separately. There
