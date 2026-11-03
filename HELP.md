@@ -1,10 +1,10 @@
 # codegraph-slicer help
 
 `codegraph-slicer` indexes Python source into a SQLite snapshot, then builds a
-ranked repository map, extracts bounded context around symbols, compares two
-snapshots, or builds bounded local control/data-flow slices. It is static syntax
-analysis: it does not import or execute indexed code, execute tests, or infer
-runtime behavior.
+ranked repository map, extracts bounded context around symbols, reports bounded
+transitive callers, compares two snapshots, or builds bounded local
+control/data-flow slices. It is static syntax analysis: it does not import or
+execute indexed code, execute tests, or infer runtime behavior.
 
 After `pip install`, the executable can be called by name from any working
 directory. Every query uses an existing database. The first
@@ -14,6 +14,7 @@ example creates one; the later commands reuse that same index:
 codegraph-slicer sync /path/to/project --db /tmp/project.sqlite
 codegraph-slicer map --db /tmp/project.sqlite
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run
+codegraph-slicer impact package.module:run --db /tmp/project.sqlite --max-depth 3 --max-nodes 200
 codegraph-slicer flow package.module:run --db /tmp/project.sqlite --variable total
 ```
 
@@ -33,9 +34,11 @@ describes the index model and known static-analysis limits.
 1. Run `sync` once to create the snapshot database.
 2. Run `map` to see ranked file skeletons, or `slice` for context around one or
    more anchors.
-3. To review changes, sync base and head source into separate databases and
+3. Run `impact` for bounded transitive call reachability from one function or
+   method; it does not trace values.
+4. To review changes, sync base and head source into separate databases and
    run `delta --base-db BASE --head-db HEAD`.
-4. Inspect the report, then run any tests separately. `delta` only reports
+5. Inspect the report, then run any tests separately. `delta` only reports
    static test-selection gaps; `--selected-test` does not execute or certify a
    test.
 
@@ -88,7 +91,8 @@ Next, pass the created database to `map` or `slice`.
 
 ```text
 codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
-                      [--max-tokens N] [--format json|markdown]
+                      [--max-tokens N] [--outline]
+                      [--format json|markdown]
 ```
 
 `--db` must name an existing index and is opened read-only. Repeat `--seed` to
@@ -98,6 +102,22 @@ ranking starts across the whole indexed repository. `--max-tokens` defaults to
 includes whole file skeletons in rank order while they fit. When files are
 omitted, JSON and Markdown report the exact omitted count; emitted and omitted
 counts reconcile to the complete map. Increase `--max-tokens` to retrieve more.
+Seeded maps omit zero-score files. If the highest-ranked file cannot fit, its
+path and the token budget that admits it are reported. Unseeded legacy map
+output is unchanged. Add `--outline` to emit schema version 1 with per-file
+entities (`id`, `name`, `kind`, `signature`, and `line`) and typed resolved
+neighbor edges (`CALLS`, `IMPORTS`, `USES_TYPE`, `INHERITS`, and `DEFINES`).
+Outline edge records are compact `{from,to,kind}` triples. Each file has a
+local `fNNNN` ID, and its entities use local `eNNNN` IDs; edge references use
+`fNNNN:eNNNN` to distinguish entities across files. Seed files and their
+entities are budgeted and displayed first in the order of repeated `--seed`
+arguments; ranked neighbors follow. `omitted.files` and `omitted.entities` give
+per-path counts, `omitted.edges` counts eligible edges with at least one
+unselected endpoint, and the single `omitted.max_tokens` value is the
+complete-candidate budget that admits all omitted records. Seeded zero-score
+files are outside the outline candidate set. Required seed entities must fit;
+otherwise the command refuses without printing output. If required omission
+metadata does not fit, the command also refuses.
 The budget includes complete
 printed output and its trailing newline in either format. A budget too small
 for required map metadata is an error. `--format` defaults to JSON.
@@ -113,7 +133,7 @@ its implementation and related context.
 
 ```text
 codegraph-slicer slice --db DATABASE ANCHOR [ANCHOR ...]
-                       [--max-tokens N] [--include-callee-bodies]
+                       [--max-tokens N] [--include-callee-bodies] [--outline]
                        [--format json|markdown]
 ```
 
@@ -150,16 +170,73 @@ room for the selected target and other context when a set of class bodies
 dominates a slice.
 `--format` defaults to JSON.
 
+Add `--outline` to return schema version 1 as a body-free structural graph. It
+contains one `entities` table with deterministic local IDs (`e0001`, `e0002`,
+...) and typed `edges` with `from`, `to`, `kind`, and source `line`. By default,
+the graph includes observed `CALLS`, `USES_TYPE`, `INHERITS`, and `DEFINES`
+relationships for the anchor neighborhood. Module (`:`) hops and `IMPORTS`
+edges are included only with `--include-imports`. Every emitted edge endpoint
+is present in `entities`; `omitted.edges` reports the exact number of eligible
+edges whose other endpoint is outside the selected entities. IDs are assigned
+by path, source line, and symbol ID; they are stable for the same indexed
+snapshot and selected neighborhood. The `diagnostics` list keeps full
+unresolved or external observations for anchors (`source`, textual `target`,
+`kind`, source `line`, and `reason`); other entities have unresolved counts
+keyed by local entity ID. These are observations, not claims that a target is
+absent. Signatures, source locations, entities, and internal edges are
+required; diagnostics are optional under the token budget. The query refuses
+only if the required entities and edges do not fit.
+
+`--include-imports` applies only with `--outline` and includes module nodes and
+their one-hop import context.
+
 When several anchors share required type definitions, those required types are
 kept in the required section and are not repeated as optional callee entries.
 
 ```sh
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --max-tokens 4000
 codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-callee-bodies --format markdown
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --format json
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --include-imports
 ```
 
 Next, inspect the returned sections; if the anchor is unknown, choose an
 indexed symbol or module from the map/database.
+
+### `impact`
+
+```text
+codegraph-slicer impact ANCHOR --db DATABASE [--max-depth N] [--max-nodes N]
+                         [--unknown-boundaries N] [--max-tokens N]
+                         [--snapshot] [--format json|markdown]
+```
+
+`impact` follows resolved `CALLS` edges backward from one indexed function or
+method. `--max-depth` defaults to 3 caller hops and `--max-nodes` defaults to
+200 returned caller nodes. Profile `python-call-impact-v2` uses caller fields
+`symbol`, `depth`, `to`, and `line`. All edges are resolved `CALLS`; at depth 1,
+`to: null` means the anchor. The smaller serialized representation wins:
+a flat list of records or `{"columns":["symbol","depth","to","line"],"rows":[...]}`.
+Callers are ordered by `(depth, symbol)` and filled up to `--max-nodes` and the
+printed token budget. `omitted.max_nodes` counts depth-bounded callers excluded
+by the node limit; `omitted.budget` counts eligible callers excluded by tokens.
+The command refuses only if its header and first caller (if any) cannot fit.
+`retrieve_details` is a runnable command with expanded node and admitting token
+budgets for every caller within the requested depth and the requested unknown
+sample, in the same output format. It does not expand the depth bound.
+
+The total unresolved `CALLS` count and indexed-snapshot scope remain present.
+`--unknown-boundaries N` requests a deterministic sample, independently bounded
+from callers; unknown samples fill residual token room after callers.
+`unknown_boundaries_omitted` counts every unprinted unknown record. These calls
+cannot be linked to the selected anchor. `truncated` is true for omitted callers,
+or reachable callers beyond the depth bound; unknown sampling is counted separately.
+Markdown embeds the same versioned profile and exact printed token estimate.
+
+This query reports static call reachability. It does not trace values, prove a
+call executes at runtime, or establish that the result is a complete impact
+set. It follows only resolved `CALLS` edges; dynamic dispatch, aliases or
+external references may leave unknown boundaries.
 
 ### `delta`
 
@@ -167,6 +244,8 @@ indexed symbol or module from the map/database.
 codegraph-slicer delta --base-db DATABASE --head-db DATABASE
                        [--forbid-import SOURCE TARGET ...]
                        [--selected-test PATH ...] [--max-tokens N] [--full]
+                       [--projection legacy|v2] [--anchor SYMBOL ...]
+                       [--kind KIND ...] [--edge-sample-limit N]
                        [--format json|markdown]
 ```
 
@@ -197,6 +276,24 @@ reachable-but-unselected tests, and no reachable tests. A requested path that
 cannot be resolved is reported as unknown and refused. Summary output includes `--full --max-tokens N`
 guidance for retrieving full details.
 
+The default `legacy` projection keeps the existing output unchanged. Add
+`--projection v2` for the additive `python-delta-v2` schema; using `--anchor`,
+`--kind`, or `--edge-sample-limit` also selects v2 automatically. In v2, repeat
+`--anchor SYMBOL` to retain records mentioning an exact symbol or a qualified
+descendant, and repeat `--kind KIND` to retain a report category (such as
+`complexity_drift`) or a relationship kind (such as `CALLS` or `IMPORTS`).
+Filters apply before totals and samples are computed. The v2 `totals` object is
+the one authoritative count per record kind; `samples` contains emitted
+records, while `omitted` records the difference. Import relationships appear
+only in `import_changes`; `added_edges` and `removed_edges` contain the other
+relationship kinds. `--edge-sample-limit N` defaults to 20, must be at least 1,
+and bounds added and removed edge samples independently. The same limit bounds
+import change samples. Import change rows in this versioned projection are
+deduplicated. `--full` is supported only by the
+legacy projection and is refused with v2. Explicit `--projection legacy` cannot
+be combined with v2 filters. The token budget covers complete JSON or Markdown
+output, including its final newline.
+
 ```sh
 codegraph-slicer sync /path/to/repo --revision BASE_REV --db /tmp/base.sqlite
 codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
@@ -205,6 +302,9 @@ codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
   --selected-test tests/test_runtime.py --max-tokens 2400 --format markdown
 codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
   --full --max-tokens 8000
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
+  --projection v2 --anchor package.runtime:run --kind CALLS \
+  --edge-sample-limit 10 --max-tokens 2400
 ```
 
 Next, review the static change report and run relevant tests separately. There
@@ -217,6 +317,7 @@ are no project-specific import boundaries unless supplied with
 codegraph-slicer flow ANCHOR --db DATABASE [--variable NAME_OR_ACCESS_PATH]
                       [--line LINE] [--direction backward|forward]
                       [--data-only] [--max-tokens N]
+                      [--compact]
                       [--format json|markdown]
 ```
 
@@ -240,11 +341,29 @@ relevant diagnostics, and graph-wide limitations. It records `query.variable`,
 criteria the full graph is returned with `seeds: []`, including its CFG and AST
 edges.
 
+`--compact` is an additive, versioned JSON representation for smaller flow
+payloads. It emits schema `python-local-cpg-flow-compact-v1`: shared function,
+path, source/blob/engine identity, query, and seeds appear once; nodes and edges
+use a `columns` list with positional `rows`; diagnostics group repeated
+`code`/`message` pairs and retain each node ID and line as an occurrence.
+Node rows are never merged by source location, so distinct cleanup nodes on the
+same line remain distinct. Node columns retain IDs, kinds, source spans and
+text, reachability, synthetic status, definitions, uses, and mutation targets;
+the compact projection therefore keeps the data and mutation facts available
+in the full graph. Use ordinary JSON without `--compact` as the recovery path
+when consumers need the original named-field records. The token budget applies
+to the selected representation. With `--format markdown`, the compact schema
+is shown as an unindented JSON block rather than expanded into the named-field
+flow view. Its token header measures the complete printed Markdown, including
+the header and final newline. JSON and Markdown estimates use a bounded
+fixed-point calculation and refuse if they do not converge.
+
 ```sh
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite \
   --variable total --line 15
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite \
   --variable new_estimate_cents --direction forward --data-only --format markdown
+codegraph-slicer flow spend:admit --db /tmp/example.sqlite --compact
 ```
 
 On `examples/spend.py`, the first is a backward slice at the `total` guardrail predicate, showing

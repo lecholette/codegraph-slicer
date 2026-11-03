@@ -6,7 +6,9 @@ A standalone, stdlib-only Python structural graph index, bounded context slicer 
 codegraph-slicer sync /path/to/project --db /tmp/graph.sqlite
 codegraph-slicer sync /path/to/git/repo --revision HEAD --db /tmp/head.sqlite
 codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 1800
+codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --outline --max-tokens 1800
 codegraph-slicer slice --db /tmp/graph.sqlite package.module:thing --max-tokens 4000
+codegraph-slicer impact package.module:thing --db /tmp/graph.sqlite --max-depth 3 --max-nodes 200
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:thing --format markdown
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:42 --include-callee-bodies
 codegraph-slicer flow package.module:function --db /tmp/graph.sqlite --variable total --line 15
@@ -16,6 +18,8 @@ codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
 ```
 
 Every command supports `--format json|markdown`. Query commands require an existing database and open it read-only. `sync` is the only writer. Python APIs are exported by `codegraph_slicer`; use `with GraphStore(path) as store:` to close the connection.
+
+`impact` walks resolved `CALLS` edges backward to find transitive callers. Profile `python-call-impact-v2` stores caller `symbol`, `depth`, `to`, and source `line`, choosing the smaller serialized flat or column layout. A null `to` at depth 1 means the anchor; all edges are `CALLS`. Callers fill the output budget in `(depth, symbol)` order; `omitted.max_nodes` and `omitted.budget` report separate exact counts within the depth bound. `retrieve_details` expands the node and token budgets to recover every depth-bounded caller and requested unknown sample. Unknown calls retain their snapshot-wide count and scope, with an optional independent `--unknown-boundaries N` sample. `truncated` reflects caller or depth omissions; unknown samples have their own omission count. Markdown includes the same profile. This is static reachability, not value flow or proof of runtime execution.
 
 `delta` defaults to a compact, priority-ranked summary with an 8000-token budget.
 Its `serialized_tokens` estimate covers the complete printed JSON, including
@@ -38,11 +42,35 @@ with GraphStore('/tmp/graph.sqlite', readonly=True) as store:
 
 Slices contain full requested implementations, full class/type definitions up to two `USES_TYPE`/`INHERITS` hops, caller signatures, then callee signatures (optionally bodies). Required anchors/types must fit or the query refuses. Across multiple anchors, required type definitions are not duplicated as optional callees. Optional neighbors follow PageRank order. A `file.py:line` anchor picks the innermost observed definition containing that line. Module anchors use `package.module:`. Repository maps aggregate symbol PageRank by file and include each file skeleton once.
 
-Map and slice budgets are deterministic estimates, not tokenizer counts: `len(printed_output) // 4 + 1`, with Unicode characters counted directly and the trailing newline included. They budget the complete printed result in JSON or Markdown. Map and slice results report exact per-kind omissions when records are dropped; emitted plus omitted counts reconcile to an unlimited result. Complete results omit omission metadata. Increase `--max-tokens` to retrieve more records; required slice anchors and their omission metadata must fit or the command refuses without printing a partial report. Their `tokens` fields report the estimate used for admission. Delta separately bounds its complete printed output in both formats. Flow's `tokens` field estimates only its compact JSON graph value (including identity and graph data, excluding the outer `tokens` field and Markdown); its max-token behavior follows that estimate.
+Add `map --outline` for schema version 1: each file has a local `fNNNN` ID and contains entities with local `eNNNN` IDs, names, kinds, signatures, and source lines. Compact `{from,to,kind}` edges use `fNNNN:eNNNN` references to disambiguate local IDs across files. Seed files and entities are budgeted and displayed first in the order of repeated `--seed` arguments; ranked neighbors follow. `omitted.files` and `omitted.entities` give per-path counts, `omitted.edges` counts eligible edges with at least one unselected endpoint, and the single `omitted.max_tokens` value is the complete-candidate budget that admits all omitted records. All resolved seed entities must fit together before ranked filling starts, or the command refuses. Seeded zero-score files are outside the outline candidate set. A seeded legacy map omits zero-score files and identifies its highest-ranked omitted file; unseeded legacy JSON remains byte-for-byte stable.
+
+Add `slice --outline` for schema version 1: it returns one body-free `entities` table with deterministic local `eNNNN` IDs and typed `edges` containing source, target, kind, and source line. The observed anchor neighborhood includes `CALLS`, `USES_TYPE`, `INHERITS`, and `DEFINES`; module (`:`) hops and `IMPORTS` edges are included only with `--include-imports`. Every emitted edge endpoint is present in the entity table, while `omitted.edges` counts eligible edges whose other endpoint is outside the selected entities. IDs are ordered by path, source line, and symbol ID and are stable for the same snapshot and neighborhood. Anchor diagnostics retain their full textual observations; other entities report unresolved counts keyed by local entity ID. Diagnostics are optional under the budget, while all selected entities and internal edges must fit. The command refuses only when those required entities and edges cannot fit.
+
+Map and slice budgets are deterministic estimates, not tokenizer counts: `len(printed_output) // 4 + 1`, with Unicode characters counted directly and the trailing newline included. They budget the complete printed result in JSON or Markdown. Map and slice results report exact omission counts when records are dropped; complete results omit omission metadata. Slice outlines keep all selected entities and internal edges, count eligible edges with unselected endpoints in `omitted.edges`, and reduce optional diagnostics details to fit. They refuse only when the required entities and edges cannot fit. Their `tokens` fields report the estimate used for admission. Delta separately bounds its complete printed output in both formats. Flow's `tokens` field estimates only its compact JSON graph value (including identity and graph data, excluding the outer `tokens` field and Markdown); its max-token behavior follows that estimate.
 
 Delta reports edge additions/removals, new module-import and symbol-call SCCs, forbidden import-prefix pairs (including unindexed targets), body/signature changes, complexity/fan-out drift, upstream entrypoints and static test gaps. Relationship identity is `(source, target, kind)`; a reported edge line is a representative occurrence, not a list of every call site. Threshold defaults are 10 for positive complexity/fan-out drift. Reachability uses both base and head graphs, while test candidates and explicit selections come from observed HEAD test symbols. A test counts as updated only when its source symbol changed; edge rebinding alone does not count. Selection does not assert that the test ran. Entrypoint discovery is heuristic: it recognizes `__main__` modules, modules with `cli`, `scripts`, or `mcp` path components, and symbols named `main`; arbitrary framework-decorated entrypoints are not discovered automatically. No test execution or behavioral coverage is inferred. Boundary rules are forbidden source/target prefix pairs; there are no project-specific default boundaries.
 
 This is static syntax analysis, not runtime execution. Bounded local CFG and def-use/state-mutation slices are available through `flow`; their scope and limits are described below. The broader index still does not provide whole-program CPG/CFG, runtime dispatch, arbitrary alias flow, package-root inference beyond the `src/` layout or runtime-import evaluation. Qualified `self`/`cls` calls identify the lexical class method, not the eventual runtime implementation. Branch complexity counts each supported branch AST node once and excludes nested definitions. Module-level re-exports resolve exactly when the defining module's own reference to the name would (see HELP.md "Analysis limits"). Conditional bindings and external dependencies can remain unresolved; star imports, dynamic namespace writes and cross-module assignment are not modelled. Repeated ordinary/overload definitions retain the final binding and a diagnostic; property accessor source spans retain getter/setter definitions. No speed or fixed compression ratio is claimed. Unsupported syntax and invalid source fail explicitly.
+
+Delta's default output remains the legacy schema. `--projection v2` selects the
+additive `python-delta-v2` projection, with repeatable `--anchor` and `--kind`
+filters and a `--edge-sample-limit` (default 20) for added/removed edges and
+import changes;
+using any of those filters selects v2 automatically.
+Its `totals` object contains each filtered count once; `samples` provides
+bounded details and `omitted` reports unsampled records. Anchor filters match
+the requested symbol and qualified descendants. Kind filters accept report
+categories or relationship kinds such as `CALLS` and `IMPORTS`. Import change
+records are deduplicated in v2 and reported only in `import_changes`, not also
+in added/removed edge totals; the sample limit applies to import changes too.
+`--full` is refused with v2. Both output formats stay within the complete
+printed-output token budget.
+
+```sh
+codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
+  --projection v2 --anchor package.runtime:run --kind CALLS \
+  --edge-sample-limit 10 --max-tokens 2400
+```
 
 ## Bounded local flow
 
@@ -52,11 +80,14 @@ This is static syntax analysis, not runtime execution. Bounded local CFG and def
 codegraph-slicer sync examples --db /tmp/example.sqlite
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite --variable total --line 15
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite --variable new_estimate_cents --direction forward --data-only --format markdown
+codegraph-slicer flow spend:admit --db /tmp/example.sqlite --compact
 ```
 
 Using [`examples/spend.py`](examples/spend.py), the first flow command selects `total` at its guardrail line and walks backward through data and (by default) control dependencies, including the billed and new estimate inputs and loop-carried liability where observed. The second walks forward from `new_estimate_cents` using data edges only. With no `--variable` or `--line`, `flow` returns the complete function graph with no selection seeds. `--line` and `--variable` together restrict the seed set to nodes satisfying both. Forward/backward select edge direction; `--data-only` removes control edges. An unknown variable or line refuses instead of selecting a nearby value. The report records the query criteria and whether control dependence was enabled.
 
 The source is the full module text cached in the SQLite snapshot. The report includes the observed symbol ID, indexed path and blob identity plus the SHA-256 of analyzed module text. Map, slice and flow verify source freshness before reading the index and refuse stale or unverifiable source; run `sync` to observe updates. Use `--snapshot` to intentionally query historical cached bytes. Querying opens SQLite read-only and never imports or executes indexed code. Default JSON includes the complete selected graph and diagnostics. Markdown lists nodes, source locations, definitions/uses, writes and limitations. Flow's deterministic token estimate covers the compact JSON graph value, including identity, but excludes the outer `tokens` field and Markdown; if it does not fit, the query errors instead of trimming dependencies.
+
+Flow JSON also accepts `--compact` for schema `python-local-cpg-flow-compact-v1`. This additive columnar projection stores shared identity, query, and seeds once; node and edge field names appear once in their `columns` arrays, with values in positional `rows`. Repeated diagnostics are grouped while preserving their node IDs and lines. Every node remains a separate row, including cleanup nodes sharing a source location, and definitions, uses, and mutation targets stay present. Ordinary flow JSON remains available as the named-field recovery representation. `--format markdown` displays the compact schema as an unindented JSON block. Its token header measures the complete printed Markdown, including the header and trailing newline. The bounded fixed-point estimate refuses if it does not converge. `--max-tokens` budgets the selected representation.
 
 The local profile supports assignments, annotated and augmented assignments, expressions, if/elif/else, for/while and their `else` blocks, break/continue, return/raise, assert/pass, and eagerly evaluated named expressions. Walrus expressions under short-circuit or conditional expressions are refused because their execution is conditional. Potentially overlapping chained attribute/subscript targets, writes whose receiver is rebound in the same assignment, and augmented memory targets that depend on a receiver walrus are refused rather than treated as independent writes. Rebinding a receiver or subpath invalidates older direct-path facts where modeled; aliases remain unresolved, so access paths are not proof of disjoint memory.
 

@@ -2,12 +2,13 @@
 
 import ast
 import hashlib
+import json
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
 
 from .ast_extractor import CodeGraphError
-from .slicer import InvalidBudgetError, serialized_tokens
+from .slicer import InvalidBudgetError, rendered_tokens
 
 
 class UnsupportedFlowError(CodeGraphError):
@@ -20,6 +21,69 @@ class FlowQueryError(CodeGraphError):
 
 class FlowBudgetExceeded(CodeGraphError):
     pass
+
+
+def _flow_output_tokens(report, render_estimator):
+    result = {"tokens": 0, "flow": report}
+    if render_estimator is None:
+        render_estimator = lambda candidate: rendered_tokens(json.dumps(
+            candidate, ensure_ascii=False, separators=(",", ":")
+        ))
+    for _ in range(16):
+        estimate = render_estimator(result)
+        if estimate == result["tokens"]:
+            return estimate
+        result["tokens"] = estimate
+    raise FlowBudgetExceeded("flow token estimate did not reach a fixed point")
+
+
+def compact_flow_result(result, render_estimator=None):
+    """Return the versioned, columnar JSON projection of a full flow result."""
+    graph = result["flow"]
+    node_columns = [
+        "id", "kind", "line", "end_line", "text", "reachable", "synthetic",
+        "defs", "uses", "mutation_targets",
+    ]
+    edge_columns = ["source", "target", "kind", "label"]
+    compact = {
+        "schema": "python-local-cpg-flow-compact-v1",
+        "profile": graph["profile"],
+        "function": graph["function"],
+        "identity": {
+            **graph["identity"],
+            "path": graph["path"],
+            "source_sha256": graph["source_sha256"],
+            "engine_sha256": graph["engine_sha256"],
+            "python_version": graph["python_version"],
+        },
+        "query": graph["query"],
+        "seeds": graph["seeds"],
+        "nodes": {
+            "columns": node_columns,
+            # Never collapse nodes by location: cleanup paths can legitimately
+            # produce distinct nodes with the same source line.
+            "rows": [[node[column] for column in node_columns] for node in graph["nodes"]],
+        },
+        "edges": {
+            "columns": edge_columns,
+            "rows": [[edge[column] for column in edge_columns] for edge in graph["edges"]],
+        },
+        "diagnostics": {
+            "columns": ["code", "message", "occurrences"],
+            "rows": [],
+        },
+        "limitations": graph["limitations"],
+    }
+    grouped = defaultdict(list)
+    for diagnostic in graph["diagnostics"]:
+        grouped[(diagnostic["code"], diagnostic["message"])].append(
+            [diagnostic["node"], diagnostic["line"]]
+        )
+    compact["diagnostics"]["rows"] = [
+        [code, message, occurrences]
+        for (code, message), occurrences in sorted(grouped.items())
+    ]
+    return {"tokens": _flow_output_tokens(compact, render_estimator), "flow": compact}
 
 
 def _structured_cleanup_depth(body):
@@ -183,10 +247,9 @@ def _walrus_names(node):
 def _access_targets(node):
     targets = set()
     for n in ast.walk(node):
-        if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store):
-            targets.add(ast.unparse(n))
-            targets.add(_wildcard_path(n))
-        elif isinstance(n, ast.Subscript) and isinstance(n.ctx, ast.Store):
+        if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(
+            n.ctx, ast.Store
+        ):
             targets.add(ast.unparse(n))
             targets.add(_wildcard_path(n))
     return targets
@@ -1110,10 +1173,6 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                         ),
                     )
     # Reaching definitions fixed point over CFG, preserving distinct parameters.
-    cfg = defaultdict(set)
-    for e in edges:
-        if e["kind"] == "CFG":
-            cfg[e["source"]].add(e["target"])
     byid = {n["id"]: n for n in nodes}
     gen = {n["id"]: {(n["id"], name) for name in n["defs"] if n["kind"] != "exception_name_delete"} for n in nodes}
     in_defs = {n["id"]: set() for n in nodes}
@@ -1266,6 +1325,7 @@ def slice_flow(
     direction="backward",
     include_control=True,
     max_tokens=8000,
+    render_estimator=None,
 ) -> dict:
     if direction not in ("backward", "forward"):
         raise FlowQueryError(f"invalid direction: {direction}")
@@ -1280,7 +1340,6 @@ def slice_flow(
     ):
         raise InvalidBudgetError("max_tokens must be a positive integer")
     nodes = graph["nodes"]
-    {n["id"]: n for n in nodes}
     if variable is None and line is None:
         report = {
             k: v for k, v in graph.items() if k not in ("nodes", "edges", "diagnostics")
@@ -1303,7 +1362,7 @@ def slice_flow(
                 "diagnostics": graph.get("diagnostics", []),
             }
         )
-        tokens = serialized_tokens(report)
+        tokens = _flow_output_tokens(report, render_estimator)
         if tokens > max_tokens:
             raise FlowBudgetExceeded(
                 f"flow needs {tokens} tokens, budget is {max_tokens}"
@@ -1362,7 +1421,7 @@ def slice_flow(
             ],
         }
     )
-    tokens = serialized_tokens(report)
+    tokens = _flow_output_tokens(report, render_estimator)
     if tokens > max_tokens:
         raise FlowBudgetExceeded(f"flow needs {tokens} tokens, budget is {max_tokens}")
     return {"tokens": tokens, "flow": report}

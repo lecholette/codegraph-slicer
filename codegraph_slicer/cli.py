@@ -1,23 +1,30 @@
 """Standalone commands; query commands open existing databases read-only."""
 
 import argparse
-from contextlib import ExitStack
 import json
-from collections import Counter
-from pathlib import Path
+import os
 import re
 import sqlite3
-import os
 import stat
-from .ast_extractor import CodeGraphError
-from .store import GraphStore
-from .pagerank import build_repo_map
-from .slicer import (AnchorNotFoundError, slice_context,
-                     rendered_tokens, tokens_for_length)
-from .delta import compute_delta, summarize_delta
-from .flow_query import query_flow
-from .flow import FlowQueryError, UnsupportedFlowError
+from collections import Counter
+from contextlib import ExitStack
+from pathlib import Path
 
+from .ast_extractor import CodeGraphError
+from .delta import compute_delta, project_delta_v2, summarize_delta
+from .flow import FlowBudgetExceeded, FlowQueryError, UnsupportedFlowError, compact_flow_result
+from .flow_query import query_flow
+from .pagerank import build_repo_map, build_repo_outline
+from .slicer import (
+    AnchorNotFoundError,
+    build_slice_outline,
+    query_call_impact,
+    rendered_tokens,
+    serialized_tokens,
+    slice_context,
+    tokens_for_length,
+)
+from .store import GraphStore
 
 _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
@@ -40,11 +47,16 @@ class _MapMarkdownEstimator:
     def __call__(self, payload):
         return rendered_tokens(_markdown(payload))
 
-    def estimate_map(self, item_cost, item_count, omitted):
+    def estimate_map(self, item_cost, item_count, omitted, top_file_omitted=None):
         fixed = ["Estimated context tokens: 0"]
         if omitted:
             fixed.extend(
                 [f"Omitted **files** records: {omitted}", "rerun with --max-tokens N"]
+            )
+        if top_file_omitted is not None:
+            fixed.append(
+                f"Top ranked file omitted: {top_file_omitted['path']} "
+                f"(first item estimate: {top_file_omitted['max_tokens']} tokens)"
             )
         fixed.append("## repository_map")
         size = sum(map(len, fixed)) + 2 * (len(fixed) - 1)
@@ -52,6 +64,41 @@ class _MapMarkdownEstimator:
         tokens = 0
         while True:
             estimate = tokens_for_length(size - len("0") + len(str(tokens)) + 1)
+            if estimate == tokens:
+                return estimate
+            tokens = estimate
+
+
+class _OutlineMarkdownEstimator:
+    """Exact Markdown accounting from selected outline records."""
+
+    def estimate_outline(self, files, edges, omitted, tokens=0):
+        blocks = ["# Repository outline (schema v1)", f"Estimated context tokens: {tokens}"]
+        for file_id, path, entities in files:
+            blocks.append(f"## {path} · `{file_id}`")
+            blocks.extend(
+                f"- `{entity['id']}` {entity['kind']} {entity['name']} "
+                f"(line {entity['line']}): `{entity['signature']}`"
+                for entity in entities
+            )
+        if edges:
+            blocks.append("## Edges")
+            blocks.extend(
+                f"- {edge['kind']}: `{edge['from']}` → `{edge['to']}`"
+                for edge in edges
+            )
+        for name, records in omitted.items():
+            blocks.append(f"## Omitted {name}")
+            blocks.append(f"- {name}: {records}")
+        return rendered_tokens("\n\n".join(blocks))
+
+    def __call__(self, payload):
+        files = [(item["id"], item["path"], item["entities"]) for item in payload["files"]]
+        tokens = 0
+        while True:
+            estimate = self.estimate_outline(
+                files, payload["edges"], payload.get("omitted", {}), tokens
+            )
             if estimate == tokens:
                 return estimate
             tokens = estimate
@@ -70,7 +117,7 @@ def _flow_markdown(result):
     source_hash = graph["source_sha256"]
     ref = _node_refs(graph["nodes"])
     blocks = [f"# Python local flow: `{graph['function']}`",
-              f"Graph JSON ≈ {result['tokens']} tokens; this view ≈ 0 tokens · profile `{graph['profile']}` · Python {graph['python_version']}"]
+              f"Graph JSON ≈ {serialized_tokens(graph)} tokens; this view ≈ 0 tokens · profile `{graph['profile']}` · Python {graph['python_version']}"]
     if identity["blob_sha"] == f"sha256:{source_hash}":
         blocks.append(f"Source: `{identity['path']}` · `{identity['symbol_id']}` · SHA-256 `{source_hash}`")
     else:
@@ -117,15 +164,104 @@ def _flow_markdown(result):
     blocks.extend(f"- {item}" for item in graph["limitations"])
     text = "\n\n".join(blocks)
     estimate = rendered_tokens(text)
-    while True:
+    for _ in range(16):
         rendered = text.replace("this view ≈ 0 tokens", f"this view ≈ {estimate} tokens", 1)
         updated = rendered_tokens(rendered)
         if updated == estimate:
             return rendered
         estimate = updated
+    raise FlowBudgetExceeded("flow Markdown token estimate did not reach a fixed point")
 
 
 def _markdown(result):
+    if "schema_version" in result and "entities" in result and "edges" in result:
+        blocks = [f"# Slice outline (schema v{result['schema_version']})"]
+        blocks.append(f"Estimated context tokens: {result['tokens']}")
+        blocks.append("## Entities")
+        blocks.extend(
+            f"- `{entity['id']}` {entity['kind']} `{entity['symbol']}` "
+            f"({entity['path']}:{entity['line']}): `{entity['signature']}`"
+            for entity in result["entities"]
+        )
+        blocks.append("## Edges")
+        blocks.extend(
+            f"- {edge['kind']} `{edge['from']}` → `{edge['to']}` (line {edge['line']})"
+            for edge in result["edges"]
+        )
+        blocks.append("## Diagnostics")
+        blocks.extend(
+            f"- {item['kind']} from `{item['source']}` to `{item['target']}` "
+            f"(line {item['line']}): {item['reason']}"
+            for item in result["diagnostics"]
+        )
+        if result.get("diagnostic_counts"):
+            blocks.append("## Other entity diagnostic counts")
+            blocks.extend(
+                f"- `{source}`: {count} unresolved observations"
+                for source, count in result["diagnostic_counts"].items()
+            )
+        if result.get("omitted"):
+            blocks.append("## Omitted records")
+            blocks.extend(
+                f"- {name}: {count}"
+                for name, count in result["omitted"].items()
+            )
+        return "\n\n".join(blocks)
+    if "schema_version" in result and "files" in result and "edges" in result:
+        blocks = [f"# Repository outline (schema v{result['schema_version']})"]
+        blocks.append(f"Estimated context tokens: {result['tokens']}")
+        for file in result["files"]:
+            blocks.append(f"## {file['path']} · `{file['id']}`")
+            blocks.extend(
+                f"- `{entity['id']}` {entity['kind']} {entity['name']} "
+                f"(line {entity['line']}): `{entity['signature']}`"
+                for entity in file["entities"]
+            )
+        if result["edges"]:
+            blocks.append("## Edges")
+            blocks.extend(
+                f"- {edge['kind']}: `{edge['from']}` → `{edge['to']}`"
+                for edge in result["edges"]
+            )
+        for name, records in result.get("omitted", {}).items():
+            blocks.append(f"## Omitted {name}")
+            blocks.extend(
+                f"- `{item['path']}`{(' ' + item['name']) if 'name' in item else ''}: "
+                f"rerun with --max-tokens {item['max_tokens']}"
+                for item in records
+            )
+        return "\n\n".join(blocks)
+    if result.get("schema") == "python-delta-v2":
+        blocks = ["# Static delta report (python-delta-v2)"]
+        blocks.append("Filters: " + json.dumps(result["filters"], ensure_ascii=False, sort_keys=True))
+        blocks.append(f"Test selection requested: `{result['test_selection']}`.")
+        blocks.append(result["test_gap_note"])
+        blocks.append("## Totals\n\n" + "\n".join(
+            f"- **{name.replace('_', ' ')}:** {count}"
+            for name, count in result["totals"].items()
+        ))
+        for name, records in result["samples"].items():
+            if records:
+                rendered = []
+                for row in records:
+                    if isinstance(row, dict):
+                        detail = "; ".join(
+                            f"{key.replace('_', ' ')}: {value}"
+                            for key, value in row.items()
+                        )
+                    elif isinstance(row, list):
+                        detail = " · ".join(map(str, row))
+                    else:
+                        detail = str(row)
+                    rendered.append("- " + detail)
+                blocks.append(
+                    "## " + name.replace("_", " ").title() + "\n\n" + "\n".join(rendered)
+                )
+        for name, count in result["omitted"].items():
+            if count:
+                blocks.append(f"Omitted **{name.replace('_', ' ')}** records: {count}")
+        blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
+        return "\n\n".join(blocks)
     if "summary" in result or "modified_symbols" in result and "serialized_tokens" in result:
         blocks = ["# Static delta report"]
         if "summary" in result:
@@ -172,8 +308,23 @@ def _markdown(result):
                 blocks.append("## " + title + "\n\n" + "\n".join(bullets))
         blocks.append(f"Estimated compact JSON tokens: {result['serialized_tokens']}")
         return "\n\n".join(blocks)
+    if result.get("flow", {}).get("schema") == "python-local-cpg-flow-compact-v1":
+        return (
+            "# Compact Python local flow\n\n"
+            f"Estimated context tokens: {result['tokens']}\n\n"
+            "```json\n"
+            + json.dumps(result["flow"], ensure_ascii=False)
+            + "\n```"
+        )
     if "flow" in result:
         return _flow_markdown(result)
+    if result.get("profile") == "python-call-impact-v2":
+        return (
+            f"# Call impact: `{result['anchor']}`\n\n"
+            "Reachability only; not value flow. Caller `to: null` means the anchor.\n\n"
+            f"Estimated context tokens: {result['tokens']}\n\n"
+            "```json\n" + json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n```"
+        )
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
         omission_blocks = []
@@ -257,6 +408,7 @@ def main(argv=None):
     mapping.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     mapping.add_argument("--seed", action="append", default=[], help="module or source path to rank from; repeatable (default: whole repository)")
     mapping.add_argument("--max-tokens", type=int, default=2000, help="estimated context budget (default: 2000)")
+    mapping.add_argument("--outline", action="store_true", help="emit versioned per-entity JSON outline")
     slicing = sub.add_parser(
         "slice",
         help="render implementations and related context for anchors",
@@ -273,7 +425,30 @@ def main(argv=None):
     slicing.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     slicing.add_argument("anchors", nargs="+", help="symbol, module, or path/line anchor")
     slicing.add_argument("--max-tokens", type=int, default=8000, help="estimated context budget (default: 8000)")
+    slicing.add_argument("--outline", action="store_true", help="emit a versioned, body-free entity graph")
+    slicing.add_argument("--include-imports", action="store_true", help="include module and import hops in an outline")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
+    impact = sub.add_parser(
+        "impact",
+        help="find bounded transitive callers over resolved call edges",
+        description=(
+            "Walk resolved CALLS edges backward from one function or method. This reports static "
+            "reachability, not value flow or proof of runtime execution. Unresolved call references "
+            "across the indexed snapshot are returned as potential unknown boundaries, not linked "
+            "to the selected anchor."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    impact.add_argument("anchor", help="observed function or method anchor")
+    impact.add_argument("--db", required=True, help="existing indexed SQLite snapshot, opened read-only")
+    impact.add_argument("--snapshot", action="store_true", help="query cached historical bytes without checking source freshness")
+    impact.add_argument("--max-depth", type=int, default=3, help="maximum number of caller hops (default: 3)")
+    impact.add_argument("--max-nodes", type=int, default=200, help="maximum returned caller nodes (default: 200)")
+    impact.add_argument(
+        "--unknown-boundaries", type=int, default=0,
+        help="include up to N unresolved CALLS records (default: count only)",
+    )
+    impact.add_argument("--max-tokens", type=int, default=8000, help="maximum printed output estimate (default: 8000)")
     flow = sub.add_parser(
         "flow", help="query bounded local Python control/data flow",
         description=("Build a function-local flow graph on demand from cached module source.\n"
@@ -293,7 +468,8 @@ def main(argv=None):
     flow.add_argument("--line", type=int, help="source line to seed")
     flow.add_argument("--direction", choices=("backward", "forward"), default="backward", help="dependency traversal direction (default: backward)")
     flow.add_argument("--data-only", action="store_true", help="exclude control-dependence edges")
-    flow.add_argument("--max-tokens", type=int, default=8000, help="estimated complete flow JSON budget (default: 8000)")
+    flow.add_argument("--compact", action="store_true", help="emit versioned columnar flow JSON; full JSON is the recovery path")
+    flow.add_argument("--max-tokens", type=int, default=8000, help="estimated printed flow output budget (default: 8000)")
     delta = sub.add_parser(
         "delta",
         help="compare indexed base and head snapshots",
@@ -321,31 +497,59 @@ def main(argv=None):
         help="report imports from SOURCE to TARGET prefixes; repeatable (default: none)",
     )
     delta.add_argument("--selected-test", action="append", default=[], help="select a test path for static gap analysis; repeatable, does not run it (default: none)")
+    delta.add_argument("--projection", choices=("legacy", "v2"), help="output schema; v2 adds filters and bounded edge samples while preserving filtered totals (default: legacy)")
+    delta.add_argument("--anchor", action="append", default=[], help="v2 projection: retain records mentioning this exact symbol or its qualified descendants; repeatable")
+    delta.add_argument("--kind", action="append", default=[], help="v2 projection: retain this report category or edge kind (for example CALLS or IMPORTS); repeatable")
+    delta.add_argument("--edge-sample-limit", type=int, help="v2 projection: maximum added/removed edge samples per direction (minimum: 1; default: 20)")
     delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
-    for command in (sync, mapping, slicing, flow, delta):
+    for command in (sync, mapping, slicing, impact, flow, delta):
         command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
+    if args.cmd == "delta" and args.edge_sample_limit is not None and args.edge_sample_limit < 1:
+        parser.error("--edge-sample-limit must be at least 1")
+    if args.cmd == "slice" and args.include_imports and not args.outline:
+        parser.error("--include-imports requires --outline")
     opening_db = True
     opening_db_path = None
     try:
         with ExitStack() as stack:
             if args.cmd == "delta":
+                has_v2_options = bool(args.anchor) or bool(args.kind) or args.edge_sample_limit is not None
+                if args.projection == "legacy" and has_v2_options:
+                    parser.error("v2 filters require --projection v2")
+                use_v2 = args.projection == "v2" or (
+                    args.projection is None and has_v2_options
+                )
+                if args.full and use_v2:
+                    parser.error("--full cannot be combined with the v2 projection or its filters")
                 opening_db_path = str(Path(args.base_db).resolve())
                 base = stack.enter_context(GraphStore(args.base_db, readonly=True))
                 opening_db_path = str(Path(args.head_db).resolve())
                 head = stack.enter_context(GraphStore(args.head_db, readonly=True))
                 opening_db = False
                 result = compute_delta(
-                    base, head, args.forbid_import, selected_tests=args.selected_test
+                    base, head, args.forbid_import, selected_tests=args.selected_test,
+                    _earliest_edge_lines=use_v2,
                 )
-                result = summarize_delta(
-                    result, args.max_tokens, full=args.full,
-                    selected_tests=bool(args.selected_test),
-                    render_estimator=(
-                        lambda candidate: rendered_tokens(_markdown(candidate))
-                    ) if args.format == "markdown" else None,
-                )
+                markdown_budget = (
+                    lambda candidate: rendered_tokens(_markdown(candidate))
+                ) if args.format == "markdown" else None
+                if use_v2:
+                    result = project_delta_v2(
+                        result, args.max_tokens, anchors=args.anchor, kinds=args.kind,
+                        edge_sample_limit=(
+                            20 if args.edge_sample_limit is None else args.edge_sample_limit
+                        ),
+                        selected_tests=bool(args.selected_test),
+                        render_estimator=markdown_budget,
+                    )
+                else:
+                    result = summarize_delta(
+                        result, args.max_tokens, full=args.full,
+                        selected_tests=bool(args.selected_test),
+                        render_estimator=markdown_budget,
+                    )
             else:
                 opening_db_path = str(Path(args.db).resolve())
                 store = stack.enter_context(GraphStore(args.db, readonly=args.cmd != "sync"))
@@ -359,42 +563,88 @@ def main(argv=None):
                 elif args.cmd == "map":
                     if not args.snapshot:
                         store.assert_fresh()
-                    result = build_repo_map(
-                        store, args.seed, args.max_tokens,
-                        render_estimator=(
-                            _MapMarkdownEstimator()
-                        ) if args.format == "markdown" else None,
-                    )
+                    if args.outline:
+                        result = build_repo_outline(
+                            store, args.seed, args.max_tokens,
+                            render_estimator=(
+                                _OutlineMarkdownEstimator()
+                            ) if args.format == "markdown" else None,
+                        )
+                    else:
+                        result = build_repo_map(
+                            store, args.seed, args.max_tokens,
+                            render_estimator=(
+                                _MapMarkdownEstimator()
+                            ) if args.format == "markdown" else None,
+                        )
                 elif args.cmd == "flow":
                     if not args.snapshot:
                         store.assert_fresh()
                     result = query_flow(
                         store, args.anchor, variable=args.variable, line=args.line,
                         direction=args.direction, include_control=not args.data_only,
-                        max_tokens=args.max_tokens,
+                        max_tokens=(2**63 - 1) if args.compact else args.max_tokens,
+                        render_estimator=(
+                            (lambda candidate: rendered_tokens(_markdown(candidate)))
+                            if args.format == "markdown"
+                            else (lambda candidate: rendered_tokens(json.dumps(
+                                candidate, ensure_ascii=False, separators=(",", ":")
+                            )))
+                        ),
                     )
-                else:
+                    if args.compact:
+                        result = compact_flow_result(
+                            result,
+                            (
+                                (lambda candidate: rendered_tokens(_markdown(candidate)))
+                                if args.format == "markdown"
+                                else (lambda candidate: rendered_tokens(json.dumps(
+                                    candidate, ensure_ascii=False, separators=(",", ":")
+                                )))
+                            ),
+                        )
+                elif args.cmd == "impact":
                     if not args.snapshot:
                         store.assert_fresh()
-                    result = slice_context(
-                        store, args.anchors, args.max_tokens, args.include_callee_bodies,
-                        database=args.db,
+                    result = query_call_impact(
+                        store, args.anchor,
+                        max_depth=args.max_depth,
+                        max_nodes=args.max_nodes,
+                        unknown_boundary_limit=args.unknown_boundaries,
+                        max_tokens=args.max_tokens, database=args.db, output_format=args.format,
                         render_estimator=(
                             lambda candidate: rendered_tokens(_markdown(candidate))
                         ) if args.format == "markdown" else None,
                     )
+                else:
+                    if not args.snapshot:
+                        store.assert_fresh()
+                    if args.outline:
+                        result = build_slice_outline(
+                            store, args.anchors, args.max_tokens,
+                            include_imports=args.include_imports,
+                            render_estimator=(
+                                lambda candidate: rendered_tokens(_markdown(candidate))
+                            ) if args.format == "markdown" else None,
+                        )
+                    else:
+                        result = slice_context(
+                            store, args.anchors, args.max_tokens, args.include_callee_bodies,
+                            database=args.db,
+                            render_estimator=(
+                                lambda candidate: rendered_tokens(_markdown(candidate))
+                            ) if args.format == "markdown" else None,
+                        )
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
-        if (args.cmd in ("map", "slice") and args.format == "markdown"
-                and rendered_tokens(rendered) > args.max_tokens):
+        if args.cmd in ("map", "slice", "impact", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
             from .slicer import InvalidBudgetError
-            raise InvalidBudgetError(f"rendered Markdown exceeds budget {args.max_tokens}")
-        if args.cmd == "delta":
-            from .slicer import InvalidBudgetError
-            if rendered_tokens(rendered) > args.max_tokens:
+            if args.cmd == "flow":
+                label = "printed flow output"
+            else:
                 label = "rendered Markdown" if args.format == "markdown" else "printed JSON"
-                raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
+            raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
         print(rendered)
         return 0
     except (CodeGraphError, OSError, sqlite3.Error) as exc:

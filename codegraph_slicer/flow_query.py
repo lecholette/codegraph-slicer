@@ -7,7 +7,7 @@ from .slicer import _anchor
 
 
 def query_flow(store, anchor, *, variable=None, line=None, direction="backward",
-               include_control=True, max_tokens=8000):
+               include_control=True, max_tokens=8000, render_estimator=None):
     row = _anchor(store, anchor)
     if row["kind"] not in {"function", "method"}:
         raise FlowQueryError(f"flow requires an observed function or method anchor: {anchor}")
@@ -28,7 +28,8 @@ def query_flow(store, anchor, *, variable=None, line=None, direction="backward",
     }
     try:
         return slice_flow(graph, variable=variable, line=line, direction=direction,
-                          include_control=include_control, max_tokens=max_tokens)
+                          include_control=include_control, max_tokens=max_tokens,
+                          render_estimator=render_estimator)
     except FlowQueryError as error:
         if variable is not None:
             tree = ast.parse(modules[0]["body"], filename=row["file_path"])

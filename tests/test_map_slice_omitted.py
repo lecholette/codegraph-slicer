@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+import codegraph_slicer.cli as cli_module
 from codegraph_slicer import GraphStore
 from codegraph_slicer.cli import main
 
@@ -265,4 +266,24 @@ def test_map_and_slice_output_budgets_exact_and_refuse_without_stdout(tmp_path, 
             captured = capsys.readouterr()
             assert captured.out == ""
             assert "budget" in captured.err.lower()
+
+
+@pytest.mark.parametrize(
+    ("command", "builder", "payload"),
+    [
+        ("map", "build_repo_map", {"tokens": 1, "items": [{"symbol": "pkg/a.py", "text": "x" * 200}]}),
+        ("slice", "slice_context", {"tokens": 1, "sections": {"target_implementations": [{"symbol": "pkg/a.py:f", "text": "x" * 200}]}}),
+    ],
+)
+def test_map_and_slice_json_final_guard_refuses_oversized_printed_output(
+    tmp_path, capsys, monkeypatch, command, builder, payload
+):
+    db = _snapshot(tmp_path / "src", {"pkg/a.py": "def f():\n    return 1\n"})
+    monkeypatch.setattr(cli_module, builder, lambda *args, **kwargs: payload)
+    anchor = ["pkg.a:f"] if command == "slice" else []
+    with pytest.raises(SystemExit, match="2"):
+        main([command, "--db", str(db), *anchor, "--max-tokens", "1"])
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "printed JSON exceeds budget 1" in captured.err
 

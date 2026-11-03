@@ -238,6 +238,18 @@ def test_markdown_pads_inline_code_that_begins_and_ends_with_backticks(tmp_path,
     assert f"- {ref} assign{span}: `` `edge` ``" in markdown.splitlines()
 
 
+def test_markdown_backtick_fence_uses_longest_run_in_synced_source(tmp_path, capsys):
+    db = _synced_source_db(
+        tmp_path,
+        'def render():\n    value = "`edge``mark`"\n    return value\n',
+    )
+    assert main(["flow", "render.py:render", "--db", str(db), "--format", "markdown"]) == 0
+    markdown = capsys.readouterr().out
+    statement = 'value = "`edge``mark`"'
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", statement)), default=0) + 1)
+    assert f"{fence}{statement}{fence}" in markdown
+
+
 def test_markdown_refuses_flow_without_profile(tmp_path, capsys):
     result = json.loads(_run(_db(tmp_path), capsys))
     del result["flow"]["profile"]
@@ -246,8 +258,8 @@ def test_markdown_refuses_flow_without_profile(tmp_path, capsys):
 
 
 def test_json_output_is_the_compact_string_the_budget_measures(tmp_path, capsys):
-    out = _run(_db(tmp_path), capsys).strip()
+    out = _run(_db(tmp_path), capsys)
     result = json.loads(out)
-    assert out == json.dumps(result, ensure_ascii=False, separators=(",", ":"))
-    flow_only = json.dumps(result["flow"], ensure_ascii=False, separators=(",", ":"))
-    assert result["tokens"] == len(flow_only) // 4 + 1
+    compact = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    assert out == compact + "\n"
+    assert result["tokens"] == len(out) // 4 + 1
