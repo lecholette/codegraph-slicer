@@ -17,6 +17,7 @@ from .flow_query import query_flow
 from .pagerank import build_repo_map, build_repo_outline
 from .slicer import (
     AnchorNotFoundError,
+    build_slice_outline,
     query_call_impact,
     rendered_tokens,
     serialized_tokens,
@@ -137,6 +138,27 @@ def _flow_markdown(result):
 
 
 def _markdown(result):
+    if "schema_version" in result and "entities" in result and "edges" in result:
+        blocks = [f"# Slice outline (schema v{result['schema_version']})"]
+        blocks.append(f"Estimated context tokens: {result['tokens']}")
+        blocks.append("## Entities")
+        blocks.extend(
+            f"- `{entity['id']}` {entity['kind']} `{entity['symbol']}` "
+            f"({entity['path']}:{entity['line']}): `{entity['signature']}`"
+            for entity in result["entities"]
+        )
+        blocks.append("## Edges")
+        blocks.extend(
+            f"- {edge['kind']} `{edge['from']}` → `{edge['to']}` (line {edge['line']})"
+            for edge in result["edges"]
+        )
+        blocks.append("## Diagnostics")
+        blocks.extend(
+            f"- {item['kind']} from `{item['source']}` to `{item['target']}` "
+            f"(line {item['line']}): {item['reason']}"
+            for item in result["diagnostics"]
+        )
+        return "\n\n".join(blocks)
     if "schema_version" in result and "files" in result and "edges" in result:
         blocks = [f"# Repository outline (schema v{result['schema_version']})"]
         blocks.append(f"Estimated context tokens: {result['tokens']}")
@@ -338,6 +360,7 @@ def main(argv=None):
     slicing.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     slicing.add_argument("anchors", nargs="+", help="symbol, module, or path/line anchor")
     slicing.add_argument("--max-tokens", type=int, default=8000, help="estimated context budget (default: 8000)")
+    slicing.add_argument("--outline", action="store_true", help="emit a versioned, body-free entity graph")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
     impact = sub.add_parser(
         "impact",
@@ -481,13 +504,21 @@ def main(argv=None):
                 else:
                     if not args.snapshot:
                         store.assert_fresh()
-                    result = slice_context(
-                        store, args.anchors, args.max_tokens, args.include_callee_bodies,
-                        database=args.db,
-                        render_estimator=(
-                            lambda candidate: rendered_tokens(_markdown(candidate))
-                        ) if args.format == "markdown" else None,
-                    )
+                    if args.outline:
+                        result = build_slice_outline(
+                            store, args.anchors, args.max_tokens,
+                            render_estimator=(
+                                lambda candidate: rendered_tokens(_markdown(candidate))
+                            ) if args.format == "markdown" else None,
+                        )
+                    else:
+                        result = slice_context(
+                            store, args.anchors, args.max_tokens, args.include_callee_bodies,
+                            database=args.db,
+                            render_estimator=(
+                                lambda candidate: rendered_tokens(_markdown(candidate))
+                            ) if args.format == "markdown" else None,
+                        )
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )

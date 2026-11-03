@@ -196,6 +196,128 @@ def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
     }
 
 
+def build_slice_outline(store, anchors, max_tokens=8000, *, render_estimator=None):
+    """Return a bounded, body-free entity graph for a slice's local neighborhood."""
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise InvalidBudgetError("max_tokens must be a positive integer")
+    if not anchors:
+        raise AnchorNotFoundError("at least one anchor is required")
+
+    allowed_kinds = ("CALLS", "USES_TYPE", "INHERITS", "IMPORTS", "DEFINES")
+    selected = {row["symbol_id"] for row in (_anchor(store, anchor) for anchor in anchors)}
+    roots = set(selected)
+    for symbol_id in sorted(roots):
+        for row in store.rows(
+            """WITH RECURSIVE closure(node,depth) AS (
+                SELECT ?,0 UNION SELECT e.target_id,c.depth+1 FROM edges e
+                JOIN closure c ON e.source_id=c.node
+                WHERE e.kind IN ('USES_TYPE','INHERITS') AND c.depth<2
+            ) SELECT DISTINCT node FROM closure WHERE depth>0""",
+            (symbol_id,),
+        ):
+            selected.add(row["node"])
+        for row in store.rows(
+            "SELECT source_id AS node FROM edges WHERE target_id=? AND kind='CALLS' "
+            "UNION SELECT target_id AS node FROM edges WHERE source_id=? AND kind='CALLS'",
+            (symbol_id, symbol_id),
+        ):
+            selected.add(row["node"])
+
+    # Include module and lexical definition endpoints so the emitted graph is
+    # closed. One hop of module imports is useful context without recursively
+    # expanding the repository's entire import graph.
+    for symbol_id in tuple(sorted(selected)):
+        rows = store.rows("SELECT file_path,module,qualname FROM symbols WHERE symbol_id=?", (symbol_id,))
+        if not rows:
+            continue
+        row = rows[0]
+        selected.add(row["module"] + ":")
+        parent = row["module"] + ":" + row["qualname"].rpartition(".")[0]
+        while parent != row["module"] + ":" and parent not in selected:
+            exists = store.rows("SELECT symbol_id FROM symbols WHERE symbol_id=?", (parent,))
+            if not exists:
+                break
+            selected.add(parent)
+            parent = parent.rpartition(".")[0]
+            if ":" not in parent:
+                parent = row["module"] + ":"
+    module_ids = {
+        row["module"] + ":"
+        for row in store.rows(
+            f"SELECT DISTINCT module FROM symbols WHERE symbol_id IN ({','.join('?' for _ in selected)})",
+            tuple(sorted(selected)),
+        )
+    } if selected else set()
+    if module_ids:
+        placeholders = ",".join("?" for _ in module_ids)
+        imported = store.rows(
+            f"SELECT DISTINCT target_id FROM edges WHERE kind='IMPORTS' AND source_id IN ({placeholders})",
+            tuple(sorted(module_ids)),
+        )
+        selected.update(row["target_id"] for row in imported)
+
+    rows_by_id = {
+        row["symbol_id"]: row
+        for row in store.rows(
+            "SELECT symbol_id,file_path,module,qualname,kind,start_line,signature "
+            f"FROM symbols WHERE symbol_id IN ({','.join('?' for _ in selected)})",
+            tuple(sorted(selected)),
+        )
+    } if selected else {}
+    ordered = sorted(rows_by_id.values(), key=lambda row: (
+        row["file_path"], row["start_line"], row["symbol_id"]
+    ))
+    local_id = {row["symbol_id"]: f"e{index:04d}" for index, row in enumerate(ordered, 1)}
+    entities = [
+        {
+            "id": local_id[row["symbol_id"]],
+            "symbol": row["symbol_id"],
+            "path": row["file_path"],
+            "name": row["qualname"].rsplit(".", 1)[-1],
+            "kind": row["kind"],
+            "line": row["start_line"],
+            "signature": row["signature"],
+        }
+        for row in ordered
+    ]
+    placeholders = ",".join("?" for _ in local_id)
+    edge_rows = store.rows(
+        f"SELECT source_id,target_id,kind,line FROM edges WHERE kind IN ({','.join('?' for _ in allowed_kinds)}) "
+        f"AND source_id IN ({placeholders}) AND target_id IN ({placeholders}) "
+        "ORDER BY source_id,target_id,kind,line",
+        (*allowed_kinds, *local_id, *local_id),
+    ) if local_id else []
+    edges = [
+        {"from": local_id[row["source_id"]], "to": local_id[row["target_id"]],
+         "kind": row["kind"], "line": row["line"]}
+        for row in edge_rows
+    ]
+    diagnostics = []
+    if local_id:
+        diagnostic_rows = store.rows(
+            f"SELECT source_id,target,kind,line,reason FROM diagnostics WHERE source_id IN ({placeholders}) "
+            "ORDER BY source_id,line,target,kind,reason",
+            tuple(local_id),
+        )
+        diagnostics = [
+            {"source": local_id[row["source_id"]], "target": row["target"],
+             "kind": row["kind"], "line": row["line"], "reason": row["reason"]}
+            for row in diagnostic_rows
+        ]
+    payload = _with_output_tokens({
+        "schema_version": 1,
+        "tokens": 0,
+        "entities": entities,
+        "edges": edges,
+        "diagnostics": diagnostics,
+    }, render_estimator)
+    if payload["tokens"] > max_tokens:
+        raise RequiredAnchorOverflow(
+            f"required slice outline needs {payload['tokens']} tokens; budget is {max_tokens}"
+        )
+    return payload
+
+
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
     render_estimator=None, database=None,

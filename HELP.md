@@ -131,7 +131,7 @@ its implementation and related context.
 
 ```text
 codegraph-slicer slice --db DATABASE ANCHOR [ANCHOR ...]
-                       [--max-tokens N] [--include-callee-bodies]
+                       [--max-tokens N] [--include-callee-bodies] [--outline]
                        [--format json|markdown]
 ```
 
@@ -168,12 +168,27 @@ room for the selected target and other context when a set of class bodies
 dominates a slice.
 `--format` defaults to JSON.
 
+Add `--outline` to return schema version 1 as a body-free structural graph. It
+contains one `entities` table with deterministic local IDs (`e0001`, `e0002`,
+...) and typed `edges` with `from`, `to`, `kind`, and source `line`. The graph
+includes observed `CALLS`, `USES_TYPE`, `INHERITS`, `IMPORTS`, and `DEFINES`
+relationships for the anchor neighborhood, with every emitted edge endpoint
+present in `entities`. IDs are assigned by path, source line, and symbol ID;
+they are stable for the same indexed snapshot and selected neighborhood. The
+`diagnostics` list is scoped to included entities and preserves unresolved or
+external references as observations (`source`, textual `target`, `kind`, call
+site `line`, and `reason`). Such an observation does not establish that a
+target is absent. This form includes signatures and source locations but no
+source bodies; if the complete graph does not fit the token budget, the query
+refuses rather than returning a partial graph.
+
 When several anchors share required type definitions, those required types are
 kept in the required section and are not repeated as optional callee entries.
 
 ```sh
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --max-tokens 4000
 codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-callee-bodies --format markdown
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --format json
 ```
 
 Next, inspect the returned sections; if the anchor is unknown, choose an
