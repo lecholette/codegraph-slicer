@@ -6,6 +6,7 @@ A standalone, stdlib-only Python structural graph index, bounded context slicer 
 codegraph-slicer sync /path/to/project --db /tmp/graph.sqlite
 codegraph-slicer sync /path/to/git/repo --revision HEAD --db /tmp/head.sqlite
 codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 1800
+codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --outline --max-tokens 1800
 codegraph-slicer slice --db /tmp/graph.sqlite package.module:thing --max-tokens 4000
 codegraph-slicer impact package.module:thing --db /tmp/graph.sqlite --max-depth 3 --max-nodes 200
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:thing --format markdown
@@ -40,6 +41,8 @@ with GraphStore('/tmp/graph.sqlite', readonly=True) as store:
 ```
 
 Slices contain full requested implementations, full class/type definitions up to two `USES_TYPE`/`INHERITS` hops, caller signatures, then callee signatures (optionally bodies). Required anchors/types must fit or the query refuses. Across multiple anchors, required type definitions are not duplicated as optional callees. Optional neighbors follow PageRank order. A `file.py:line` anchor picks the innermost observed definition containing that line. Module anchors use `package.module:`. Repository maps aggregate symbol PageRank by file and include each file skeleton once.
+
+Add `map --outline` for schema version 1: each file has a local `fNNNN` ID and contains entities with local `eNNNN` IDs, names, kinds, signatures, and source lines. Compact `{from,to,kind}` edges use `fNNNN:eNNNN` references to disambiguate local IDs across files. Seed files and entities are budgeted and displayed first in the order of repeated `--seed` arguments; ranked neighbors follow. Skipped files and entities report the complete-candidate token budget that admits them. Seeded zero-score files are outside the outline candidate set. A seeded legacy map omits zero-score files and identifies its highest-ranked omitted file; unseeded legacy JSON remains byte-for-byte stable.
 
 Map and slice budgets are deterministic estimates, not tokenizer counts: `len(printed_output) // 4 + 1`, with Unicode characters counted directly and the trailing newline included. They budget the complete printed result in JSON or Markdown. Map and slice results report exact per-kind omissions when records are dropped; emitted plus omitted counts reconcile to an unlimited result. Complete results omit omission metadata. Increase `--max-tokens` to retrieve more records; required slice anchors and their omission metadata must fit or the command refuses without printing a partial report. Their `tokens` fields report the estimate used for admission. Delta separately bounds its complete printed output in both formats. Flow's `tokens` field estimates only its compact JSON graph value (including identity and graph data, excluding the outer `tokens` field and Markdown); its max-token behavior follows that estimate.
 

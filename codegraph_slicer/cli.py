@@ -14,7 +14,7 @@ from .ast_extractor import CodeGraphError
 from .delta import compute_delta, summarize_delta
 from .flow import FlowQueryError, UnsupportedFlowError
 from .flow_query import query_flow
-from .pagerank import build_repo_map
+from .pagerank import build_repo_map, build_repo_outline
 from .slicer import (
     AnchorNotFoundError,
     query_call_impact,
@@ -46,11 +46,16 @@ class _MapMarkdownEstimator:
     def __call__(self, payload):
         return rendered_tokens(_markdown(payload))
 
-    def estimate_map(self, item_cost, item_count, omitted):
+    def estimate_map(self, item_cost, item_count, omitted, top_file_omitted=None):
         fixed = ["Estimated context tokens: 0"]
         if omitted:
             fixed.extend(
                 [f"Omitted **files** records: {omitted}", "rerun with --max-tokens N"]
+            )
+        if top_file_omitted is not None:
+            fixed.append(
+                f"Top ranked file omitted: {top_file_omitted['path']} "
+                f"(first item estimate: {top_file_omitted['max_tokens']} tokens)"
             )
         fixed.append("## repository_map")
         size = sum(map(len, fixed)) + 2 * (len(fixed) - 1)
@@ -132,6 +137,30 @@ def _flow_markdown(result):
 
 
 def _markdown(result):
+    if "schema_version" in result and "files" in result and "edges" in result:
+        blocks = [f"# Repository outline (schema v{result['schema_version']})"]
+        blocks.append(f"Estimated context tokens: {result['tokens']}")
+        for file in result["files"]:
+            blocks.append(f"## {file['path']} · `{file['id']}`")
+            blocks.extend(
+                f"- `{entity['id']}` {entity['kind']} {entity['name']} "
+                f"(line {entity['line']}): `{entity['signature']}`"
+                for entity in file["entities"]
+            )
+        if result["edges"]:
+            blocks.append("## Edges")
+            blocks.extend(
+                f"- {edge['kind']}: `{edge['from']}` → `{edge['to']}`"
+                for edge in result["edges"]
+            )
+        for name, records in result.get("omitted", {}).items():
+            blocks.append(f"## Omitted {name}")
+            blocks.extend(
+                f"- `{item['path']}`{(' ' + item['name']) if 'name' in item else ''}: "
+                f"rerun with --max-tokens {item['max_tokens']}"
+                for item in records
+            )
+        return "\n\n".join(blocks)
     if "summary" in result or "modified_symbols" in result and "serialized_tokens" in result:
         blocks = ["# Static delta report"]
         if "summary" in result:
@@ -292,6 +321,7 @@ def main(argv=None):
     mapping.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     mapping.add_argument("--seed", action="append", default=[], help="module or source path to rank from; repeatable (default: whole repository)")
     mapping.add_argument("--max-tokens", type=int, default=2000, help="estimated context budget (default: 2000)")
+    mapping.add_argument("--outline", action="store_true", help="emit versioned per-entity JSON outline")
     slicing = sub.add_parser(
         "slice",
         help="render implementations and related context for anchors",
@@ -411,12 +441,20 @@ def main(argv=None):
                 elif args.cmd == "map":
                     if not args.snapshot:
                         store.assert_fresh()
-                    result = build_repo_map(
-                        store, args.seed, args.max_tokens,
-                        render_estimator=(
-                            _MapMarkdownEstimator()
-                        ) if args.format == "markdown" else None,
-                    )
+                    if args.outline:
+                        result = build_repo_outline(
+                            store, args.seed, args.max_tokens,
+                            render_estimator=(
+                                lambda candidate: rendered_tokens(_markdown(candidate))
+                            ) if args.format == "markdown" else None,
+                        )
+                    else:
+                        result = build_repo_map(
+                            store, args.seed, args.max_tokens,
+                            render_estimator=(
+                                _MapMarkdownEstimator()
+                            ) if args.format == "markdown" else None,
+                        )
                 elif args.cmd == "flow":
                     if not args.snapshot:
                         store.assert_fresh()

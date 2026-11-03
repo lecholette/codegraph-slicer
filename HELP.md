@@ -91,7 +91,8 @@ Next, pass the created database to `map` or `slice`.
 
 ```text
 codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
-                      [--max-tokens N] [--format json|markdown]
+                      [--max-tokens N] [--outline]
+                      [--format json|markdown]
 ```
 
 `--db` must name an existing index and is opened read-only. Repeat `--seed` to
@@ -101,6 +102,20 @@ ranking starts across the whole indexed repository. `--max-tokens` defaults to
 includes whole file skeletons in rank order while they fit. When files are
 omitted, JSON and Markdown report the exact omitted count; emitted and omitted
 counts reconcile to the complete map. Increase `--max-tokens` to retrieve more.
+Seeded maps omit zero-score files. If the highest-ranked file cannot fit, its
+path and the token budget that admits it are reported. Unseeded legacy map
+output is unchanged. Add `--outline` to emit schema version 1 with per-file
+entities (`id`, `name`, `kind`, `signature`, and `line`) and typed resolved
+neighbor edges (`CALLS`, `IMPORTS`, `USES_TYPE`, `INHERITS`, and `DEFINES`).
+Outline edge records are compact `{from,to,kind}` triples. Each file has a
+local `fNNNN` ID, and its entities use local `eNNNN` IDs; edge references use
+`fNNNN:eNNNN` to distinguish entities across files. Seed files and their
+entities are budgeted and displayed first in the order of repeated `--seed`
+arguments; ranked neighbors follow. Skipped files and entities include their
+paths and a complete-candidate
+budget that admits them. Seeded zero-score files are outside the outline
+candidate set. If required omission metadata does not fit, the command refuses
+without printing output.
 The budget includes complete
 printed output and its trailing newline in either format. A budget too small
 for required map metadata is an error. `--format` defaults to JSON.
