@@ -44,25 +44,63 @@ def test_outline_serializes_local_entities_and_typed_edges(tmp_path, capsys):
 
 def test_outline_omissions_name_each_skipped_entity_and_path(tmp_path, capsys):
     db = _snapshot(tmp_path / "limited", {
-        "pkg/seed.py": "def alpha():\n    return 1\n\ndef beta():\n    return alpha()\n",
-        "pkg/other.py": "def unrelated():\n    return 9\n",
+        "pkg/seed.py": "from pkg.other import beta\ndef alpha():\n    return beta()\n",
+        "pkg/other.py": "def beta():\n    return 9\n",
     })
     assert main(["map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", "120"]) == 0
     output = capsys.readouterr().out
     payload = json.loads(output)
     omitted_entities = payload["omitted"]["entities"]
-    assert all(item["path"] and item["max_tokens"] > payload["tokens"] for item in omitted_entities)
-    assert all("name" in item and "id" in item for item in omitted_entities)
-    assert {item["name"] for item in omitted_entities} == {"beta"}
-    assert {item["path"] for item in omitted_entities} == {"pkg/seed.py"}
-    assert "files" not in payload["omitted"]
+    assert omitted_entities == [{"path": "pkg/other.py", "count": 2}]
+    assert payload["omitted"]["max_tokens"] > payload["tokens"]
+    assert payload["omitted"]["edges"] == 4
+    assert payload["omitted"]["files"] == [{"path": "pkg/other.py", "count": 1}]
     assert payload["tokens"] == len(output) // 4 + 1 <= 120
-    beta_budget = omitted_entities[0]["max_tokens"]
+    beta_budget = payload["omitted"]["max_tokens"]
     assert main(["map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", str(beta_budget)]) == 0
     retry = json.loads(capsys.readouterr().out)
     assert any(entity["name"] == "beta" for file in retry["files"] for entity in file["entities"])
     assert retry["tokens"] == beta_budget
     assert "omitted" not in retry
+
+
+def test_outline_retries_omissions_with_one_file_budget_and_edge_count(tmp_path, capsys):
+    db = _snapshot(tmp_path / "omitted-edge", {
+        "pkg/seed.py": "from pkg.neighbor import bravo\ndef alpha():\n    return bravo()\n",
+        "pkg/neighbor.py": "def bravo():\n    return 7\n",
+    })
+    assert main([
+        "map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", "120",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["omitted"] == {
+        "files": [{"path": "pkg/neighbor.py", "count": 1}],
+        "entities": [{"path": "pkg/neighbor.py", "count": 2}],
+        "edges": 4,
+        "max_tokens": 192,
+    }
+
+
+def test_map_markdown_estimator_type_error_is_not_retried_without_argument(
+    tmp_path,
+):
+    db = _snapshot(tmp_path / "estimator", {"pkg/a.py": "def alpha():\n    return 1\n"})
+
+    class StrictEstimator:
+        def item_cost(self, item):
+            return 0
+
+        def __call__(self, payload):
+            return 1
+
+        def estimate_map(self, item_cost, item_count, omitted):
+            return 1
+
+    with GraphStore(db, readonly=True) as store:
+        with pytest.raises(TypeError, match="positional arguments"):
+            from codegraph_slicer.pagerank import build_repo_map
+
+            build_repo_map(store, render_estimator=StrictEstimator())
 
 
 def test_outline_file_retry_budget_admits_the_file(tmp_path, capsys):
@@ -72,12 +110,13 @@ def test_outline_file_retry_budget_admits_the_file(tmp_path, capsys):
     })
     assert main(["map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", "120"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    omitted = next(item for item in payload["omitted"]["files"] if item["path"] == "pkg/neighbor.py")
-    assert omitted["max_tokens"] > payload["tokens"]
-    assert main(["map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", str(omitted["max_tokens"])]) == 0
+    assert payload["omitted"]["files"] == [{"path": "pkg/neighbor.py", "count": 1}]
+    assert payload["omitted"]["entities"] == [{"path": "pkg/neighbor.py", "count": 2}]
+    assert payload["omitted"]["max_tokens"] > payload["tokens"]
+    assert main(["map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", str(payload["omitted"]["max_tokens"])]) == 0
     retry = json.loads(capsys.readouterr().out)
     assert "pkg/neighbor.py" in [file["path"] for file in retry["files"]]
-    assert retry["tokens"] == omitted["max_tokens"]
+    assert retry["tokens"] == payload["omitted"]["max_tokens"]
     assert "omitted" not in retry
 
 
@@ -143,6 +182,8 @@ def test_outline_markdown_resolves_compact_edge_file_ids(tmp_path, capsys):
         "--format", "markdown", "--max-tokens", "2000",
     ]) == 0
     output = capsys.readouterr().out
+    estimated_tokens = int(re.search(r"^Estimated context tokens: (\d+)$", output, re.MULTILINE).group(1))
+    assert estimated_tokens == len(output) // 4 + 1
     file_ids = set(re.findall(r"^## .* · `(f\d{4})`$", output, re.MULTILINE))
     edge_refs = re.findall(r"- (?:CALLS|IMPORTS|USES_TYPE|INHERITS|DEFINES): `(f\d{4}):e\d{4}` → `(f\d{4}):e\d{4}`", output)
     assert file_ids
@@ -158,6 +199,19 @@ def test_outline_refuses_when_required_metadata_cannot_fit(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "required outline metadata" in captured.err
+
+
+def test_outline_refuses_if_seed_entities_cannot_fit_independently(tmp_path, capsys):
+    db = _snapshot(tmp_path / "seed-only-budget", {
+        "pkg/seed.py": "def alpha(value: '" + "x" * 240 + "') -> str:\n    return value\n",
+        "pkg/neighbor.py": "def bravo():\n    return 1\n",
+    })
+    with pytest.raises(SystemExit, match="2") as exc:
+        main(["map", "--db", str(db), "--outline", "--seed", "pkg.seed", "--max-tokens", "120"])
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "seed entities" in captured.err
 
 
 def test_seeded_legacy_map_omits_zero_score_and_reports_top_file(tmp_path, capsys):

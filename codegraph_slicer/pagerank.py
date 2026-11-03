@@ -107,12 +107,9 @@ def build_repo_map(
 
         def estimate_cost(item_cost, count, top_file_omitted=None):
             if map_estimator is not None:
-                try:
-                    return map_estimator.estimate_map(
-                        item_cost, count, total_files - count, top_file_omitted
-                    )
-                except TypeError:
-                    return map_estimator.estimate_map(item_cost, count, total_files - count)
+                return map_estimator.estimate_map(
+                    item_cost, count, total_files - count, top_file_omitted
+                )
             # Match compact JSON key ordering and escaping exactly, including
             # the token and omitted-count digit transitions and final newline.
             size = (
@@ -294,11 +291,33 @@ def build_repo_outline(
         target_path = file_by_symbol.get(edge["target_id"])
         if source_path not in ids or target_path not in ids:
             continue
+        if source_path not in candidate_paths or target_path not in candidate_paths:
+            continue
         all_edges.append({
             "from": symbol_refs[edge["source_id"]],
             "to": symbol_refs[edge["target_id"]],
             "kind": edge["kind"],
         })
+
+    def compact(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    entity_costs = {
+        (path, entity["id"]): len(compact(entity))
+        for path in all_paths for entity in entities[path]
+    }
+    file_prefix_costs = {
+        path: (
+            len('{"id":') + len(compact(file_ids[path]))
+            + len(',"path":') + len(compact(path))
+            + len(',"entities":[')
+        )
+        for path in all_paths
+    }
+    edge_costs = {
+        (edge["from"], edge["to"], edge["kind"]): len(compact(edge))
+        for edge in all_edges
+    }
 
     # Budget entities in seed priority order. Omitted records point to the
     # complete candidate budget, which is guaranteed to admit every candidate.
@@ -309,7 +328,94 @@ def build_repo_outline(
     selected = set()
     selected_empty_files = set()
 
-    def make_payload(selected_pairs, omission_tokens=None, empty_files=None):
+    def estimate_selected(selected_pairs, omission_budget=None, empty_files=None):
+        empty_files = selected_empty_files if empty_files is None else empty_files
+        selected_by_path = {}
+        selected_refs = set()
+        files_cost = 0
+        file_count = 0
+        for path in ranked_paths:
+            selected_entities = [
+                entity for entity in entities[path]
+                if (path, entity["id"]) in selected_pairs
+            ]
+            if selected_entities:
+                file_count += 1
+                files_cost += (
+                    file_prefix_costs[path]
+                    + sum(entity_costs[(path, entity["id"])] for entity in selected_entities)
+                    + max(0, len(selected_entities) - 1) + len("]}")
+                )
+                selected_refs.update(
+                    f"{file_ids[path]}:{entity['id']}" for entity in selected_entities
+                )
+            elif path in empty_files:
+                file_count += 1
+                files_cost += file_prefix_costs[path] + len("]}")
+        files_cost += max(0, file_count - 1)
+
+        kept_edge_count = 0
+        edges_cost = 0
+        for edge in all_edges:
+            if edge["from"] in selected_refs and edge["to"] in selected_refs:
+                kept_edge_count += 1
+                edges_cost += edge_costs[(edge["from"], edge["to"], edge["kind"])]
+        edges_cost += max(0, kept_edge_count - 1)
+
+        omitted = {}
+        skipped_files = []
+        skipped_entities = []
+        for path in ranked_paths:
+            selected_count = sum(
+                (path, entity["id"]) in selected_pairs for entity in entities[path]
+            )
+            if not selected_count and path not in empty_files:
+                skipped_files.append({"path": path, "count": 1})
+            omitted_count = len(entities[path]) - selected_count
+            if omitted_count:
+                skipped_entities.append({"path": path, "count": omitted_count})
+        if skipped_files:
+            omitted["files"] = skipped_files
+        if skipped_entities:
+            omitted["entities"] = skipped_entities
+        omitted_edge_count = len(all_edges) - kept_edge_count
+        if omitted_edge_count:
+            omitted["edges"] = omitted_edge_count
+        if omitted and omission_budget is not None:
+            omitted["max_tokens"] = omission_budget
+
+        if render_estimator is not None and hasattr(render_estimator, "estimate_outline"):
+            markdown_files = [
+                (file_ids[path], path, [
+                    entity for entity in entities[path]
+                    if (path, entity["id"]) in selected_pairs
+                ])
+                for path in ranked_paths
+                if any((path, entity["id"]) in selected_pairs for entity in entities[path])
+                or path in empty_files
+            ]
+            markdown_edges = [
+                edge for edge in all_edges
+                if edge["from"] in selected_refs and edge["to"] in selected_refs
+            ]
+            return render_estimator.estimate_outline(markdown_files, markdown_edges, omitted)
+
+        size_without_tokens = (
+            len('{"schema_version":1,"tokens":') + len(',"files":[')
+            + files_cost + len('],"edges":[') + edges_cost
+            + len("]") + len("}")
+        )
+        if omitted:
+            size_without_tokens += len(',"omitted":') + len(compact(omitted))
+        tokens = 0
+        for _ in range(16):
+            estimate = tokens_for_length(size_without_tokens + len(str(tokens)) + 1)
+            if estimate == tokens:
+                return estimate
+            tokens = estimate
+        raise InvalidBudgetError("repository outline JSON token estimate did not reach a fixed point")
+
+    def make_payload(selected_pairs, omission_budget=None, empty_files=None):
         empty_files = selected_empty_files if empty_files is None else empty_files
         selected_by_path = {}
         for path in ranked_paths:
@@ -329,13 +435,16 @@ def build_repo_outline(
         for path in ranked_paths:
             selected_in_file = {entity["id"] for entity in selected_by_path.get(path, [])}
             if not selected_in_file and path not in empty_files:
-                skipped_files.append({"path": path, "max_tokens": (omission_tokens or {}).get(("file", path), 0)})
-            for entity in entities[path]:
-                if entity["id"] not in selected_in_file:
-                    skipped_entities.append({
-                        "path": path, "id": entity["id"], "name": entity["name"],
-                        "max_tokens": (omission_tokens or {}).get(("entity", path, entity["id"]), 0),
-                    })
+                skipped_files.append({"path": path, "count": 1})
+            omitted_entity_count = sum(
+                entity["id"] not in selected_in_file for entity in entities[path]
+            )
+            if omitted_entity_count:
+                skipped_entities.append({"path": path, "count": omitted_entity_count})
+        omitted_edge_count = sum(
+            edge["from"] not in listed_refs or edge["to"] not in listed_refs
+            for edge in all_edges
+        )
         payload = {
             "schema_version": 1,
             "tokens": 0,
@@ -345,20 +454,60 @@ def build_repo_outline(
                 if path in selected_by_path or path in empty_files
             ],
             "edges": kept_edges,
-            "omitted": {"files": skipped_files, "entities": skipped_entities},
         }
-        if not skipped_files:
-            del payload["omitted"]["files"]
-        if not skipped_entities:
-            del payload["omitted"]["entities"]
-        if not payload["omitted"]:
-            del payload["omitted"]
-        return _with_output_tokens(payload, render_estimator)
+        omitted = {}
+        if skipped_files:
+            omitted["files"] = skipped_files
+        if skipped_entities:
+            omitted["entities"] = skipped_entities
+        if omitted_edge_count:
+            omitted["edges"] = omitted_edge_count
+        if omitted and omission_budget is not None:
+            omitted["max_tokens"] = omission_budget
+        if omitted:
+            payload["omitted"] = omitted
+        if render_estimator is not None:
+            return _with_output_tokens(payload, render_estimator)
+
+        # JSON admission is additive: file/entity and edge records are encoded
+        # once, then candidate prefixes are measured from their cached sizes.
+        files_cost = 0
+        for index, file in enumerate(payload["files"]):
+            path = file["path"]
+            items = file["entities"]
+            file_cost = (
+                file_prefix_costs[path]
+                + sum(entity_costs[(path, item["id"])] for item in items)
+                + max(0, len(items) - 1)
+                + len("]}")
+            )
+            files_cost += file_cost + int(index > 0)
+        edges_cost = sum(
+            edge_costs[(edge["from"], edge["to"], edge["kind"])]
+            for edge in payload["edges"]
+        )
+        edges_cost += max(0, len(payload["edges"]) - 1)
+        json_size_without_token = (
+            len('{"schema_version":1,"tokens":')
+            + len(',"files":[') + files_cost
+            + len('],"edges":[') + edges_cost
+            + len("]")
+        )
+        if "omitted" in payload:
+            json_size_without_token += len(',"omitted":') + len(compact(payload["omitted"]))
+        json_size_without_token += len("}")
+        tokens = 0
+        for _ in range(16):
+            estimate = tokens_for_length(json_size_without_token + len(str(tokens)) + 1)
+            if estimate == tokens:
+                payload["tokens"] = estimate
+                return payload
+            tokens = estimate
+        raise InvalidBudgetError("repository outline JSON token estimate did not reach a fixed point")
 
     def printed_tokens(payload):
-        if render_estimator is None:
-            import json
-            return rendered_tokens(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        if render_estimator is None or hasattr(render_estimator, "estimate_outline"):
+            return payload["tokens"]
         return render_estimator(payload)
 
     empty_paths = [path for path in ranked_paths if not entities[path]]
@@ -367,15 +516,28 @@ def build_repo_outline(
         (path, entity["id"])
         for path in ranked_paths for entity in entities[path]
     }
-    complete_result = make_payload(complete_pairs, empty_files=set(empty_paths))
-    complete_tokens = complete_result["tokens"]
+    complete_tokens = estimate_selected(complete_pairs, empty_files=set(empty_paths))
     if complete_tokens <= max_tokens:
-        return complete_result
+        return make_payload(complete_pairs, empty_files=set(empty_paths))
 
+    seed_pairs = {
+        (file_by_symbol[symbol_id], ids[file_by_symbol[symbol_id]][symbol_id])
+        for symbol_id in seed_ids
+    }
+    # Seed entities are mandatory whenever a seeded outline is requested. Test
+    # the complete seed set alone before filling the remaining rank order.
+    if seed_pairs and estimate_selected(seed_pairs, complete_tokens) > max_tokens:
+        raise InvalidBudgetError(
+            f"required outline metadata: seed entities need more than the "
+            f"{max_tokens}-token budget"
+        )
+    selected.update(seed_pairs)
     for path, entity in ordered_entities:
+        if (path, entity["id"]) in selected:
+            continue
         candidate = set(selected)
         candidate.add((path, entity["id"]))
-        if printed_tokens(make_payload(candidate)) <= max_tokens:
+        if estimate_selected(candidate, complete_tokens) <= max_tokens:
             selected = candidate
     for path in empty_paths:
         candidate = set(selected_empty_files)
@@ -383,22 +545,8 @@ def build_repo_outline(
         if printed_tokens(make_payload(selected, empty_files=candidate)) <= max_tokens:
             selected_empty_files = candidate
 
-    def omission_budgets(selected_pairs, empty_files):
-        budgets = {}
-        for path in ranked_paths:
-            selected_in_file = any(
-                (path, entity["id"]) in selected_pairs for entity in entities[path]
-            )
-            if not selected_in_file and path not in empty_files:
-                budgets[("file", path)] = complete_tokens
-            for entity in entities[path]:
-                if (path, entity["id"]) not in selected_pairs:
-                    budgets[("entity", path, entity["id"])] = complete_tokens
-        return budgets
-
     while True:
-        omitted_budgets = omission_budgets(selected, selected_empty_files)
-        final = make_payload(selected, omitted_budgets)
+        final = make_payload(selected, complete_tokens)
         if printed_tokens(final) <= max_tokens:
             break
         if selected_empty_files:
@@ -417,7 +565,7 @@ def build_repo_outline(
             raise InvalidBudgetError(
                 f"required outline metadata needs {printed_tokens(final)} tokens; budget is {max_tokens}"
             )
-    final = make_payload(selected, omitted_budgets)
+    final = make_payload(selected, complete_tokens)
     if printed_tokens(final) > max_tokens:
         raise InvalidBudgetError(
             f"required outline metadata needs {printed_tokens(final)} tokens; budget is {max_tokens}"

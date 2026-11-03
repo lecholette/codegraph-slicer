@@ -111,11 +111,13 @@ Outline edge records are compact `{from,to,kind}` triples. Each file has a
 local `fNNNN` ID, and its entities use local `eNNNN` IDs; edge references use
 `fNNNN:eNNNN` to distinguish entities across files. Seed files and their
 entities are budgeted and displayed first in the order of repeated `--seed`
-arguments; ranked neighbors follow. Skipped files and entities include their
-paths and a complete-candidate
-budget that admits them. Seeded zero-score files are outside the outline
-candidate set. If required omission metadata does not fit, the command refuses
-without printing output.
+arguments; ranked neighbors follow. `omitted.files` and `omitted.entities` give
+per-path counts, `omitted.edges` counts eligible edges with at least one
+unselected endpoint, and the single `omitted.max_tokens` value is the
+complete-candidate budget that admits all omitted records. Seeded zero-score
+files are outside the outline candidate set. Required seed entities must fit;
+otherwise the command refuses without printing output. If required omission
+metadata does not fit, the command also refuses.
 The budget includes complete
 printed output and its trailing newline in either format. A budget too small
 for required map metadata is an error. `--format` defaults to JSON.
@@ -275,10 +277,9 @@ Filters apply before totals and samples are computed. The v2 `totals` object is
 the one authoritative count per record kind; `samples` contains emitted
 records, while `omitted` records the difference. Import relationships appear
 only in `import_changes`; `added_edges` and `removed_edges` contain the other
-relationship kinds. `--edge-sample-limit N`
-defaults to 20 and bounds added and removed edge samples independently; zero
-keeps totals while suppressing those samples. The same limit bounds import
-change samples. Import change rows in this versioned projection are
+relationship kinds. `--edge-sample-limit N` defaults to 20, must be at least 1,
+and bounds added and removed edge samples independently. The same limit bounds
+import change samples. Import change rows in this versioned projection are
 deduplicated. `--full` is supported only by the
 legacy projection and is refused with v2. Explicit `--projection legacy` cannot
 be combined with v2 filters. The token budget covers complete JSON or Markdown

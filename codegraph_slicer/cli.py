@@ -69,6 +69,41 @@ class _MapMarkdownEstimator:
             tokens = estimate
 
 
+class _OutlineMarkdownEstimator:
+    """Exact Markdown accounting from selected outline records."""
+
+    def estimate_outline(self, files, edges, omitted, tokens=0):
+        blocks = ["# Repository outline (schema v1)", f"Estimated context tokens: {tokens}"]
+        for file_id, path, entities in files:
+            blocks.append(f"## {path} · `{file_id}`")
+            blocks.extend(
+                f"- `{entity['id']}` {entity['kind']} {entity['name']} "
+                f"(line {entity['line']}): `{entity['signature']}`"
+                for entity in entities
+            )
+        if edges:
+            blocks.append("## Edges")
+            blocks.extend(
+                f"- {edge['kind']}: `{edge['from']}` → `{edge['to']}`"
+                for edge in edges
+            )
+        for name, records in omitted.items():
+            blocks.append(f"## Omitted {name}")
+            blocks.append(f"- {name}: {records}")
+        return rendered_tokens("\n\n".join(blocks))
+
+    def __call__(self, payload):
+        files = [(item["id"], item["path"], item["entities"]) for item in payload["files"]]
+        tokens = 0
+        while True:
+            estimate = self.estimate_outline(
+                files, payload["edges"], payload.get("omitted", {}), tokens
+            )
+            if estimate == tokens:
+                return estimate
+            tokens = estimate
+
+
 def _node_refs(nodes):
     per_line = Counter(n["line"] for n in nodes if n["kind"] not in _ENDPOINTS)
     return {n["id"]: n["kind"] if n["kind"] in _ENDPOINTS
@@ -199,6 +234,8 @@ def _markdown(result):
     if result.get("schema") == "python-delta-v2":
         blocks = ["# Static delta report (python-delta-v2)"]
         blocks.append("Filters: " + json.dumps(result["filters"], ensure_ascii=False, sort_keys=True))
+        blocks.append(f"Test selection requested: `{result['test_selection']}`.")
+        blocks.append(result["test_gap_note"])
         blocks.append("## Totals\n\n" + "\n".join(
             f"- **{name.replace('_', ' ')}:** {count}"
             for name, count in result["totals"].items()
@@ -484,12 +521,14 @@ def main(argv=None):
     delta.add_argument("--projection", choices=("legacy", "v2"), help="output schema; v2 adds filters and bounded edge samples while preserving filtered totals (default: legacy)")
     delta.add_argument("--anchor", action="append", default=[], help="v2 projection: retain records mentioning this exact symbol or its qualified descendants; repeatable")
     delta.add_argument("--kind", action="append", default=[], help="v2 projection: retain this report category or edge kind (for example CALLS or IMPORTS); repeatable")
-    delta.add_argument("--edge-sample-limit", type=int, help="v2 projection: maximum added/removed edge samples per direction (default: 20)")
+    delta.add_argument("--edge-sample-limit", type=int, help="v2 projection: maximum added/removed edge samples per direction (minimum: 1; default: 20)")
     delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
     for command in (sync, mapping, slicing, impact, flow, delta):
         command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
+    if args.cmd == "delta" and args.edge_sample_limit is not None and args.edge_sample_limit < 1:
+        parser.error("--edge-sample-limit must be at least 1")
     if args.cmd == "slice" and args.include_imports and not args.outline:
         parser.error("--include-imports requires --outline")
     opening_db = True
@@ -549,7 +588,7 @@ def main(argv=None):
                         result = build_repo_outline(
                             store, args.seed, args.max_tokens,
                             render_estimator=(
-                                lambda candidate: rendered_tokens(_markdown(candidate))
+                                _OutlineMarkdownEstimator()
                             ) if args.format == "markdown" else None,
                         )
                     else:
