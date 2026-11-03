@@ -318,34 +318,13 @@ def _markdown(result):
         )
     if "flow" in result:
         return _flow_markdown(result)
-    if "callers" in result and "unknown_boundaries" in result and "unknown_boundary_count" in result:
-        blocks = [
-            f"# Call impact: `{result['anchor']}`",
-            f"Profile `{result['profile']}`. Reachability only; not value flow. "
-            + f"Depth ≤ {result['query']['max_depth']}; "
-            + f"caller-node bound {result['query']['max_nodes']}; truncated: {str(result['truncated']).lower()}.",
-            f"Unknown call boundaries across the indexed snapshot: {result['unknown_boundary_count']}. "
-            + "They are not linked to this anchor.",
-            "## Transitive callers",
-        ]
-        for caller in result["callers"]:
-            edge = caller["witness"]
-            blocks.append(
-                f"- `{caller['symbol']}` (depth {caller['depth']}) via "
-                f"`{edge['from']} → {edge['to']}` ({edge['kind']}, line {edge['line']})"
-            )
-        if result["unknown_boundaries"]:
-            blocks.append("## Unknown call boundaries")
-            blocks.extend(
-                f"- `{item['from']}` → `{item['target']}` ({item['kind']}, "
-                f"line {item['line']}): {item['reason']}"
-                for item in result["unknown_boundaries"]
-            )
-        if result["unknown_boundaries_omitted"]:
-            blocks.append(
-                f"Unknown call boundary records omitted: {result['unknown_boundaries_omitted']}"
-            )
-        return "\n\n".join(blocks)
+    if result.get("profile") == "python-call-impact-v2":
+        return (
+            f"# Call impact: `{result['anchor']}`\n\n"
+            "Reachability only; not value flow. Caller `to: null` means the anchor.\n\n"
+            f"Estimated context tokens: {result['tokens']}\n\n"
+            "```json\n" + json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n```"
+        )
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
         omission_blocks = []
@@ -632,6 +611,10 @@ def main(argv=None):
                         max_depth=args.max_depth,
                         max_nodes=args.max_nodes,
                         unknown_boundary_limit=args.unknown_boundaries,
+                        max_tokens=args.max_tokens, database=args.db, output_format=args.format,
+                        render_estimator=(
+                            lambda candidate: rendered_tokens(_markdown(candidate))
+                        ) if args.format == "markdown" else None,
                     )
                 else:
                     if not args.snapshot:
@@ -655,16 +638,6 @@ def main(argv=None):
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
-        if args.cmd == "impact":
-            while (
-                result["unknown_boundaries"]
-                and rendered_tokens(rendered) > args.max_tokens
-            ):
-                result["unknown_boundaries"].pop()
-                result["unknown_boundaries_omitted"] += 1
-                rendered = _markdown(result) if args.format == "markdown" else json.dumps(
-                    result, ensure_ascii=False, separators=(",", ":")
-                )
         if args.cmd in ("map", "slice", "impact", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
             from .slicer import InvalidBudgetError
             if args.cmd == "flow":

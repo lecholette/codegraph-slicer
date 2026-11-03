@@ -97,7 +97,8 @@ def _anchor(store, anchor):
 
 
 def query_call_impact(
-    store, anchor, *, max_depth=3, max_nodes=200, unknown_boundary_limit=0
+    store, anchor, *, max_depth=3, max_nodes=200, unknown_boundary_limit=0,
+    max_tokens=8000, database=None, render_estimator=None, output_format="json"
 ):
     """Return bounded transitive callers over resolved CALLS edges only."""
     if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth <= 0:
@@ -110,6 +111,8 @@ def query_call_impact(
         or unknown_boundary_limit < 0
     ):
         raise InvalidBudgetError("unknown boundary limit must be a non-negative integer")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise InvalidBudgetError("max_tokens must be a positive integer")
     target = _anchor(store, anchor)
     if target["kind"] not in {"function", "async_function", "method"}:
         raise AnchorNotFoundError(f"impact requires an observed function or method anchor: {anchor}")
@@ -118,11 +121,10 @@ def query_call_impact(
     visited = {anchor_id}
     callers = []
     frontier = [(anchor_id, 0)]
-    node_limit_hit = False
     depth_boundary_nodes = set()
     while frontier:
         next_frontier = []
-        for callee, depth in frontier:
+        for callee, depth in sorted(frontier):
             incoming = store.rows(
                 """SELECT e.source_id,e.target_id,e.kind,e.line FROM edges e
                    JOIN symbols s ON s.symbol_id=e.source_id
@@ -135,9 +137,6 @@ def query_call_impact(
                 caller = edge["source_id"]
                 if caller in visited:
                     continue
-                if len(callers) >= max_nodes:
-                    node_limit_hit = True
-                    break
                 visited.add(caller)
                 callers.append({
                     "symbol": caller,
@@ -153,26 +152,20 @@ def query_call_impact(
                     next_frontier.append((caller, depth + 1))
                 else:
                     depth_boundary_nodes.add(caller)
-            if node_limit_hit:
-                break
-        if node_limit_hit:
-            break
         frontier = next_frontier
 
     depth_limit_hit = False
-    if not node_limit_hit:
-        for caller in depth_boundary_nodes:
-            possible_callers = store.rows(
-                """SELECT e.source_id FROM edges e JOIN symbols s
-                    ON s.symbol_id=e.source_id WHERE e.target_id=?
-                    AND e.kind='CALLS' AND s.kind IN ('function','async_function','method')
-                    ORDER BY e.source_id""",
-                (caller,),
-            )
-            if any(row["source_id"] not in visited for row in possible_callers):
-                depth_limit_hit = True
-                break
-
+    for caller in depth_boundary_nodes:
+        possible_callers = store.rows(
+            """SELECT e.source_id FROM edges e JOIN symbols s
+                ON s.symbol_id=e.source_id WHERE e.target_id=?
+                AND e.kind='CALLS' AND s.kind IN ('function','async_function','method')
+                ORDER BY e.source_id""",
+            (caller,),
+        )
+        if any(row["source_id"] not in visited for row in possible_callers):
+            depth_limit_hit = True
+            break
     boundary_count_rows = store.rows(
         "SELECT count(*) AS count FROM diagnostics WHERE kind='CALLS'"
     )
@@ -193,21 +186,95 @@ def query_call_impact(
         for row in rows
     ]
     unknown_boundaries_omitted = max(0, boundary_count - len(unknown_boundaries))
-    return {
-        "profile": "python-call-impact-v1",
+    callers.sort(key=lambda item: (item["depth"], item["symbol"]))
+    compact = [
+        {"symbol": item["symbol"], "depth": item["depth"],
+         "to": None if item["depth"] == 1 else item["witness"]["to"],
+         "line": item["witness"]["line"]}
+        for item in callers
+    ]
+    columns = ["symbol", "depth", "to", "line"]
+
+    def layout(rows):
+        columnar = {"columns": columns, "rows": [[row[key] for key in columns] for row in rows]}
+        def size(value):
+            return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+        return columnar if size(columnar) < size(rows) else rows
+
+    result = {
+        "profile": "python-call-impact-v2",
         "anchor": anchor_id,
-        "query": {
-            "max_depth": max_depth,
-            "max_nodes": max_nodes,
-            "unknown_boundaries": unknown_boundary_limit,
-        },
-        "callers": callers,
-        "unknown_boundaries": unknown_boundaries,
+        "query": {"max_depth": max_depth, "max_nodes": max_nodes,
+                  "unknown_boundaries": unknown_boundary_limit},
+        "callers": layout([]),
+        "omitted": {"max_nodes": max(0, len(compact) - max_nodes), "budget": 0},
+        "unknown_boundaries": [],
         "unknown_boundary_count": boundary_count,
-        "unknown_boundaries_omitted": unknown_boundaries_omitted,
+        "unknown_boundaries_omitted": boundary_count,
         "unknown_boundary_scope": "indexed_snapshot; unresolved calls are not linked to the anchor",
-        "truncated": node_limit_hit or depth_limit_hit,
+        "truncated": False,
+        "retrieve_details": "",
     }
+
+    def measured(rows, boundaries):
+        candidate = dict(result)
+        candidate["callers"] = layout(rows)
+        candidate["omitted"] = {"max_nodes": max(0, len(compact) - max_nodes),
+                                "budget": min(len(compact), max_nodes) - len(rows)}
+        candidate["unknown_boundaries"] = boundaries
+        candidate["unknown_boundaries_omitted"] = boundary_count - len(boundaries)
+        candidate["truncated"] = bool(
+            depth_limit_hit or any(candidate["omitted"].values())
+        )
+        return _with_output_tokens(candidate, render_estimator)
+
+    # Recovery expands the node bound and admits every requested unknown sample.
+    # Its own command and token field are included in the fixed-point budget.
+    recovery = dict(result)
+    recovery["query"] = dict(result["query"], max_nodes=max(max_nodes, len(compact)))
+    recovery["callers"] = layout(compact)
+    recovery["omitted"] = {"max_nodes": 0, "budget": 0}
+    recovery["unknown_boundaries"] = unknown_boundaries
+    recovery["unknown_boundaries_omitted"] = unknown_boundaries_omitted
+    recovery["truncated"] = bool(depth_limit_hit)
+    recovery_budget = 1
+    while True:
+        command = shlex.join([
+            "codegraph-slicer", "impact", anchor_id, "--db", str(database or store.rows("PRAGMA database_list")[0]["file"]),
+            "--snapshot", "--max-depth", str(max_depth), "--max-nodes",
+            str(max(max_nodes, len(compact))), "--unknown-boundaries",
+            str(unknown_boundary_limit), "--format", output_format,
+            "--max-tokens", str(recovery_budget),
+        ])
+        recovery["retrieve_details"] = command
+        estimate = _with_output_tokens(recovery, render_estimator)["tokens"]
+        if estimate <= recovery_budget:
+            break
+        recovery_budget = estimate
+    result["retrieve_details"] = command
+    eligible = compact[:max_nodes]
+    selected = eligible[:1]
+    output = measured(selected, [])
+    if output["tokens"] > max_tokens:
+        raise InvalidBudgetError(
+            f"impact header and first caller require {output['tokens']} tokens; budget is {max_tokens}"
+        )
+    # Keep a deterministic ordered prefix, then spend residual room on unknowns.
+    for row in eligible[1:]:
+        candidate = measured(selected + [row], [])
+        if candidate["tokens"] > max_tokens:
+            break
+        selected.append(row)
+        output = candidate
+    boundaries = []
+    for boundary in unknown_boundaries:
+        candidate = measured(selected, boundaries + [boundary])
+        if candidate["tokens"] > max_tokens:
+            break
+        boundaries.append(boundary)
+        output = candidate
+    return output
+
 
 
 def build_slice_outline(

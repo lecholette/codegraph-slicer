@@ -213,16 +213,25 @@ codegraph-slicer impact ANCHOR --db DATABASE [--max-depth N] [--max-nodes N]
 
 `impact` follows resolved `CALLS` edges backward from one indexed function or
 method. `--max-depth` defaults to 3 caller hops and `--max-nodes` defaults to
-200 returned caller nodes. Each caller record includes its witness edge
-(`from`, `to`, `kind`, and source line). `truncated` is true when the depth or
-node bound cuts off additional reachable callers. By default, the report gives
-the total unresolved `CALLS` count and its indexed-snapshot scope without
-listing boundary records. Use `--unknown-boundaries N` to include a deterministic
-sample of at most N records; this limit is independent of `--max-nodes`, and
-`unknown_boundaries_omitted` reports the remaining count. Unresolved calls
-cannot be linked to the selected anchor, so this is explicit uncertainty, not
-an assertion that they call the anchor. The JSON output identifies its shape
-with the `python-call-impact-v1` profile.
+200 returned caller nodes. Profile `python-call-impact-v2` uses caller fields
+`symbol`, `depth`, `to`, and `line`. All edges are resolved `CALLS`; at depth 1,
+`to: null` means the anchor. The smaller serialized representation wins:
+a flat list of records or `{"columns":["symbol","depth","to","line"],"rows":[...]}`.
+Callers are ordered by `(depth, symbol)` and filled up to `--max-nodes` and the
+printed token budget. `omitted.max_nodes` counts depth-bounded callers excluded
+by the node limit; `omitted.budget` counts eligible callers excluded by tokens.
+The command refuses only if its header and first caller (if any) cannot fit.
+`retrieve_details` is a runnable command with expanded node and admitting token
+budgets for every caller within the requested depth and the requested unknown
+sample, in the same output format. It does not expand the depth bound.
+
+The total unresolved `CALLS` count and indexed-snapshot scope remain present.
+`--unknown-boundaries N` requests a deterministic sample, independently bounded
+from callers; unknown samples fill residual token room after callers.
+`unknown_boundaries_omitted` counts every unprinted unknown record. These calls
+cannot be linked to the selected anchor. `truncated` is true for omitted callers,
+or reachable callers beyond the depth bound; unknown sampling is counted separately.
+Markdown embeds the same versioned profile and exact printed token estimate.
 
 This query reports static call reachability. It does not trace values, prove a
 call executes at runtime, or establish that the result is a complete impact

@@ -75,14 +75,24 @@ def _db(tmp_path):
 
 def _impact(db, capsys, anchor, *options):
     assert main(["impact", anchor, "--db", str(db), "--snapshot", *options]) == 0
-    return json.loads(capsys.readouterr().out)
+    result = json.loads(capsys.readouterr().out)
+    compact = result["callers"]
+    if isinstance(compact, dict):
+        compact = [dict(zip(compact["columns"], row)) for row in compact["rows"]]
+    result["callers"] = [
+        {"symbol": row["symbol"], "depth": row["depth"], "witness": {
+            "from": row["symbol"], "to": row["to"] or result["anchor"],
+            "kind": "CALLS", "line": row["line"],
+        }} for row in compact
+    ]
+    return result
 
 
 def test_impact_walks_three_caller_hops_with_witness_edges(tmp_path, capsys):
     result = _impact(
         _db(tmp_path), capsys, "impactmod:leaf", "--max-depth", "3", "--max-nodes", "20"
     )
-    assert result["profile"] == "python-call-impact-v1"
+    assert result["profile"] == "python-call-impact-v2"
     callers = {entry["symbol"]: entry["depth"] for entry in result["callers"]}
     assert callers == {
         "impactmod:one": 1,
@@ -140,6 +150,7 @@ def test_impact_does_not_mark_depth_truncated_when_paths_converge(tmp_path, caps
         "impactmod:converged_x",
         "impactmod:converged_y",
     }
+    assert result["omitted"] == {"max_nodes": 0, "budget": 0}
     assert result["truncated"] is False
 
 
