@@ -31,7 +31,7 @@ def test_slice_outline_emits_closed_entity_graph_and_scoped_observations(tmp_pat
             "def caller():\n"
             "    return Child().run()\n"
         ),
-        "pkg/b.py": "class Base:\n    pass\n\ndef helper():\n    return 1\n",
+        "pkg/b.py": "class Base:\n    pass\n\ndef helper():\n    return missing_peer()\n",
         "pkg/unrelated.py": "def unrelated():\n    return 99\n",
     })
     assert main([
@@ -44,10 +44,14 @@ def test_slice_outline_emits_closed_entity_graph_and_scoped_observations(tmp_pat
     assert json.loads(capsys.readouterr().out) == payload
 
     assert payload["schema_version"] == 1
-    assert set(payload) == {"schema_version", "tokens", "entities", "edges", "diagnostics"}
-    assert {item["kind"] for item in payload["edges"]} >= {
-        "CALLS", "USES_TYPE", "INHERITS", "IMPORTS", "DEFINES",
+    assert set(payload) == {
+        "schema_version", "tokens", "entities", "edges", "diagnostics",
+        "diagnostic_counts", "omitted",
     }
+    assert {item["kind"] for item in payload["edges"]} >= {
+        "CALLS", "USES_TYPE", "INHERITS", "DEFINES",
+    }
+    assert all(item["kind"] != "IMPORTS" for item in payload["edges"])
     entities = {item["id"]: item for item in payload["entities"]}
     assert [item["id"] for item in payload["entities"]] == [
         f"e{index:04d}" for index in range(1, len(payload["entities"]) + 1)
@@ -61,12 +65,24 @@ def test_slice_outline_emits_closed_entity_graph_and_scoped_observations(tmp_pat
     assert missing["kind"] == "CALLS"
     assert missing["line"] == 5
     assert missing["source"] in entities
-    external_import = next(
-        item for item in payload["diagnostics"] if item["target"] == "external_pkg"
-    )
-    assert external_import["kind"] == "IMPORTS"
-    assert external_import["source"] in entities
-    assert entities[external_import["source"]]["kind"] == "module"
+    assert all(entity["kind"] != "module" for entity in entities.values())
+    helper_id = next(entity["id"] for entity in entities.values() if entity["name"] == "helper")
+    assert payload["diagnostic_counts"] == {helper_id: 1}
+    assert payload["omitted"]["edges"] == 4
+
+
+def test_slice_outline_import_context_is_opt_in(tmp_path, capsys):
+    db = _snapshot(tmp_path / "src", {
+        "pkg/a.py": "import pkg.b\ndef target():\n    return pkg.b.helper()\n",
+        "pkg/b.py": "def helper():\n    return 1\n",
+    })
+    assert main([
+        "slice", "--db", str(db), "--outline", "pkg.a:target",
+        "--include-imports", "--max-tokens", "4000",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(entity["kind"] == "module" for entity in payload["entities"])
+    assert any(edge["kind"] == "IMPORTS" for edge in payload["edges"])
 
 
 def test_slice_outline_refuses_too_small_budget(tmp_path, capsys):
@@ -77,3 +93,21 @@ def test_slice_outline_refuses_too_small_budget(tmp_path, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "required slice outline" in captured.err
+
+
+def test_slice_outline_keeps_required_graph_when_anchor_diagnostics_do_not_fit(
+    tmp_path, capsys
+):
+    calls = " + ".join(f"missing_{index}()" for index in range(12))
+    db = _snapshot(tmp_path / "diagnostic-heavy", {
+        "pkg/a.py": f"def target():\n    return {calls}\n",
+    })
+    assert main([
+        "slice", "--db", str(db), "--outline", "pkg.a:target", "--max-tokens", "80",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["tokens"] == 67
+    assert [entity["symbol"] for entity in payload["entities"]] == ["pkg.a:target"]
+    assert payload["edges"] == []
+    assert payload["diagnostics"] == []
+    assert payload["omitted"] == {"edges": 1, "diagnostics": 12}

@@ -159,6 +159,18 @@ def _markdown(result):
             f"(line {item['line']}): {item['reason']}"
             for item in result["diagnostics"]
         )
+        if result.get("diagnostic_counts"):
+            blocks.append("## Other entity diagnostic counts")
+            blocks.extend(
+                f"- `{source}`: {count} unresolved observations"
+                for source, count in result["diagnostic_counts"].items()
+            )
+        if result.get("omitted"):
+            blocks.append("## Omitted records")
+            blocks.extend(
+                f"- {name}: {count}"
+                for name, count in result["omitted"].items()
+            )
         return "\n\n".join(blocks)
     if "schema_version" in result and "files" in result and "edges" in result:
         blocks = [f"# Repository outline (schema v{result['schema_version']})"]
@@ -398,6 +410,7 @@ def main(argv=None):
     slicing.add_argument("anchors", nargs="+", help="symbol, module, or path/line anchor")
     slicing.add_argument("--max-tokens", type=int, default=8000, help="estimated context budget (default: 8000)")
     slicing.add_argument("--outline", action="store_true", help="emit a versioned, body-free entity graph")
+    slicing.add_argument("--include-imports", action="store_true", help="include module and import hops in an outline")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
     impact = sub.add_parser(
         "impact",
@@ -477,6 +490,8 @@ def main(argv=None):
     for command in (sync, mapping, slicing, impact, flow, delta):
         command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
+    if args.cmd == "slice" and args.include_imports and not args.outline:
+        parser.error("--include-imports requires --outline")
     opening_db = True
     opening_db_path = None
     try:
@@ -585,6 +600,7 @@ def main(argv=None):
                     if args.outline:
                         result = build_slice_outline(
                             store, args.anchors, args.max_tokens,
+                            include_imports=args.include_imports,
                             render_estimator=(
                                 lambda candidate: rendered_tokens(_markdown(candidate))
                             ) if args.format == "markdown" else None,

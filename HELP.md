@@ -170,17 +170,23 @@ dominates a slice.
 
 Add `--outline` to return schema version 1 as a body-free structural graph. It
 contains one `entities` table with deterministic local IDs (`e0001`, `e0002`,
-...) and typed `edges` with `from`, `to`, `kind`, and source `line`. The graph
-includes observed `CALLS`, `USES_TYPE`, `INHERITS`, `IMPORTS`, and `DEFINES`
-relationships for the anchor neighborhood, with every emitted edge endpoint
-present in `entities`. IDs are assigned by path, source line, and symbol ID;
-they are stable for the same indexed snapshot and selected neighborhood. The
-`diagnostics` list is scoped to included entities and preserves unresolved or
-external references as observations (`source`, textual `target`, `kind`, call
-site `line`, and `reason`). Such an observation does not establish that a
-target is absent. This form includes signatures and source locations but no
-source bodies; if the complete graph does not fit the token budget, the query
-refuses rather than returning a partial graph.
+...) and typed `edges` with `from`, `to`, `kind`, and source `line`. By default,
+the graph includes observed `CALLS`, `USES_TYPE`, `INHERITS`, and `DEFINES`
+relationships for the anchor neighborhood. Module (`:`) hops and `IMPORTS`
+edges are included only with `--include-imports`. Every emitted edge endpoint
+is present in `entities`; `omitted.edges` reports the exact number of eligible
+edges whose other endpoint is outside the selected entities. IDs are assigned
+by path, source line, and symbol ID; they are stable for the same indexed
+snapshot and selected neighborhood. The `diagnostics` list keeps full
+unresolved or external observations for anchors (`source`, textual `target`,
+`kind`, source `line`, and `reason`); other entities have unresolved counts
+keyed by local entity ID. These are observations, not claims that a target is
+absent. Signatures, source locations, entities, and internal edges are
+required; diagnostics are optional under the token budget. The query refuses
+only if the required entities and edges do not fit.
+
+`--include-imports` applies only with `--outline` and includes module nodes and
+their one-hop import context.
 
 When several anchors share required type definitions, those required types are
 kept in the required section and are not repeated as optional callee entries.
@@ -189,6 +195,7 @@ kept in the required section and are not repeated as optional callee entries.
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --max-tokens 4000
 codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-callee-bodies --format markdown
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --format json
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --include-imports
 ```
 
 Next, inspect the returned sections; if the anchor is unknown, choose an

@@ -210,14 +210,18 @@ def query_call_impact(
     }
 
 
-def build_slice_outline(store, anchors, max_tokens=8000, *, render_estimator=None):
+def build_slice_outline(
+    store, anchors, max_tokens=8000, *, include_imports=False, render_estimator=None
+):
     """Return a bounded, body-free entity graph for a slice's local neighborhood."""
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise InvalidBudgetError("max_tokens must be a positive integer")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
 
-    allowed_kinds = ("CALLS", "USES_TYPE", "INHERITS", "IMPORTS", "DEFINES")
+    allowed_kinds = ["CALLS", "USES_TYPE", "INHERITS", "DEFINES"]
+    if include_imports:
+        allowed_kinds.append("IMPORTS")
     selected = {row["symbol_id"] for row in (_anchor(store, anchor) for anchor in anchors)}
     roots = set(selected)
     for symbol_id in sorted(roots):
@@ -237,15 +241,13 @@ def build_slice_outline(store, anchors, max_tokens=8000, *, render_estimator=Non
         ):
             selected.add(row["node"])
 
-    # Include module and lexical definition endpoints so the emitted graph is
-    # closed. One hop of module imports is useful context without recursively
-    # expanding the repository's entire import graph.
+    # Include lexical definitions but leave module symbols out unless import
+    # context was requested.
     for symbol_id in tuple(sorted(selected)):
         rows = store.rows("SELECT file_path,module,qualname FROM symbols WHERE symbol_id=?", (symbol_id,))
         if not rows:
             continue
         row = rows[0]
-        selected.add(row["module"] + ":")
         parent = row["module"] + ":" + row["qualname"].rpartition(".")[0]
         while parent != row["module"] + ":" and parent not in selected:
             exists = store.rows("SELECT symbol_id FROM symbols WHERE symbol_id=?", (parent,))
@@ -255,20 +257,22 @@ def build_slice_outline(store, anchors, max_tokens=8000, *, render_estimator=Non
             parent = parent.rpartition(".")[0]
             if ":" not in parent:
                 parent = row["module"] + ":"
-    module_ids = {
-        row["module"] + ":"
-        for row in store.rows(
-            f"SELECT DISTINCT module FROM symbols WHERE symbol_id IN ({','.join('?' for _ in selected)})",
-            tuple(sorted(selected)),
-        )
-    } if selected else set()
-    if module_ids:
-        placeholders = ",".join("?" for _ in module_ids)
-        imported = store.rows(
-            f"SELECT DISTINCT target_id FROM edges WHERE kind='IMPORTS' AND source_id IN ({placeholders})",
-            tuple(sorted(module_ids)),
-        )
-        selected.update(row["target_id"] for row in imported)
+    if include_imports:
+        module_ids = {
+            row["module"] + ":"
+            for row in store.rows(
+                f"SELECT DISTINCT module FROM symbols WHERE symbol_id IN ({','.join('?' for _ in selected)})",
+                tuple(sorted(selected)),
+            )
+        } if selected else set()
+        selected.update(module_ids)
+        if module_ids:
+            placeholders = ",".join("?" for _ in module_ids)
+            imported = store.rows(
+                f"SELECT DISTINCT target_id FROM edges WHERE kind='IMPORTS' AND source_id IN ({placeholders})",
+                tuple(sorted(module_ids)),
+            )
+            selected.update(row["target_id"] for row in imported)
 
     rows_by_id = {
         row["symbol_id"]: row
@@ -297,34 +301,70 @@ def build_slice_outline(store, anchors, max_tokens=8000, *, render_estimator=Non
     placeholders = ",".join("?" for _ in local_id)
     edge_rows = store.rows(
         f"SELECT source_id,target_id,kind,line FROM edges WHERE kind IN ({','.join('?' for _ in allowed_kinds)}) "
-        f"AND source_id IN ({placeholders}) AND target_id IN ({placeholders}) "
+        f"AND (source_id IN ({placeholders}) OR target_id IN ({placeholders})) "
         "ORDER BY source_id,target_id,kind,line",
         (*allowed_kinds, *local_id, *local_id),
     ) if local_id else []
-    edges = [
-        {"from": local_id[row["source_id"]], "to": local_id[row["target_id"]],
-         "kind": row["kind"], "line": row["line"]}
-        for row in edge_rows
-    ]
+    edges = []
+    omitted_edges = 0
+    for row in edge_rows:
+        if row["source_id"] not in local_id or row["target_id"] not in local_id:
+            omitted_edges += 1
+            continue
+        edges.append({
+            "from": local_id[row["source_id"]],
+            "to": local_id[row["target_id"]],
+            "kind": row["kind"],
+            "line": row["line"],
+        })
     diagnostics = []
+    diagnostic_counts = {}
     if local_id:
         diagnostic_rows = store.rows(
             f"SELECT source_id,target,kind,line,reason FROM diagnostics WHERE source_id IN ({placeholders}) "
             "ORDER BY source_id,line,target,kind,reason",
             tuple(local_id),
         )
-        diagnostics = [
-            {"source": local_id[row["source_id"]], "target": row["target"],
-             "kind": row["kind"], "line": row["line"], "reason": row["reason"]}
-            for row in diagnostic_rows
-        ]
-    payload = _with_output_tokens({
-        "schema_version": 1,
-        "tokens": 0,
-        "entities": entities,
-        "edges": edges,
-        "diagnostics": diagnostics,
-    }, render_estimator)
+        for row in diagnostic_rows:
+            if row["source_id"] in roots:
+                diagnostics.append({
+                    "source": local_id[row["source_id"]],
+                    "target": row["target"],
+                    "kind": row["kind"],
+                    "line": row["line"],
+                    "reason": row["reason"],
+                })
+            else:
+                source = local_id[row["source_id"]]
+                diagnostic_counts[source] = diagnostic_counts.get(source, 0) + 1
+
+    omitted_diagnostics = 0
+
+    def result_payload():
+        payload = {
+            "schema_version": 1,
+            "tokens": 0,
+            "entities": entities,
+            "edges": edges,
+            "diagnostics": diagnostics,
+            "diagnostic_counts": dict(diagnostic_counts),
+        }
+        omitted = {"edges": omitted_edges} if omitted_edges else {}
+        if omitted_diagnostics:
+            omitted["diagnostics"] = omitted_diagnostics
+        if omitted:
+            payload["omitted"] = omitted
+        return _with_output_tokens(payload, render_estimator)
+
+    payload = result_payload()
+    while payload["tokens"] > max_tokens and diagnostics:
+        diagnostics.pop()
+        omitted_diagnostics += 1
+        payload = result_payload()
+    while payload["tokens"] > max_tokens and diagnostic_counts:
+        source = next(reversed(diagnostic_counts))
+        omitted_diagnostics += diagnostic_counts.pop(source)
+        payload = result_payload()
     if payload["tokens"] > max_tokens:
         raise RequiredAnchorOverflow(
             f"required slice outline needs {payload['tokens']} tokens; budget is {max_tokens}"
