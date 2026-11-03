@@ -1,23 +1,29 @@
 """Standalone commands; query commands open existing databases read-only."""
 
 import argparse
-from contextlib import ExitStack
 import json
-from collections import Counter
-from pathlib import Path
+import os
 import re
 import sqlite3
-import os
 import stat
-from .ast_extractor import CodeGraphError
-from .store import GraphStore
-from .pagerank import build_repo_map
-from .slicer import (AnchorNotFoundError, slice_context,
-                     rendered_tokens, serialized_tokens, tokens_for_length)
-from .delta import compute_delta, summarize_delta
-from .flow_query import query_flow
-from .flow import FlowQueryError, UnsupportedFlowError
+from collections import Counter
+from contextlib import ExitStack
+from pathlib import Path
 
+from .ast_extractor import CodeGraphError
+from .delta import compute_delta, summarize_delta
+from .flow import FlowQueryError, UnsupportedFlowError
+from .flow_query import query_flow
+from .pagerank import build_repo_map
+from .slicer import (
+    AnchorNotFoundError,
+    query_call_impact,
+    rendered_tokens,
+    serialized_tokens,
+    slice_context,
+    tokens_for_length,
+)
+from .store import GraphStore
 
 _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
@@ -174,6 +180,35 @@ def _markdown(result):
         return "\n\n".join(blocks)
     if "flow" in result:
         return _flow_markdown(result)
+    if "callers" in result and "witnesses" in result and "unknown_boundaries" in result:
+        blocks = [
+            f"# Call impact: `{result['anchor']}`",
+            f"Profile `{result['profile']}`. Reachability only; not value flow. "
+            + f"Depth ≤ {result['query']['max_depth']}; "
+            + f"caller-node bound {result['query']['max_nodes']}; truncated: {str(result['truncated']).lower()}.",
+            "Unknown boundary scope: unresolved CALLS across the indexed snapshot; "
+            + "these records are not linked to this anchor.",
+            "## Transitive callers",
+        ]
+        witnesses = {edge["from"]: edge for edge in result["witnesses"]}
+        for caller in result["callers"]:
+            edge = witnesses[caller["symbol"]]
+            blocks.append(
+                f"- `{caller['symbol']}` (depth {caller['depth']}) via "
+                f"`{edge['from']} → {edge['to']}` ({edge['kind']}, line {edge['line']})"
+            )
+        if result["unknown_boundaries"]:
+            blocks.append("## Unknown call boundaries")
+            blocks.extend(
+                f"- `{item['from']}` → `{item['target']}` ({item['kind']}, "
+                f"line {item['line']}): {item['reason']}"
+                for item in result["unknown_boundaries"]
+            )
+        if result["unknown_boundaries_omitted"]:
+            blocks.append(
+                f"Unknown call boundaries omitted: {result['unknown_boundaries_omitted']}"
+            )
+        return "\n\n".join(blocks)
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
         omission_blocks = []
@@ -274,6 +309,23 @@ def main(argv=None):
     slicing.add_argument("anchors", nargs="+", help="symbol, module, or path/line anchor")
     slicing.add_argument("--max-tokens", type=int, default=8000, help="estimated context budget (default: 8000)")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
+    impact = sub.add_parser(
+        "impact",
+        help="find bounded transitive callers over resolved call edges",
+        description=(
+            "Walk resolved CALLS edges backward from one function or method. This reports static "
+            "reachability, not value flow or proof of runtime execution. Unresolved call references "
+            "across the indexed snapshot are returned as potential unknown boundaries, not linked "
+            "to the selected anchor."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    impact.add_argument("anchor", help="observed function or method anchor")
+    impact.add_argument("--db", required=True, help="existing indexed SQLite snapshot, opened read-only")
+    impact.add_argument("--snapshot", action="store_true", help="query cached historical bytes without checking source freshness")
+    impact.add_argument("--max-depth", type=int, default=3, help="maximum number of caller hops (default: 3)")
+    impact.add_argument("--max-nodes", type=int, default=200, help="maximum returned caller nodes (default: 200)")
+    impact.add_argument("--max-tokens", type=int, default=8000, help="maximum printed output estimate (default: 8000)")
     flow = sub.add_parser(
         "flow", help="query bounded local Python control/data flow",
         description=("Build a function-local flow graph on demand from cached module source.\n"
@@ -323,7 +375,7 @@ def main(argv=None):
     delta.add_argument("--selected-test", action="append", default=[], help="select a test path for static gap analysis; repeatable, does not run it (default: none)")
     delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
-    for command in (sync, mapping, slicing, flow, delta):
+    for command in (sync, mapping, slicing, impact, flow, delta):
         command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
     opening_db = True
@@ -380,6 +432,14 @@ def main(argv=None):
                             )))
                         ),
                     )
+                elif args.cmd == "impact":
+                    if not args.snapshot:
+                        store.assert_fresh()
+                    result = query_call_impact(
+                        store, args.anchor,
+                        max_depth=args.max_depth,
+                        max_nodes=args.max_nodes,
+                    )
                 else:
                     if not args.snapshot:
                         store.assert_fresh()
@@ -393,7 +453,7 @@ def main(argv=None):
         rendered = _markdown(result) if args.format == "markdown" else json.dumps(
             result, ensure_ascii=False, separators=(",", ":")
         )
-        if args.cmd in ("map", "slice", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
+        if args.cmd in ("map", "slice", "impact", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
             from .slicer import InvalidBudgetError
             if args.cmd == "flow":
                 label = "printed flow output"

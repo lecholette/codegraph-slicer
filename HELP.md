@@ -1,10 +1,10 @@
 # codegraph-slicer help
 
 `codegraph-slicer` indexes Python source into a SQLite snapshot, then builds a
-ranked repository map, extracts bounded context around symbols, compares two
-snapshots, or builds bounded local control/data-flow slices. It is static syntax
-analysis: it does not import or execute indexed code, execute tests, or infer
-runtime behavior.
+ranked repository map, extracts bounded context around symbols, reports bounded
+transitive callers, compares two snapshots, or builds bounded local
+control/data-flow slices. It is static syntax analysis: it does not import or
+execute indexed code, execute tests, or infer runtime behavior.
 
 After `pip install`, the executable can be called by name from any working
 directory. Every query uses an existing database. The first
@@ -14,6 +14,7 @@ example creates one; the later commands reuse that same index:
 codegraph-slicer sync /path/to/project --db /tmp/project.sqlite
 codegraph-slicer map --db /tmp/project.sqlite
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run
+codegraph-slicer impact package.module:run --db /tmp/project.sqlite --max-depth 3 --max-nodes 200
 codegraph-slicer flow package.module:run --db /tmp/project.sqlite --variable total
 ```
 
@@ -33,9 +34,11 @@ describes the index model and known static-analysis limits.
 1. Run `sync` once to create the snapshot database.
 2. Run `map` to see ranked file skeletons, or `slice` for context around one or
    more anchors.
-3. To review changes, sync base and head source into separate databases and
+3. Run `impact` for bounded transitive call reachability from one function or
+   method; it does not trace values.
+4. To review changes, sync base and head source into separate databases and
    run `delta --base-db BASE --head-db HEAD`.
-4. Inspect the report, then run any tests separately. `delta` only reports
+5. Inspect the report, then run any tests separately. `delta` only reports
    static test-selection gaps; `--selected-test` does not execute or certify a
    test.
 
@@ -160,6 +163,29 @@ codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-calle
 
 Next, inspect the returned sections; if the anchor is unknown, choose an
 indexed symbol or module from the map/database.
+
+### `impact`
+
+```text
+codegraph-slicer impact ANCHOR --db DATABASE [--max-depth N] [--max-nodes N]
+                         [--max-tokens N] [--snapshot] [--format json|markdown]
+```
+
+`impact` follows resolved `CALLS` edges backward from one indexed function or
+method. `--max-depth` defaults to 3 caller hops and `--max-nodes` defaults to
+200 returned caller nodes. Each caller includes a witness edge (`from`, `to`,
+`kind`, and source line). `truncated` is true when the depth or node bound cuts
+off additional reachable callers. All unresolved `CALLS` references in the
+indexed snapshot are listed as potential boundaries in `unknown_boundaries`;
+they cannot be linked to the selected anchor, so this is explicit uncertainty,
+not an assertion that they call the anchor. At most `--max-nodes` boundary
+records are emitted; `unknown_boundaries_omitted` reports the remainder. The
+JSON output identifies its shape with the `python-call-impact-v1` profile.
+
+This query reports static call reachability. It does not trace values, prove a
+call executes at runtime, or establish that the result is a complete impact
+set. It follows only resolved `CALLS` edges; dynamic dispatch, aliases or
+external references may leave unknown boundaries.
 
 ### `delta`
 

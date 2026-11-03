@@ -7,6 +7,7 @@ codegraph-slicer sync /path/to/project --db /tmp/graph.sqlite
 codegraph-slicer sync /path/to/git/repo --revision HEAD --db /tmp/head.sqlite
 codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 1800
 codegraph-slicer slice --db /tmp/graph.sqlite package.module:thing --max-tokens 4000
+codegraph-slicer impact package.module:thing --db /tmp/graph.sqlite --max-depth 3 --max-nodes 200
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:thing --format markdown
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:42 --include-callee-bodies
 codegraph-slicer flow package.module:function --db /tmp/graph.sqlite --variable total --line 15
@@ -16,6 +17,8 @@ codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
 ```
 
 Every command supports `--format json|markdown`. Query commands require an existing database and open it read-only. `sync` is the only writer. Python APIs are exported by `codegraph_slicer`; use `with GraphStore(path) as store:` to close the connection.
+
+`impact` walks resolved `CALLS` edges backward to find bounded transitive callers. Each returned caller has a witness edge. All unresolved `CALLS` references in the indexed snapshot are reported as potential unknown boundaries (at most `--max-nodes`, with any remainder counted); they are not linked to the selected anchor. This is static reachability, not value flow, proof of runtime execution, or a complete list of callers when the depth or node bound truncates the walk. JSON output uses the `python-call-impact-v1` profile.
 
 `delta` defaults to a compact, priority-ranked summary with an 8000-token budget.
 Its `serialized_tokens` estimate covers the complete printed JSON, including

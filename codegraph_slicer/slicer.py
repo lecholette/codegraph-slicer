@@ -96,6 +96,106 @@ def _anchor(store, anchor):
     raise error
 
 
+def query_call_impact(store, anchor, *, max_depth=3, max_nodes=200):
+    """Return bounded transitive callers over resolved CALLS edges only."""
+    if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth <= 0:
+        raise InvalidBudgetError("max_depth must be a positive integer")
+    if not isinstance(max_nodes, int) or isinstance(max_nodes, bool) or max_nodes <= 0:
+        raise InvalidBudgetError("max_nodes must be a positive integer")
+    target = _anchor(store, anchor)
+    if target["kind"] not in {"function", "async_function", "method"}:
+        raise AnchorNotFoundError(f"impact requires an observed function or method anchor: {anchor}")
+
+    anchor_id = target["symbol_id"]
+    visited = {anchor_id}
+    callers = []
+    witnesses = []
+    frontier = [(anchor_id, 0)]
+    node_limit_hit = False
+    depth_boundary_nodes = set()
+    while frontier:
+        next_frontier = []
+        for callee, depth in frontier:
+            incoming = store.rows(
+                """SELECT e.source_id,e.target_id,e.kind,e.line FROM edges e
+                   JOIN symbols s ON s.symbol_id=e.source_id
+                   WHERE e.target_id=? AND e.kind='CALLS'
+                     AND s.kind IN ('function','async_function','method')
+                   ORDER BY e.source_id,e.line""",
+                (callee,),
+            )
+            for edge in incoming:
+                caller = edge["source_id"]
+                if caller in visited:
+                    continue
+                if len(callers) >= max_nodes:
+                    node_limit_hit = True
+                    break
+                visited.add(caller)
+                callers.append({"symbol": caller, "depth": depth + 1})
+                witnesses.append({
+                    "from": caller,
+                    "to": edge["target_id"],
+                    "kind": edge["kind"],
+                    "line": edge["line"],
+                })
+                if depth + 1 < max_depth:
+                    next_frontier.append((caller, depth + 1))
+                else:
+                    depth_boundary_nodes.add(caller)
+            if node_limit_hit:
+                break
+        if node_limit_hit:
+            break
+        frontier = next_frontier
+
+    depth_limit_hit = False
+    if not node_limit_hit:
+        for caller in depth_boundary_nodes:
+            possible_callers = store.rows(
+                """SELECT e.source_id FROM edges e JOIN symbols s
+                    ON s.symbol_id=e.source_id WHERE e.target_id=?
+                    AND e.kind='CALLS' AND s.kind IN ('function','async_function','method')
+                    ORDER BY e.source_id""",
+                (caller,),
+            )
+            if any(row["source_id"] not in visited for row in possible_callers):
+                depth_limit_hit = True
+                break
+
+    boundary_count_rows = store.rows(
+        "SELECT count(*) AS count FROM diagnostics WHERE kind='CALLS'"
+    )
+    boundary_count = boundary_count_rows[0]["count"]
+    rows = store.rows(
+        """SELECT source_id,target,kind,line,reason FROM diagnostics
+            WHERE kind='CALLS' ORDER BY source_id,line,target LIMIT ?""",
+        (max_nodes,),
+    )
+    unknown_boundaries = [
+        {
+            "from": row["source_id"],
+            "target": row["target"],
+            "kind": row["kind"],
+            "line": row["line"],
+            "reason": row["reason"],
+        }
+        for row in rows[:max_nodes]
+    ]
+    unknown_boundaries_omitted = max(0, boundary_count - len(unknown_boundaries))
+    return {
+        "profile": "python-call-impact-v1",
+        "anchor": anchor_id,
+        "query": {"max_depth": max_depth, "max_nodes": max_nodes},
+        "callers": callers,
+        "witnesses": witnesses,
+        "unknown_boundaries": unknown_boundaries,
+        "unknown_boundaries_omitted": unknown_boundaries_omitted,
+        "unknown_boundary_scope": "indexed_snapshot; unresolved calls are not linked to the anchor",
+        "truncated": node_limit_hit or depth_limit_hit,
+    }
+
+
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
     render_estimator=None, database=None,
