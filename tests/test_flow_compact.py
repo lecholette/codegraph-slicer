@@ -1,4 +1,5 @@
 import json
+import re
 from collections import Counter
 
 from codegraph_slicer import GraphStore
@@ -74,3 +75,16 @@ def test_compact_flow_preserves_facts_identity_and_same_line_cleanup_nodes(tmp_p
     live_ins = [row for row in diagnostic_rows if row[0] == "unknown-live-in"]
     assert live_ins
     assert any(len(row[2]) > 1 for row in live_ins)
+
+
+def test_compact_markdown_uses_printed_token_header_and_unindented_json(tmp_path, capsys):
+    markdown = _flow(
+        tmp_path, capsys, "--compact", "--format", "markdown", "--max-tokens", "100000"
+    )
+    output_tokens = len(markdown) // 4 + 1
+    header = int(re.search(r"Estimated context tokens: (\d+)", markdown).group(1))
+    assert header == output_tokens
+    fenced_json = markdown.split("```json\n", 1)[1].split("\n```", 1)[0]
+    assert "\n  \"schema\"" not in fenced_json
+    assert '"schema": "python-local-cpg-flow-compact-v1"' in fenced_json
+    assert json.loads(fenced_json)["schema"] == "python-local-cpg-flow-compact-v1"

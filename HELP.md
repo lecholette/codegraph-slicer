@@ -333,8 +333,10 @@ the compact projection therefore keeps the data and mutation facts available
 in the full graph. Use ordinary JSON without `--compact` as the recovery path
 when consumers need the original named-field records. The token budget applies
 to the selected representation. With `--format markdown`, the compact schema
-is shown as a formatted JSON block rather than expanded into the named-field
-flow view.
+is shown as an unindented JSON block rather than expanded into the named-field
+flow view. Its token header measures the complete printed Markdown, including
+the header and final newline. JSON and Markdown estimates use a bounded
+fixed-point calculation and refuse if they do not converge.
 
 ```sh
 codegraph-slicer flow spend:admit --db /tmp/example.sqlite \

@@ -29,11 +29,12 @@ def _flow_output_tokens(report, render_estimator):
         render_estimator = lambda candidate: rendered_tokens(json.dumps(
             candidate, ensure_ascii=False, separators=(",", ":")
         ))
-    while True:
+    for _ in range(16):
         estimate = render_estimator(result)
         if estimate == result["tokens"]:
             return estimate
         result["tokens"] = estimate
+    raise FlowBudgetExceeded("flow token estimate did not reach a fixed point")
 
 
 def compact_flow_result(result, render_estimator=None):

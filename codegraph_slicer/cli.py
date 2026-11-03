@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .ast_extractor import CodeGraphError
 from .delta import compute_delta, project_delta_v2, summarize_delta
-from .flow import FlowQueryError, UnsupportedFlowError, compact_flow_result
+from .flow import FlowBudgetExceeded, FlowQueryError, UnsupportedFlowError, compact_flow_result
 from .flow_query import query_flow
 from .pagerank import build_repo_map, build_repo_outline
 from .slicer import (
@@ -129,12 +129,13 @@ def _flow_markdown(result):
     blocks.extend(f"- {item}" for item in graph["limitations"])
     text = "\n\n".join(blocks)
     estimate = rendered_tokens(text)
-    while True:
+    for _ in range(16):
         rendered = text.replace("this view ≈ 0 tokens", f"this view ≈ {estimate} tokens", 1)
         updated = rendered_tokens(rendered)
         if updated == estimate:
             return rendered
         estimate = updated
+    raise FlowBudgetExceeded("flow Markdown token estimate did not reach a fixed point")
 
 
 def _markdown(result):
@@ -263,7 +264,7 @@ def _markdown(result):
             "# Compact Python local flow\n\n"
             f"Estimated context tokens: {result['tokens']}\n\n"
             "```json\n"
-            + json.dumps(result["flow"], ensure_ascii=False, indent=2)
+            + json.dumps(result["flow"], ensure_ascii=False)
             + "\n```"
         )
     if "flow" in result:
