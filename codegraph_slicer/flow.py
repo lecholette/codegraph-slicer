@@ -449,64 +449,59 @@ def _check(node, path):
         _check(child, path)
 
 
-def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
-    """Build a deterministic CFG/data-dependence graph for one observed function."""
-    try:
-        tree = ast.parse(source, filename=path)
-    except SyntaxError as exc:
-        raise FlowQueryError(f"invalid source {path}:{exc.lineno}: {exc.msg}") from exc
+def _find_function(tree, qualname, path):
+    """Resolve one qualified function from a parsed module."""
     candidates = []
 
     def visit(body, prefix):
         for item in body:
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                q = ".".join((*prefix, item.name))
-                if q == qualname:
+                qname = ".".join((*prefix, item.name))
+                if qname == qualname:
                     candidates.append(item)
                 visit(item.body, (*prefix, item.name))
             elif isinstance(item, ast.ClassDef):
                 visit(item.body, (*prefix, item.name))
 
     visit(tree.body, [])
-    if len(candidates) != 1 or not isinstance(candidates[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+    if len(candidates) != 1 or not isinstance(
+        candidates[0], (ast.FunctionDef, ast.AsyncFunctionDef)
+    ):
         raise FlowQueryError(
             f"expected exactly one synchronous function {qualname!r} in {path}"
         )
-    fn = candidates[0]
-    structured_depth, deepest_structured = _structured_cleanup_depth(fn.body)
+    return candidates[0]
+
+
+def _validate_function(fn, path):
+    """Reject syntax whose data-flow semantics are not modeled."""
     for stmt in fn.body:
         _check(stmt, path)
     for parent in ast.walk(fn):
-        if isinstance(parent, (ast.BoolOp, ast.IfExp)):
-            for child in ast.walk(parent):
-                if isinstance(child, ast.NamedExpr):
-                    raise UnsupportedFlowError(
-                        f"unsupported conditional named expression in {path}:{child.lineno}"
-                    )
+        conditional = isinstance(parent, (ast.BoolOp, ast.IfExp))
+        conditional_children = ast.walk(parent) if conditional else ()
         if isinstance(parent, ast.Compare):
-            for child in ast.walk(
+            conditional_children = ast.walk(
                 ast.Tuple(elts=parent.comparators[1:], ctx=ast.Load())
-            ):
-                if isinstance(child, ast.NamedExpr):
-                    raise UnsupportedFlowError(
-                        f"unsupported conditional named expression in {path}:{child.lineno}"
-                    )
-        if isinstance(parent, ast.Assert) and parent.msg is not None:
-            for child in ast.walk(parent.msg):
-                if isinstance(child, ast.NamedExpr):
-                    raise UnsupportedFlowError(
-                        f"unsupported conditional named expression in {path}:{child.lineno}"
-                    )
+            )
+        elif isinstance(parent, ast.Assert) and parent.msg is not None:
+            conditional_children = ast.walk(parent.msg)
+        for child in conditional_children:
+            if isinstance(child, ast.NamedExpr):
+                raise UnsupportedFlowError(
+                    f"unsupported conditional named expression in {path}:{child.lineno}"
+                )
     for stmt in ast.walk(fn):
         if isinstance(stmt, ast.Assign):
             target_names = set().union(*(_plain_target_names(t) for t in stmt.targets))
             walrus_names = _target_names(stmt.value)
             for target in stmt.targets:
-                if isinstance(target, (ast.Attribute, ast.Subscript)):
-                    if _target_access_roots(target) & (target_names | walrus_names):
-                        raise UnsupportedFlowError(
-                            f"unsupported overlapping assignment target in {path}:{stmt.lineno}"
-                        )
+                if isinstance(target, (ast.Attribute, ast.Subscript)) and (
+                    _target_access_roots(target) & (target_names | walrus_names)
+                ):
+                    raise UnsupportedFlowError(
+                        f"unsupported overlapping assignment target in {path}:{stmt.lineno}"
+                    )
         elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
             if isinstance(stmt.target, (ast.Attribute, ast.Subscript)) and (
                 _target_access_roots(stmt.target) & _target_names(stmt.value)
@@ -516,11 +511,74 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
                 )
         elif isinstance(stmt, ast.AugAssign) and isinstance(
             stmt.target, (ast.Attribute, ast.Subscript)
-        ):
-            if _target_access_roots(stmt.target) & _target_names(stmt.value):
-                raise UnsupportedFlowError(
-                    f"unsupported overlapping augmented target in {path}:{stmt.lineno}"
-                )
+        ) and _target_access_roots(stmt.target) & _target_names(stmt.value):
+            raise UnsupportedFlowError(
+                f"unsupported overlapping augmented target in {path}:{stmt.lineno}"
+            )
+
+
+def _mark_reachability_and_control(nodes, edges, entry, exit_id):
+    """Compute reachable nodes and control-dependence edges."""
+    cfg_nodes = {node["id"] for node in nodes}
+    successors = defaultdict(set)
+    for edge_record in edges:
+        if edge_record["kind"] == "CFG":
+            successors[edge_record["source"]].add(edge_record["target"])
+    reachable = {entry}
+    queue = deque([entry])
+    while queue:
+        for target in successors[queue.popleft()] - reachable:
+            reachable.add(target)
+            queue.append(target)
+    for node in nodes:
+        node["reachable"] = node["id"] in reachable
+    reachable_cfg = reachable & cfg_nodes
+    postdom = {node: set(reachable_cfg) for node in reachable_cfg}
+    postdom[exit_id] = {exit_id}
+    changed = True
+    while changed:
+        changed = False
+        for node_id in reachable_cfg - {exit_id}:
+            succ = successors[node_id] & reachable_cfg
+            new = {node_id} | (
+                set.intersection(*(postdom[target] for target in succ))
+                if succ else {exit_id}
+            )
+            if new != postdom[node_id]:
+                postdom[node_id] = new
+                changed = True
+    for node_id, succ in successors.items():
+        if node_id not in reachable_cfg:
+            continue
+        succ &= reachable_cfg
+        if len(succ) < 2:
+            continue
+        for branch in sorted(succ):
+            controlled = postdom[branch] - postdom[node_id]
+            for target in sorted(controlled):
+                if target != node_id and target != exit_id:
+                    label = next((
+                        record["label"] for record in edges
+                        if record["kind"] == "CFG"
+                        and record["source"] == node_id
+                        and record["target"] == branch
+                    ), "branch")
+                    edges.append({
+                        "source": node_id, "target": target,
+                        "kind": "CONTROL_DEP", "label": label,
+                    })
+    return reachable
+
+
+def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
+    """Build a deterministic CFG/data-dependence graph for one observed function."""
+    try:
+        tree = ast.parse(source, filename=path)
+    except SyntaxError as exc:
+        raise FlowQueryError(f"invalid source {path}:{exc.lineno}: {exc.msg}") from exc
+    fn = _find_function(tree, qualname, path)
+    structured_depth, deepest_structured = _structured_cleanup_depth(fn.body)
+    _validate_function(fn, path)
     nodes, edges, diagnostics = [], [], []
 
     def add(kind, node=None, text="", defs=(), uses=(), synthetic=False):
@@ -1120,58 +1178,7 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             edge(tail, exit_id, "CFG", "exit")
     # Postdominators identify control dependence, including a false guard that
     # continues after an early return in the true arm.
-    cfg_nodes = {n["id"] for n in nodes}
-    successors = defaultdict(set)
-    for e in edges:
-        if e["kind"] == "CFG":
-            successors[e["source"]].add(e["target"])
-    reachable = {entry}
-    queue = deque([entry])
-    while queue:
-        for target in successors[queue.popleft()] - reachable:
-            reachable.add(target)
-            queue.append(target)
-    for n in nodes:
-        n["reachable"] = n["id"] in reachable
-    reachable_cfg = reachable & cfg_nodes
-    postdom = {n: set(reachable_cfg) for n in reachable_cfg}
-    postdom[exit_id] = {exit_id}
-    changed = True
-    while changed:
-        changed = False
-        for nid in reachable_cfg - {exit_id}:
-            succ = successors[nid] & reachable_cfg
-            new = {nid} | (
-                set.intersection(*(postdom[s] for s in succ)) if succ else {exit_id}
-            )
-            if new != postdom[nid]:
-                postdom[nid] = new
-                changed = True
-    for nid, succ in successors.items():
-        if nid not in reachable_cfg:
-            continue
-        succ &= reachable_cfg
-        if len(succ) < 2:
-            continue
-        for branch in sorted(succ):
-            controlled = postdom[branch] - postdom[nid]
-            for target in sorted(controlled):
-                if target != nid and target != exit_id:
-                    edge(
-                        nid,
-                        target,
-                        "CONTROL_DEP",
-                        next(
-                            (
-                                e["label"]
-                                for e in edges
-                                if e["kind"] == "CFG"
-                                and e["source"] == nid
-                                and e["target"] == branch
-                            ),
-                            "branch",
-                        ),
-                    )
+    reachable = _mark_reachability_and_control(nodes, edges, entry, exit_id)
     # Reaching definitions fixed point over CFG, preserving distinct parameters.
     byid = {n["id"]: n for n in nodes}
     gen = {n["id"]: {(n["id"], name) for name in n["defs"] if n["kind"] != "exception_name_delete"} for n in nodes}
