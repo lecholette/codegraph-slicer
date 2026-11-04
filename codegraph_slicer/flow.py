@@ -570,616 +570,13 @@ def _mark_reachability_and_control(nodes, edges, entry, exit_id):
     return reachable
 
 
-def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
-    """Build a deterministic CFG/data-dependence graph for one observed function."""
-    try:
-        tree = ast.parse(source, filename=path)
-    except SyntaxError as exc:
-        raise FlowQueryError(f"invalid source {path}:{exc.lineno}: {exc.msg}") from exc
-    fn = _find_function(tree, qualname, path)
-    structured_depth, deepest_structured = _structured_cleanup_depth(fn.body)
-    _validate_function(fn, path)
-    nodes, edges, diagnostics = [], [], []
 
-    def add(kind, node=None, text="", defs=(), uses=(), synthetic=False):
-        line, end = _span(node) if node is not None else (fn.lineno, fn.lineno)
-        ident = f"n{len(nodes):04d}"
-        nodes.append(
-            {
-                "id": ident,
-                "kind": kind,
-                "line": line,
-                "end_line": end,
-                "text": text
-                or (
-                    ast.get_source_segment(source, node) or ""
-                    if node is not None
-                    else ""
-                ),
-                "defs": sorted(set(defs)),
-                "uses": sorted(set(uses)),
-                "mutation_targets": [],
-                "reachable": True,
-                "synthetic": synthetic,
-            }
-        )
-        return ident
+def _append_flow_edge(edges, a, b, kind, label=""):
+    if a and b:
+        edges.append({"source": a, "target": b, "kind": kind, "label": label})
 
-    def edge(a, b, k, label=""):
-        if a and b:
-            edges.append({"source": a, "target": b, "kind": k, "label": label})
 
-    entry = add("entry", synthetic=True)
-    exit_id = add("exit", synthetic=True)
-    param_tail = entry
-    arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
-    arguments += [arg for arg in (fn.args.vararg, fn.args.kwarg) if arg is not None]
-    for arg in arguments:
-        nid = add("parameter", arg, arg.arg, (arg.arg,))
-        edge(entry, nid, "AST", "parameter")
-        edge(param_tail, nid, "CFG", "parameter")
-        param_tail = nid
-    # Each source statement gets a node; predicates use only their header span.
-    stmt_id = {}
-    with_parts = {}
-    try_parts = {}
-    inline_after = {}
-    inline_before = {}
-    weak_definitions = {}
-    exception_origins = {}
-    active_exception_handler = []
-    has_exception_binding = any(
-        isinstance(node, ast.ExceptHandler) and node.name for node in ast.walk(fn)
-    )
-
-    def remember_inline(nid, expression, before=()):
-        after, earlier = _inline_name_flow(expression)
-        inline_after[nid] = after
-        inline_before[nid] = earlier | set(before)
-
-    def collect(stmts):
-        for st in stmts:
-            if isinstance(st, (ast.Try, ast.TryStar)):
-                handlers = []
-                for handler in st.handlers:
-                    handler_node = add(
-                        "except_handler", handler,
-                        "except " + (ast.unparse(handler.type) if handler.type else "BaseException"),
-                        defs=set([handler.name] if handler.name else ()) | _target_names(handler.type),
-                        uses=_names(handler.type) | _paths(handler.type),
-                    )
-                    if handler.type is not None:
-                        remember_inline(handler_node, handler.type)
-                        unmatched_node = add(
-                            "except_type_unmatched", handler,
-                            "unmatched " + ast.unparse(handler.type),
-                            defs=_target_names(handler.type),
-                            uses=_names(handler.type) | _paths(handler.type),
-                            synthetic=True,
-                        )
-                        remember_inline(unmatched_node, handler.type)
-                    else:
-                        unmatched_node = None
-                    delete = bool(handler.name)
-                    handlers.append((handler, handler_node, delete, unmatched_node))
-                nid = add("trystar" if isinstance(st, ast.TryStar) else "try", st, text="try*" if isinstance(st, ast.TryStar) else "try")
-                stmt_id[st] = nid
-                try_parts[st] = handlers
-                collect(st.body)
-                for handler, _, _, _ in handlers:
-                    collect(handler.body)
-                collect(st.orelse)
-                collect(st.finalbody)
-                continue
-            if isinstance(st, (ast.With, ast.AsyncWith)):
-                parts = []
-                for item in st.items:
-                    manager = add(
-                        "with_enter", item.context_expr,
-                        ast.get_source_segment(source, item.context_expr) or "context manager",
-                        defs=_target_names(item.context_expr),
-                        uses=_names(item.context_expr) | _paths(item.context_expr),
-                        synthetic=True,
-                    )
-                    remember_inline(manager, item.context_expr)
-                    bind = None
-                    if item.optional_vars is not None:
-                        bind = add(
-                            "with_binding", item.optional_vars,
-                            f"bind {ast.unparse(item.optional_vars)}",
-                            defs=_target_names(item.optional_vars) | _access_targets(item.optional_vars),
-                            uses=_names(item.optional_vars) | _paths(item.optional_vars), synthetic=True,
-                        )
-                        weak_definitions[bind] = _dynamic_access_targets(item.optional_vars)
-                        remember_inline(bind, _target_events(item.optional_vars))
-                        edge(manager, bind, "DATA_DEP", "context-value")
-                    parts.append((manager, bind))
-                header = "async with " if isinstance(st, ast.AsyncWith) else "with "
-                header += ", ".join(
-                    ast.unparse(item.context_expr)
-                    + (f" as {ast.unparse(item.optional_vars)}" if item.optional_vars else "")
-                    for item in st.items
-                ) + ":"
-                nid = add("asyncwith" if isinstance(st, ast.AsyncWith) else "with", st, text=header,
-                          uses=())
-                stmt_id[st] = nid
-                with_parts[st] = parts
-                collect(st.body)
-                continue
-            if isinstance(st, (ast.If, ast.For, ast.While)):
-                expr = st.test if isinstance(st, (ast.If, ast.While)) else None
-                nid = add(
-                    "predicate",
-                    expr or st,
-                    (ast.get_source_segment(source, expr) or "for iteration")
-                    if expr is not None
-                    else "for iteration",
-                    _target_names(expr) | _access_targets(expr) if expr else (),
-                    _names(expr) | _paths(expr) if expr else (),
-                )
-                if expr is not None:
-                    remember_inline(nid, expr)
-                if isinstance(st, ast.For):
-                    nodes[int(nid[1:])]["line"] = st.lineno
-                    nodes[int(nid[1:])]["end_line"] = getattr(
-                        st.iter, "end_lineno", st.lineno
-                    )
-                    nodes[int(nid[1:])]["text"] = (
-                        f"for {ast.unparse(st.target)} in {ast.get_source_segment(source, st.iter)}"
-                    )
-                stmt_id[st] = nid
-                collect(st.body)
-                collect(st.orelse)
-            else:
-                d = _target_names(st) | _access_targets(st)
-                if isinstance(st, ast.AnnAssign):
-                    d = _target_names(st.target) | _access_targets(st.target)
-                    if st.value is not None:
-                        d |= _target_names(st.value)
-                    else:
-                        d = _walrus_names(st.target)
-                u = _names(st) | _paths(st)
-                if isinstance(st, ast.AnnAssign):
-                    u = (
-                        _names(st.value) | _paths(st.value)
-                        if st.value is not None
-                        else set()
-                    )
-                    u |= _names(st.target) | _paths(st.target)
-                if isinstance(st, ast.AugAssign):
-                    u |= _plain_target_names(st.target) | _access_targets(st.target)
-                nid = add(type(st).__name__.lower(), st, defs=d, uses=u)
-                stmt_id[st] = nid
-                weak_definitions[nid] = _dynamic_access_targets(st)
-                expression = (
-                    _expression_events(st.value) + [
-                        event for target in st.targets for event in _target_events(target)
-                    ]
-                    if isinstance(st, ast.Assign)
-                    else _expression_events(st.value) + _target_events(st.target)
-                    if isinstance(st, ast.AnnAssign) and st.value is not None
-                    else _target_events(st.target, read_only=True)
-                    if isinstance(st, ast.AnnAssign)
-                    else _target_events(st.target, read_only=True)
-                    + _expression_events(st.value)
-                    + _target_write_events(st.target)
-                    if isinstance(st, ast.AugAssign)
-                    else st.value
-                    if isinstance(st, (ast.Expr, ast.Return))
-                    else _ordered_expression(st.exc, st.cause)
-                    if isinstance(st, ast.Raise)
-                    else st.test
-                    if isinstance(st, ast.Assert)
-                    else None
-                )
-                remember_inline(nid, expression)
-                writes = (
-                    ast.walk(st)
-                    if not isinstance(st, ast.AnnAssign) or st.value is not None
-                    else ()
-                )
-                for sub in writes:
-                    if isinstance(sub, (ast.Attribute, ast.Subscript)) and isinstance(
-                        sub.ctx, (ast.Store, ast.Del)
-                    ):
-                        nodes[-1]["mutation_targets"].append(_mutation_label(sub))
-                        if isinstance(sub, ast.Subscript) and not isinstance(
-                            sub.slice, ast.Constant
-                        ):
-                            diagnostics.append(
-                                {
-                                    "code": "dynamic-index-write",
-                                    "node": nid,
-                                    "line": sub.lineno,
-                                    "message": "dynamic index write may overlap other access paths",
-                                }
-                            )
-
-    collect(fn.body)
-    for st in fn.body:
-        edge(entry, stmt_id[st], "AST", "body")
-    for st in ast.walk(fn):
-        if isinstance(st, ast.stmt) and not isinstance(
-            st, _SUPPORTED_STMTS + _UNSUPPORTED + (ast.AsyncFunctionDef,)
-        ):
-            raise UnsupportedFlowError(
-                f"unsupported {type(st).__name__} in {path}:{st.lineno}"
-            )
-    for st, nid in stmt_id.items():
-        if isinstance(st, ast.For):
-            continue
-        expression = st.test if isinstance(st, (ast.If, ast.While)) else st
-        if any(isinstance(child, ast.Call) for child in ast.walk(expression)):
-            diagnostics.append(
-                {
-                    "code": "opaque-call-effects",
-                    "node": nid,
-                    "line": nodes[int(nid[1:])]["line"],
-                    "message": "call effects and implicit exceptions are unknown",
-                }
-            )
-    # AST statement hierarchy edges and normal CFG, with explicit abrupt exits.
-
-    def block(stmts, incoming, follow, loop=None):
-        cur = set(incoming)
-        for index, st in enumerate(stmts):
-            n = stmt_id[st]
-            following = (
-                {stmt_id[stmts[index + 1]]} if index + 1 < len(stmts) else follow
-            )
-            for p in cur:
-                edge(p, n, "CFG", "next")
-            if isinstance(st, ast.If):
-                for child in st.body + st.orelse:
-                    edge(
-                        n,
-                        stmt_id[child],
-                        "AST",
-                        "body" if child in st.body else "orelse",
-                    )
-                if st.body:
-                    edge(n, stmt_id[st.body[0]], "CFG", "true")
-                if st.orelse:
-                    edge(n, stmt_id[st.orelse[0]], "CFG", "false")
-                left = block(st.body, {n}, following, loop)
-                right = block(st.orelse, {n}, following, loop) if st.orelse else {n}
-                if not st.orelse and following:
-                    edge(n, next(iter(following)), "CFG", "false")
-                cur = left | right
-            elif isinstance(st, (ast.For, ast.While)):
-                body_ids = [stmt_id[x] for x in st.body]
-                else_ids = [stmt_id[x] for x in st.orelse]
-                for child in st.body + st.orelse:
-                    edge(
-                        n,
-                        stmt_id[child],
-                        "AST",
-                        "body" if child in st.body else "orelse",
-                    )
-                if isinstance(st, ast.For):
-                    it = add(
-                        "iterator_init",
-                        st,
-                        ast.get_source_segment(source, st.iter) or "iterable",
-                        defs=_target_names(st.iter),
-                        synthetic=True,
-                        uses=_names(st.iter) | _paths(st.iter),
-                    )
-                    remember_inline(it, st.iter)
-                    if any(isinstance(child, ast.Call) for child in ast.walk(st.iter)):
-                        diagnostics.append(
-                            {
-                                "code": "opaque-call-effects",
-                                "node": it,
-                                "line": st.lineno,
-                                "message": "call effects and implicit exceptions are unknown",
-                            }
-                        )
-                    pred = add("iterator_test", st, "iterator test", synthetic=True)
-                    bind = add(
-                        "target_binding",
-                        st,
-                        f"bind {ast.unparse(st.target)}",
-                        synthetic=True,
-                        defs=_target_names(st.target) | _access_targets(st.target),
-                        uses=_names(st.target) | _paths(st.target),
-                    )
-                    weak_definitions[bind] = _dynamic_access_targets(st.target)
-                    remember_inline(bind, _target_events(st.target))
-                    for machinery in (it, pred, bind):
-                        nodes[int(machinery[1:])]["line"] = st.lineno
-                        nodes[int(machinery[1:])]["end_line"] = getattr(
-                            st.iter, "end_lineno", st.lineno
-                        )
-                    edge(n, it, "AST", "iterator-init")
-                    edge(n, pred, "AST", "iterator-test")
-                    edge(n, bind, "AST", "target-binding")
-                    edge(it, bind, "DATA_DEP", "iterator-value")
-                    edge(n, it, "CFG", "evaluate-iterable")
-                    edge(it, pred, "CFG", "initialize")
-                    edge(pred, bind, "CFG", "iterate")
-                    if not body_ids:
-                        edge(bind, pred, "CFG", "empty-iteration")
-                    edge(
-                        pred,
-                        next(iter(else_ids), next(iter(following), exit_id)),
-                        "CFG",
-                        "zero-or-done",
-                    )
-                    start = bind
-                else:
-                    pred = n
-                    edge(n, next(iter(body_ids), pred), "CFG", "true")
-                    edge(
-                        n,
-                        next(iter(else_ids), next(iter(following), exit_id)),
-                        "CFG",
-                        "false",
-                    )
-                    start = n
-                after = next(iter(following), exit_id)
-                child_loop = (after, pred)
-                inner = block(st.body, {start}, {pred}, child_loop)
-                for x in inner:
-                    edge(x, pred, "CFG", "backedge")
-                tail = block(st.orelse, {pred}, following, loop) if st.orelse else set()
-                cur = set(tail)
-            elif isinstance(st, ast.Break):
-                if loop:
-                    edge(n, loop[0], "CFG", "break")
-                cur = set()
-            elif isinstance(st, ast.Continue):
-                if loop:
-                    edge(n, loop[1], "CFG", "continue")
-                cur = set()
-            elif isinstance(st, (ast.Return, ast.Raise)):
-                edge(n, exit_id, "CFG", "abrupt-exit")
-                cur = set()
-            elif isinstance(st, ast.Assert):
-                edge(n, exit_id, "CFG", "assert-failure")
-                cur = {n}
-            else:
-                cur = {n}
-        return cur
-
-    def structured_block(stmts, incoming):
-        """Return disjoint pending completions; cleanup cannot merge their tails."""
-        result = defaultdict(set)
-        cur = set(incoming)
-        for st in stmts:
-            n = stmt_id[st]
-            pre = add("exception_point", st, "before " + type(st).__name__, synthetic=True)
-            for tail in cur:
-                edge(tail, pre, "CFG", "next")
-            edge(pre, n, "CFG", "complete")
-            pending = defaultdict(set)
-            for field in ("body", "orelse", "finalbody"):
-                for child in getattr(st, field, ()):
-                    edge(n, stmt_id[child], "AST", field)
-            for handler, hn, deletion, unmatched in try_parts.get(st, ()):
-                edge(n, hn, "AST", "handler")
-                if unmatched:
-                    edge(n, unmatched, "AST", "handler-type-unmatched")
-                for child in handler.body:
-                    edge(hn, stmt_id[child], "AST", "body")
-            pending["raise"].update((pre, n))
-            if isinstance(st, ast.If):
-                for label, suite in (("true", st.body), ("false", st.orelse)):
-                    start = add("branch", st, label, synthetic=True)
-                    edge(n, start, "CFG", label)
-                    for key, tails in structured_block(suite, {start}).items():
-                        pending[key].update(tails)
-            elif isinstance(st, (ast.For, ast.While)):
-                pred = n
-                if isinstance(st, ast.For):
-                    init = add("iterator_init", st, ast.get_source_segment(source, st.iter) or "iterable", defs=_target_names(st.iter), uses=_names(st.iter) | _paths(st.iter), synthetic=True)
-                    remember_inline(init, st.iter)
-                    pred = add("iterator_test", st, "iterator test", synthetic=True)
-                    bind = add("target_binding", st, f"bind {ast.unparse(st.target)}", defs=_target_names(st.target) | _access_targets(st.target), uses=_names(st.target) | _paths(st.target), synthetic=True)
-                    weak_definitions[bind] = _dynamic_access_targets(st.target)
-                    remember_inline(bind, _target_events(st.target))
-                    edge(n, init, "CFG", "evaluate-iterable")
-                    edge(init, pred, "CFG", "initialize")
-                    edge(init, bind, "DATA_DEP", "iterator-value")
-                    edge(pred, bind, "CFG", "iterate")
-                    pending["raise"].update((init, pred, bind))
-                    start = bind
-                else:
-                    start = add("branch", st, "true", synthetic=True)
-                    edge(n, start, "CFG", "true")
-                inner = structured_block(st.body, {start})
-                for tail in inner.pop("normal", set()) | inner.pop("continue", set()):
-                    edge(tail, pred, "CFG", "backedge")
-                broken = inner.pop("break", set())
-                for key, tails in inner.items():
-                    pending[key].update(tails)
-                exhausted = add("branch", st, "loop exhausted", synthetic=True)
-                edge(pred, exhausted, "CFG", "zero-or-done")
-                for key, tails in structured_block(st.orelse, {exhausted}).items():
-                    pending[key].update(tails)
-                pending["normal"].update(broken)
-            elif isinstance(st, (ast.Try, ast.TryStar)):
-                body = structured_block(st.body, {n})
-                exceptional = body.pop("raise", set())
-                normal = body.pop("normal", set())
-                for key, tails in body.items():
-                    pending[key].update(tails)
-                # The header itself cannot raise; protected-body exceptions do.
-                pending["raise"].clear()
-                for key, tails in structured_block(st.orelse, normal).items():
-                    pending[key].update(tails)
-                handlers = try_parts[st]
-                star_previous = set()
-                prior_unmatched = None
-                for handler, hn, delete, unmatched in handlers:
-                    if prior_unmatched is not None:
-                        edge(prior_unmatched, hn, "CFG", "exception-unmatched")
-                        if unmatched is not None:
-                            edge(prior_unmatched, unmatched, "CFG", "exception-unmatched")
-                    if prior_unmatched is None:
-                        for tail in exceptional:
-                            label = "exception-before-statement" if nodes[int(tail[1:])]["kind"] == "exception_point" else "exception-after-statement"
-                            edge(tail, hn, "CFG", label)
-                            if unmatched is not None:
-                                edge(tail, unmatched, "CFG", label)
-                    for tail in exceptional:
-                        for origin in exception_origins.get(tail, ()):
-                            if handler.name:
-                                edge(origin, hn, "DATA_DEP", "exception-value")
-                    if isinstance(st, ast.TryStar):
-                        for tail in star_previous:
-                            edge(tail, hn, "CFG", "except-star-next")
-                            if unmatched is not None:
-                                edge(tail, unmatched, "CFG", "except-star-next")
-                    handler_origins = (
-                        {hn} if handler.name else set().union(
-                            *(exception_origins.get(tail, set()) for tail in exceptional)
-                        )
-                    )
-                    active_exception_handler.append(
-                        (handler_origins, handler.name or "exception")
-                    )
-                    handled = structured_block(handler.body, {hn})
-                    active_exception_handler.pop()
-                    if delete:
-                        handled = cleanup_delete(handled, handler)
-                    if isinstance(st, ast.TryStar):
-                        if handler.type is not None and _target_names(handler.type):
-                            # Route older matched subsets through this type test
-                            # before they can reach later handlers, so its
-                            # walrus definitions cannot be bypassed.
-                            star_previous.clear()
-                        star_previous.update(set().union(*handled.values()))
-                    for key, tails in handled.items():
-                        pending[key].update(tails)
-                    prior_unmatched = unmatched
-                    if unmatched is not None:
-                        # Type lookup and exception matching happen after any
-                        # walrus stores and can themselves raise outward.
-                        pending["raise"].add(unmatched)
-                if not any(handler.type is None for handler, _, _, _ in handlers):
-                    pending["raise"].update(exceptional)
-                if st.finalbody:
-                    pending = cleanup_finally(pending, st.finalbody)
-            elif isinstance(st, (ast.With, ast.AsyncWith)):
-                pending.clear()
-                # Acquiring manager i fails before it becomes an active cleanup.
-                def acquire(index, starts, st=st):
-                    if index == len(st.items):
-                        return structured_block(st.body, starts)
-                    manager, bind = with_parts[st][index]
-                    evaluation = add("exception_point", st.items[index].context_expr, f"before manager {index + 1}", synthetic=True)
-                    for tail in starts:
-                        edge(tail, evaluation, "CFG", "evaluate-manager")
-                    edge(evaluation, manager, "CFG", "complete")
-                    acquired = {manager}
-                    binding_failure = set()
-                    if bind:
-                        edge(manager, bind, "CFG", "bind-target")
-                        binding_failure.update((manager, bind))
-                        acquired = {bind}
-                    inside = acquire(index + 1, acquired)
-                    inside["raise"].update(binding_failure)
-                    cleaned = defaultdict(set)
-                    for key, tails in inside.items():
-                        if not tails:
-                            continue
-                        leave = add("with_exit", st.items[index].context_expr, f"exit manager {index + 1} ({key})", synthetic=True)
-                        for tail in tails:
-                            edge(tail, leave, "CFG", "enter-body" if tail == bind else "context-" + key)
-                        cleaned[key].add(leave)
-                        cleaned["raise"].add(leave)
-                        if key == "raise":
-                            suppressed = add("with_suppressed", st, "suppressed exception", synthetic=True)
-                            edge(leave, suppressed, "CFG", "suppressed-exit")
-                            cleaned["normal"].add(suppressed)
-                    # __enter__ failure does not call this manager's __exit__.
-                    cleaned["raise"].update((evaluation, manager))
-                    return cleaned
-                pending = acquire(0, {n})
-            elif isinstance(st, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
-                pending[type(st).__name__.lower()].add(n)
-                if isinstance(st, ast.Raise):
-                    if st.exc is not None:
-                        exception_origins[n] = {n}
-                    elif active_exception_handler:
-                        origins, label = active_exception_handler[-1]
-                        if has_exception_binding:
-                            for origin in origins:
-                                edge(origin, n, "DATA_DEP", label)
-                        exception_origins[n] = {n}
-            else:
-                pending["normal"].add(n)
-            cur = pending.pop("normal", set())
-            for key, tails in pending.items():
-                result[key].update(tails)
-        result["normal"].update(cur)
-        return result
-
-    def cleanup_delete(pending, handler):
-        cleaned = defaultdict(set)
-        for key, tails in pending.items():
-            if tails:
-                deletion = add("exception_name_delete", handler, f"delete {handler.name}", defs=[handler.name], synthetic=True)
-                for tail in tails:
-                    edge(tail, deletion, "CFG", "implicit-delete")
-                    if tail in exception_origins:
-                        exception_origins.setdefault(deletion, set()).update(exception_origins[tail])
-                cleaned[key].add(deletion)
-        return cleaned
-
-    def cleanup_finally(pending, suite):
-        cleaned = defaultdict(set)
-        first = True
-        for key, tails in list(pending.items()):
-            if not tails:
-                continue
-            saved = (stmt_id.copy(), with_parts.copy(), try_parts.copy())
-            if not first:
-                collect(suite)
-            first = False
-            bridge = add("finally_entry", suite[0], "finally " + key, synthetic=True)
-            for tail in tails:
-                edge(tail, bridge, "CFG", "finally-" + key)
-                if tail in exception_origins:
-                    exception_origins.setdefault(bridge, set()).update(exception_origins[tail])
-            pushes_exception_context = key == "raise"
-            if pushes_exception_context:
-                active_exception_handler.append(
-                    (set(exception_origins.get(bridge, ())), "exception")
-                )
-            final = structured_block(suite, {bridge})
-            if pushes_exception_context:
-                active_exception_handler.pop()
-            normal_tails = final.pop("normal", set())
-            cleaned[key].update(normal_tails)
-            if bridge in exception_origins:
-                for tail in normal_tails:
-                    exception_origins.setdefault(tail, set()).update(exception_origins[bridge])
-            for override, endings in final.items():
-                cleaned[override].update(endings)
-            stmt_id.clear()
-            stmt_id.update(saved[0])
-            with_parts.clear()
-            with_parts.update(saved[1])
-            try_parts.clear()
-            try_parts.update(saved[2])
-        return cleaned
-
-    structured = any(isinstance(st, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)) for st in ast.walk(fn))
-    if structured:
-        completions = structured_block(fn.body, {param_tail})
-        for key, tails in completions.items():
-            for tail in tails:
-                edge(tail, exit_id, "CFG", "exit" if key == "normal" else key + "-exit")
-    else:
-        tails = block(fn.body, {param_tail}, {exit_id})
-        for tail in tails:
-            edge(tail, exit_id, "CFG", "exit")
-    # Postdominators identify control dependence, including a false guard that
-    # continues after an early return in the true arm.
-    reachable = _mark_reachability_and_control(nodes, edges, entry, exit_id)
-    # Reaching definitions fixed point over CFG, preserving distinct parameters.
+def _compute_reaching_definitions(nodes, edges, weak_definitions):
     byid = {n["id"]: n for n in nodes}
     gen = {n["id"]: {(n["id"], name) for name in n["defs"] if n["kind"] != "exception_name_delete"} for n in nodes}
     in_defs = {n["id"]: set() for n in nodes}
@@ -1190,39 +587,24 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
         for n in nodes:
             nid = n["id"]
             newin = (
-                set().union(
-                    *(
-                        out_defs[e["source"]]
-                        for e in edges
-                        if e["kind"] == "CFG"
-                        and e["target"] == nid
-                        and byid[e["source"]]["reachable"]
-                    )
-                )
-                if n["reachable"]
-                else set()
+                set().union(*(out_defs[e["source"]] for e in edges if e["kind"] == "CFG" and e["target"] == nid and byid[e["source"]]["reachable"]))
+                if n["reachable"] else set()
             )
-            kills = {
-                item
-                for item in newin
-                if _killed_by_rebinding(
-                    item[1], n["defs"], weak_definitions.get(nid, set())
-                )
-            }
+            kills = {item for item in newin if _killed_by_rebinding(item[1], n["defs"], weak_definitions.get(nid, set()))}
             newout = (newin - kills) | gen[nid]
             if newin != in_defs[nid] or newout != out_defs[nid]:
                 in_defs[nid] = newin
                 out_defs[nid] = newout
                 changed = True
-    params = {a.arg for a in arguments}
-    locals_ = set(params)
-    for stmt in fn.body:
-        locals_.update(_target_names(stmt))
-    locals_.update(handler.name for handler in ast.walk(fn) if isinstance(handler, ast.ExceptHandler) and handler.name)
+    return byid, in_defs
+
+
+def _compute_must_definitions(nodes, edges, entry, reachable, locals_):
     must_in = {n["id"]: set(locals_) for n in nodes}
     must_out = {n["id"]: set(locals_) for n in nodes}
     must_in[entry] = set()
     must_out[entry] = set()
+    byid = {n["id"]: n for n in nodes}
     changed = True
     while changed:
         changed = False
@@ -1230,28 +612,19 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             nid = n["id"]
             if nid not in reachable:
                 continue
-            preds = [
-                e["source"]
-                for e in edges
-                if e["kind"] == "CFG"
-                and e["target"] == nid
-                and byid[e["source"]]["reachable"]
-            ]
+            preds = [e["source"] for e in edges if e["kind"] == "CFG" and e["target"] == nid and byid[e["source"]]["reachable"]]
             newin = set.intersection(*(must_out[p] for p in preds)) if preds else set()
             newout = (newin - set(n["defs"])) if n["kind"] == "exception_name_delete" else newin | set(n["defs"])
             if newin != must_in[nid] or newout != must_out[nid]:
                 must_in[nid] = newin
                 must_out[nid] = newout
                 changed = True
+    return must_in
+
+
+def _emit_dataflow_edges(nodes, edges, diagnostics, inline_after, inline_before, locals_, in_defs, must_in):
     for n in nodes:
-        if not n["reachable"]:
-            continue
-        if n["kind"] in (
-            "entry",
-            "exit",
-            "parameter",
-            "iterator_test",
-        ):
+        if not n["reachable"] or n["kind"] in ("entry", "exit", "parameter", "iterator_test"):
             continue
         for name in n["uses"]:
             found = sorted(d for d, defined in in_defs[n["id"]] if name == defined)
@@ -1259,69 +632,796 @@ def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
             inline_before_use = name in inline_before.get(n["id"], set())
             if found and not (inline_after_use and not inline_before_use):
                 for d in found:
-                    edge(d, n["id"], "DATA_DEP", name)
-            if (
-                name in locals_
-                and name not in must_in[n["id"]]
-                and not (inline_after_use and not inline_before_use)
-            ):
-                diagnostics.append(
-                    {
-                        "code": "possibly-unbound-local",
-                        "node": n["id"],
-                        "line": n["line"],
-                        "message": f"local {name!r} may have no reaching definition",
-                    }
-                )
+                    _append_flow_edge(edges, d, n["id"], "DATA_DEP", name)
+            if name in locals_ and name not in must_in[n["id"]] and not (inline_after_use and not inline_before_use):
+                diagnostics.append({"code": "possibly-unbound-local", "node": n["id"], "line": n["line"], "message": f"local {name!r} may have no reaching definition"})
             if inline_after_use:
-                edge(n["id"], n["id"], "DATA_DEP", name)
-            elif (
-                name not in locals_ or "." in name or name.endswith("[*]")
-            ) and not found:
+                _append_flow_edge(edges, n["id"], n["id"], "DATA_DEP", name)
+            elif (name not in locals_ or "." in name or name.endswith("[*]")) and not found:
+                diagnostics.append({"code": "unknown-live-in", "node": n["id"], "line": n["line"], "message": f"{name!r} has no observed local definition; provenance is live-in/unknown"})
+
+
+def _resolve_reaching_definitions(nodes, edges, diagnostics, fn, arguments, entry, reachable, inline_after, inline_before, weak_definitions):
+    params = {a.arg for a in arguments}
+    locals_ = set(params)
+    for stmt in fn.body:
+        locals_.update(_target_names(stmt))
+    locals_.update(handler.name for handler in ast.walk(fn) if isinstance(handler, ast.ExceptHandler) and handler.name)
+    byid, in_defs = _compute_reaching_definitions(nodes, edges, weak_definitions)
+    must_in = _compute_must_definitions(nodes, edges, entry, reachable, locals_)
+    _emit_dataflow_edges(nodes, edges, diagnostics, inline_after, inline_before, locals_, in_defs, must_in)
+
+
+def analyze_flow(source: str, qualname: str, *, path: str) -> dict:
+    """Build a deterministic CFG/data-dependence graph for one observed function."""
+    return _FlowBuilder(source, qualname, path).build()
+
+
+class _FlowBuilder:
+    """Mutable private state for constructing one function's flow graph."""
+
+    def __init__(self, source: str, qualname: str, path: str):
+        self.source, self.qualname, self.path = source, qualname, path
+
+    def add(self, kind, node=None, text="", defs=(), uses=(), synthetic=False):
+        line, end = _span(node) if node is not None else (self.fn.lineno, self.fn.lineno)
+        ident = f"n{len(self.nodes):04d}"
+        self.nodes.append({
+            "id": ident, "kind": kind, "line": line, "end_line": end,
+            "text": text or (ast.get_source_segment(self.source, node) or "" if node is not None else ""),
+            "defs": sorted(set(defs)), "uses": sorted(set(uses)),
+            "mutation_targets": [], "reachable": True, "synthetic": synthetic,
+        })
+        return ident
+
+    def edge(self, a, b, kind, label=""):
+        if a and b:
+            self.edges.append({"source": a, "target": b, "kind": kind, "label": label})
+
+    def remember_inline(self, nid, expression, before=()):
+        after, earlier = _inline_name_flow(expression)
+        self.inline_after[nid] = after
+        self.inline_before[nid] = earlier | set(before)
+
+    def _collect_try(self, st):
+        handlers = []
+        for handler in st.handlers:
+            handler_node = self.add(
+                "except_handler", handler,
+                "except " + (ast.unparse(handler.type) if handler.type else "BaseException"),
+                defs=set([handler.name] if handler.name else ()) | _target_names(handler.type),
+                uses=_names(handler.type) | _paths(handler.type),
+            )
+            if handler.type is not None:
+                self.remember_inline(handler_node, handler.type)
+                unmatched_node = self.add(
+                    "except_type_unmatched", handler,
+                    "unmatched " + ast.unparse(handler.type),
+                    defs=_target_names(handler.type),
+                    uses=_names(handler.type) | _paths(handler.type),
+                    synthetic=True,
+                )
+                self.remember_inline(unmatched_node, handler.type)
+            else:
+                unmatched_node = None
+            delete = bool(handler.name)
+            handlers.append((handler, handler_node, delete, unmatched_node))
+        nid = self.add("trystar" if isinstance(st, ast.TryStar) else "try", st, text="try*" if isinstance(st, ast.TryStar) else "try")
+        self.stmt_id[st] = nid
+        self.try_parts[st] = handlers
+        self.collect(st.body)
+        for handler, _, _, _ in handlers:
+            self.collect(handler.body)
+        self.collect(st.orelse)
+        self.collect(st.finalbody)
+
+    def _collect_with(self, st):
+        parts = []
+        for item in st.items:
+            manager = self.add(
+                "with_enter", item.context_expr,
+                ast.get_source_segment(self.source, item.context_expr) or "context manager",
+                defs=_target_names(item.context_expr),
+                uses=_names(item.context_expr) | _paths(item.context_expr),
+                synthetic=True,
+            )
+            self.remember_inline(manager, item.context_expr)
+            bind = None
+            if item.optional_vars is not None:
+                bind = self.add(
+                    "with_binding", item.optional_vars,
+                    f"bind {ast.unparse(item.optional_vars)}",
+                    defs=_target_names(item.optional_vars) | _access_targets(item.optional_vars),
+                    uses=_names(item.optional_vars) | _paths(item.optional_vars), synthetic=True,
+                )
+                self.weak_definitions[bind] = _dynamic_access_targets(item.optional_vars)
+                self.remember_inline(bind, _target_events(item.optional_vars))
+                self.edge(manager, bind, "DATA_DEP", "context-value")
+            parts.append((manager, bind))
+        header = "async with " if isinstance(st, ast.AsyncWith) else "with "
+        header += ", ".join(
+            ast.unparse(item.context_expr)
+            + (f" as {ast.unparse(item.optional_vars)}" if item.optional_vars else "")
+            for item in st.items
+        ) + ":"
+        nid = self.add("asyncwith" if isinstance(st, ast.AsyncWith) else "with", st, text=header,
+                  uses=())
+        self.stmt_id[st] = nid
+        self.with_parts[st] = parts
+        self.collect(st.body)
+
+    def _collect_predicate(self, st):
+        expr = st.test if isinstance(st, (ast.If, ast.While)) else None
+        nid = self.add(
+            "predicate",
+            expr or st,
+            (ast.get_source_segment(self.source, expr) or "for iteration")
+            if expr is not None
+            else "for iteration",
+            _target_names(expr) | _access_targets(expr) if expr else (),
+            _names(expr) | _paths(expr) if expr else (),
+        )
+        if expr is not None:
+            self.remember_inline(nid, expr)
+        if isinstance(st, ast.For):
+            self.nodes[int(nid[1:])]["line"] = st.lineno
+            self.nodes[int(nid[1:])]["end_line"] = getattr(
+                st.iter, "end_lineno", st.lineno
+            )
+            self.nodes[int(nid[1:])]["text"] = (
+                f"for {ast.unparse(st.target)} in {ast.get_source_segment(self.source, st.iter)}"
+            )
+        self.stmt_id[st] = nid
+        self.collect(st.body)
+        self.collect(st.orelse)
+
+    def _collect_simple(self, st):
+        d = _target_names(st) | _access_targets(st)
+        if isinstance(st, ast.AnnAssign):
+            d = _target_names(st.target) | _access_targets(st.target)
+            if st.value is not None:
+                d |= _target_names(st.value)
+            else:
+                d = _walrus_names(st.target)
+        u = _names(st) | _paths(st)
+        if isinstance(st, ast.AnnAssign):
+            u = (
+                _names(st.value) | _paths(st.value)
+                if st.value is not None
+                else set()
+            )
+            u |= _names(st.target) | _paths(st.target)
+        if isinstance(st, ast.AugAssign):
+            u |= _plain_target_names(st.target) | _access_targets(st.target)
+        nid = self.add(type(st).__name__.lower(), st, defs=d, uses=u)
+        self.stmt_id[st] = nid
+        self.weak_definitions[nid] = _dynamic_access_targets(st)
+        expression = (
+            _expression_events(st.value) + [
+                event for target in st.targets for event in _target_events(target)
+            ]
+            if isinstance(st, ast.Assign)
+            else _expression_events(st.value) + _target_events(st.target)
+            if isinstance(st, ast.AnnAssign) and st.value is not None
+            else _target_events(st.target, read_only=True)
+            if isinstance(st, ast.AnnAssign)
+            else _target_events(st.target, read_only=True)
+            + _expression_events(st.value)
+            + _target_write_events(st.target)
+            if isinstance(st, ast.AugAssign)
+            else st.value
+            if isinstance(st, (ast.Expr, ast.Return))
+            else _ordered_expression(st.exc, st.cause)
+            if isinstance(st, ast.Raise)
+            else st.test
+            if isinstance(st, ast.Assert)
+            else None
+        )
+        self.remember_inline(nid, expression)
+        writes = (
+            ast.walk(st)
+            if not isinstance(st, ast.AnnAssign) or st.value is not None
+            else ()
+        )
+        for sub in writes:
+            if isinstance(sub, (ast.Attribute, ast.Subscript)) and isinstance(
+                sub.ctx, (ast.Store, ast.Del)
+            ):
+                self.nodes[-1]["mutation_targets"].append(_mutation_label(sub))
+                if isinstance(sub, ast.Subscript) and not isinstance(
+                    sub.slice, ast.Constant
+                ):
+                    self.diagnostics.append(
+                        {
+                            "code": "dynamic-index-write",
+                            "node": nid,
+                            "line": sub.lineno,
+                            "message": "dynamic index write may overlap other access paths",
+                        }
+                    )
+
+    def collect(self, stmts):
+        for st in stmts:
+            if isinstance(st, (ast.Try, ast.TryStar)):
+                self._collect_try(st)
+            elif isinstance(st, (ast.With, ast.AsyncWith)):
+                self._collect_with(st)
+            elif isinstance(st, (ast.If, ast.For, ast.While)):
+                self._collect_predicate(st)
+            else:
+                self._collect_simple(st)
+
+
+    def block(self, stmts, incoming, follow, loop=None):
+        cur = set(incoming)
+        for index, st in enumerate(stmts):
+            n = self.stmt_id[st]
+            following = (
+                {self.stmt_id[stmts[index + 1]]} if index + 1 < len(stmts) else follow
+            )
+            for p in cur:
+                self.edge(p, n, "CFG", "next")
+            if isinstance(st, ast.If):
+                for child in st.body + st.orelse:
+                    self.edge(
+                        n,
+                        self.stmt_id[child],
+                        "AST",
+                        "body" if child in st.body else "orelse",
+                    )
+                if st.body:
+                    self.edge(n, self.stmt_id[st.body[0]], "CFG", "true")
+                if st.orelse:
+                    self.edge(n, self.stmt_id[st.orelse[0]], "CFG", "false")
+                left = self.block(st.body, {n}, following, loop)
+                right = self.block(st.orelse, {n}, following, loop) if st.orelse else {n}
+                if not st.orelse and following:
+                    self.edge(n, next(iter(following)), "CFG", "false")
+                cur = left | right
+            elif isinstance(st, (ast.For, ast.While)):
+                body_ids = [self.stmt_id[x] for x in st.body]
+                else_ids = [self.stmt_id[x] for x in st.orelse]
+                for child in st.body + st.orelse:
+                    self.edge(
+                        n,
+                        self.stmt_id[child],
+                        "AST",
+                        "body" if child in st.body else "orelse",
+                    )
+                if isinstance(st, ast.For):
+                    it = self.add(
+                        "iterator_init",
+                        st,
+                        ast.get_source_segment(self.source, st.iter) or "iterable",
+                        defs=_target_names(st.iter),
+                        synthetic=True,
+                        uses=_names(st.iter) | _paths(st.iter),
+                    )
+                    self.remember_inline(it, st.iter)
+                    if any(isinstance(child, ast.Call) for child in ast.walk(st.iter)):
+                        self.diagnostics.append(
+                            {
+                                "code": "opaque-call-effects",
+                                "node": it,
+                                "line": st.lineno,
+                                "message": "call effects and implicit exceptions are unknown",
+                            }
+                        )
+                    pred = self.add("iterator_test", st, "iterator test", synthetic=True)
+                    bind = self.add(
+                        "target_binding",
+                        st,
+                        f"bind {ast.unparse(st.target)}",
+                        synthetic=True,
+                        defs=_target_names(st.target) | _access_targets(st.target),
+                        uses=_names(st.target) | _paths(st.target),
+                    )
+                    self.weak_definitions[bind] = _dynamic_access_targets(st.target)
+                    self.remember_inline(bind, _target_events(st.target))
+                    for machinery in (it, pred, bind):
+                        self.nodes[int(machinery[1:])]["line"] = st.lineno
+                        self.nodes[int(machinery[1:])]["end_line"] = getattr(
+                            st.iter, "end_lineno", st.lineno
+                        )
+                    self.edge(n, it, "AST", "iterator-init")
+                    self.edge(n, pred, "AST", "iterator-test")
+                    self.edge(n, bind, "AST", "target-binding")
+                    self.edge(it, bind, "DATA_DEP", "iterator-value")
+                    self.edge(n, it, "CFG", "evaluate-iterable")
+                    self.edge(it, pred, "CFG", "initialize")
+                    self.edge(pred, bind, "CFG", "iterate")
+                    if not body_ids:
+                        self.edge(bind, pred, "CFG", "empty-iteration")
+                    self.edge(
+                        pred,
+                        next(iter(else_ids), next(iter(following), self.exit_id)),
+                        "CFG",
+                        "zero-or-done",
+                    )
+                    start = bind
+                else:
+                    pred = n
+                    self.edge(n, next(iter(body_ids), pred), "CFG", "true")
+                    self.edge(
+                        n,
+                        next(iter(else_ids), next(iter(following), self.exit_id)),
+                        "CFG",
+                        "false",
+                    )
+                    start = n
+                after = next(iter(following), self.exit_id)
+                child_loop = (after, pred)
+                inner = self.block(st.body, {start}, {pred}, child_loop)
+                for x in inner:
+                    self.edge(x, pred, "CFG", "backedge")
+                tail = self.block(st.orelse, {pred}, following, loop) if st.orelse else set()
+                cur = set(tail)
+            elif isinstance(st, ast.Break):
+                if loop:
+                    self.edge(n, loop[0], "CFG", "break")
+                cur = set()
+            elif isinstance(st, ast.Continue):
+                if loop:
+                    self.edge(n, loop[1], "CFG", "continue")
+                cur = set()
+            elif isinstance(st, (ast.Return, ast.Raise)):
+                self.edge(n, self.exit_id, "CFG", "abrupt-exit")
+                cur = set()
+            elif isinstance(st, ast.Assert):
+                self.edge(n, self.exit_id, "CFG", "assert-failure")
+                cur = {n}
+            else:
+                cur = {n}
+        return cur
+
+    def acquire_with_manager(self, index, starts, st):
+        if index == len(st.items):
+            return self.structured_block(st.body, starts)
+        manager, bind = self.with_parts[st][index]
+        evaluation = self.add("exception_point", st.items[index].context_expr, f"before manager {index + 1}", synthetic=True)
+        for tail in starts:
+            self.edge(tail, evaluation, "CFG", "evaluate-manager")
+        self.edge(evaluation, manager, "CFG", "complete")
+        acquired = {manager}
+        binding_failure = set()
+        if bind:
+            self.edge(manager, bind, "CFG", "bind-target")
+            binding_failure.update((manager, bind))
+            acquired = {bind}
+        inside = self.acquire_with_manager(index + 1, acquired, st)
+        inside["raise"].update(binding_failure)
+        cleaned = defaultdict(set)
+        for key, tails in inside.items():
+            if not tails:
+                continue
+            leave = self.add("with_exit", st.items[index].context_expr, f"exit manager {index + 1} ({key})", synthetic=True)
+            for tail in tails:
+                self.edge(tail, leave, "CFG", "enter-body" if tail == bind else "context-" + key)
+            cleaned[key].add(leave)
+            cleaned["raise"].add(leave)
+            if key == "raise":
+                suppressed = self.add("with_suppressed", st, "suppressed exception", synthetic=True)
+                self.edge(leave, suppressed, "CFG", "suppressed-exit")
+                cleaned["normal"].add(suppressed)
+        # __enter__ failure does not call this manager's __exit__.
+        cleaned["raise"].update((evaluation, manager))
+        return cleaned
+
+    def _structured_if(self, st, n, pending):
+        for label, suite in (("true", st.body), ("false", st.orelse)):
+            start = self.add("branch", st, label, synthetic=True)
+            self.edge(n, start, "CFG", label)
+            for key, tails in self.structured_block(suite, {start}).items():
+                pending[key].update(tails)
+        return pending
+
+    def _structured_loop(self, st, n, pending):
+        pred = n
+        if isinstance(st, ast.For):
+            init = self.add("iterator_init", st, ast.get_source_segment(self.source, st.iter) or "iterable", defs=_target_names(st.iter), uses=_names(st.iter) | _paths(st.iter), synthetic=True)
+            self.remember_inline(init, st.iter)
+            pred = self.add("iterator_test", st, "iterator test", synthetic=True)
+            bind = self.add("target_binding", st, f"bind {ast.unparse(st.target)}", defs=_target_names(st.target) | _access_targets(st.target), uses=_names(st.target) | _paths(st.target), synthetic=True)
+            self.weak_definitions[bind] = _dynamic_access_targets(st.target)
+            self.remember_inline(bind, _target_events(st.target))
+            self.edge(n, init, "CFG", "evaluate-iterable")
+            self.edge(init, pred, "CFG", "initialize")
+            self.edge(init, bind, "DATA_DEP", "iterator-value")
+            self.edge(pred, bind, "CFG", "iterate")
+            pending["raise"].update((init, pred, bind))
+            start = bind
+        else:
+            start = self.add("branch", st, "true", synthetic=True)
+            self.edge(n, start, "CFG", "true")
+        inner = self.structured_block(st.body, {start})
+        for tail in inner.pop("normal", set()) | inner.pop("continue", set()):
+            self.edge(tail, pred, "CFG", "backedge")
+        broken = inner.pop("break", set())
+        for key, tails in inner.items():
+            pending[key].update(tails)
+        exhausted = self.add("branch", st, "loop exhausted", synthetic=True)
+        self.edge(pred, exhausted, "CFG", "zero-or-done")
+        for key, tails in self.structured_block(st.orelse, {exhausted}).items():
+            pending[key].update(tails)
+        pending["normal"].update(broken)
+        return pending
+
+    def _structured_try(self, st, n, pending):
+        body = self.structured_block(st.body, {n})
+        exceptional = body.pop("raise", set())
+        normal = body.pop("normal", set())
+        for key, tails in body.items():
+            pending[key].update(tails)
+        # The header itself cannot raise; protected-body exceptions do.
+        pending["raise"].clear()
+        for key, tails in self.structured_block(st.orelse, normal).items():
+            pending[key].update(tails)
+        handlers = self.try_parts[st]
+        star_previous = set()
+        prior_unmatched = None
+        for handler, hn, delete, unmatched in handlers:
+            if prior_unmatched is not None:
+                self.edge(prior_unmatched, hn, "CFG", "exception-unmatched")
+                if unmatched is not None:
+                    self.edge(prior_unmatched, unmatched, "CFG", "exception-unmatched")
+            if prior_unmatched is None:
+                for tail in exceptional:
+                    label = "exception-before-statement" if self.nodes[int(tail[1:])]["kind"] == "exception_point" else "exception-after-statement"
+                    self.edge(tail, hn, "CFG", label)
+                    if unmatched is not None:
+                        self.edge(tail, unmatched, "CFG", label)
+            for tail in exceptional:
+                for origin in self.exception_origins.get(tail, ()):
+                    if handler.name:
+                        self.edge(origin, hn, "DATA_DEP", "exception-value")
+            if isinstance(st, ast.TryStar):
+                for tail in star_previous:
+                    self.edge(tail, hn, "CFG", "except-star-next")
+                    if unmatched is not None:
+                        self.edge(tail, unmatched, "CFG", "except-star-next")
+            handler_origins = (
+                {hn} if handler.name else set().union(
+                    *(self.exception_origins.get(tail, set()) for tail in exceptional)
+                )
+            )
+            self.active_exception_handler.append(
+                (handler_origins, handler.name or "exception")
+            )
+            handled = self.structured_block(handler.body, {hn})
+            self.active_exception_handler.pop()
+            if delete:
+                handled = self.cleanup_delete(handled, handler)
+            if isinstance(st, ast.TryStar):
+                if handler.type is not None and _target_names(handler.type):
+                    # Route older matched subsets through this type test
+                    # before they can reach later handlers, so its
+                    # walrus definitions cannot be bypassed.
+                    star_previous.clear()
+                star_previous.update(set().union(*handled.values()))
+            for key, tails in handled.items():
+                pending[key].update(tails)
+            prior_unmatched = unmatched
+            if unmatched is not None:
+                # Type lookup and exception matching happen after any
+                # walrus stores and can themselves raise outward.
+                pending["raise"].add(unmatched)
+        if not any(handler.type is None for handler, _, _, _ in handlers):
+            pending["raise"].update(exceptional)
+        if st.finalbody:
+            pending = self.cleanup_finally(pending, st.finalbody)
+        return pending
+
+    def _structured_with(self, st, n, pending):
+        pending.clear()
+        # Acquiring manager i fails before it becomes an active cleanup.
+
+        pending = self.acquire_with_manager(0, {n}, st)
+        return pending
+
+    def _structured_abrupt(self, st, n, pending):
+        pending[type(st).__name__.lower()].add(n)
+        if isinstance(st, ast.Raise):
+            if st.exc is not None:
+                self.exception_origins[n] = {n}
+            elif self.active_exception_handler:
+                origins, label = self.active_exception_handler[-1]
+                if self.has_exception_binding:
+                    for origin in origins:
+                        self.edge(origin, n, "DATA_DEP", label)
+                self.exception_origins[n] = {n}
+        return pending
+
+    def _structured_simple(self, st, n, pending):
+        pending["normal"].add(n)
+        return pending
+
+    def structured_statement(self, st, n, pending):
+        if isinstance(st, ast.If):
+            return self._structured_if(st, n, pending)
+        if isinstance(st, (ast.For, ast.While)):
+            return self._structured_loop(st, n, pending)
+        if isinstance(st, (ast.Try, ast.TryStar)):
+            return self._structured_try(st, n, pending)
+        if isinstance(st, (ast.With, ast.AsyncWith)):
+            return self._structured_with(st, n, pending)
+        if isinstance(st, (ast.Return, ast.Raise, ast.Break, ast.Continue)):
+            return self._structured_abrupt(st, n, pending)
+        return self._structured_simple(st, n, pending)
+
+
+    def structured_block(self, stmts, incoming):
+        """Return disjoint pending completions; cleanup cannot merge their tails."""
+        result = defaultdict(set)
+        cur = set(incoming)
+        for st in stmts:
+            n = self.stmt_id[st]
+            pre = self.add("exception_point", st, "before " + type(st).__name__, synthetic=True)
+            for tail in cur:
+                self.edge(tail, pre, "CFG", "next")
+            self.edge(pre, n, "CFG", "complete")
+            pending = defaultdict(set)
+            for field in ("body", "orelse", "finalbody"):
+                for child in getattr(st, field, ()):
+                    self.edge(n, self.stmt_id[child], "AST", field)
+            for handler, hn, deletion, unmatched in self.try_parts.get(st, ()):
+                self.edge(n, hn, "AST", "handler")
+                if unmatched:
+                    self.edge(n, unmatched, "AST", "handler-type-unmatched")
+                for child in handler.body:
+                    self.edge(hn, self.stmt_id[child], "AST", "body")
+            pending["raise"].update((pre, n))
+            pending = self.structured_statement(st, n, pending)
+            cur = pending.pop("normal", set())
+            for key, tails in pending.items():
+                result[key].update(tails)
+        result["normal"].update(cur)
+        return result
+
+    def cleanup_delete(self, pending, handler):
+        cleaned = defaultdict(set)
+        for key, tails in pending.items():
+            if tails:
+                deletion = self.add("exception_name_delete", handler, f"delete {handler.name}", defs=[handler.name], synthetic=True)
+                for tail in tails:
+                    self.edge(tail, deletion, "CFG", "implicit-delete")
+                    if tail in self.exception_origins:
+                        self.exception_origins.setdefault(deletion, set()).update(self.exception_origins[tail])
+                cleaned[key].add(deletion)
+        return cleaned
+
+    def cleanup_finally(self, pending, suite):
+        cleaned = defaultdict(set)
+        first = True
+        for key, tails in list(pending.items()):
+            if not tails:
+                continue
+            saved = (self.stmt_id.copy(), self.with_parts.copy(), self.try_parts.copy())
+            if not first:
+                self.collect(suite)
+            first = False
+            bridge = self.add("finally_entry", suite[0], "finally " + key, synthetic=True)
+            for tail in tails:
+                self.edge(tail, bridge, "CFG", "finally-" + key)
+                if tail in self.exception_origins:
+                    self.exception_origins.setdefault(bridge, set()).update(self.exception_origins[tail])
+            pushes_exception_context = key == "raise"
+            if pushes_exception_context:
+                self.active_exception_handler.append(
+                    (set(self.exception_origins.get(bridge, ())), "exception")
+                )
+            final = self.structured_block(suite, {bridge})
+            if pushes_exception_context:
+                self.active_exception_handler.pop()
+            normal_tails = final.pop("normal", set())
+            cleaned[key].update(normal_tails)
+            if bridge in self.exception_origins:
+                for tail in normal_tails:
+                    self.exception_origins.setdefault(tail, set()).update(self.exception_origins[bridge])
+            for override, endings in final.items():
+                cleaned[override].update(endings)
+            self.stmt_id.clear()
+            self.stmt_id.update(saved[0])
+            self.with_parts.clear()
+            self.with_parts.update(saved[1])
+            self.try_parts.clear()
+            self.try_parts.update(saved[2])
+        return cleaned
+
+    def build(self) -> dict:
+        source, qualname, path = self.source, self.qualname, self.path
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError as exc:
+            raise FlowQueryError(f"invalid source {path}:{exc.lineno}: {exc.msg}") from exc
+        fn = _find_function(tree, qualname, path)
+        self.fn = fn
+        structured_depth, deepest_structured = _structured_cleanup_depth(fn.body)
+        _validate_function(fn, path)
+        nodes, edges, diagnostics = [], [], []
+        self.nodes, self.edges = nodes, edges
+        add, edge = self.add, self.edge
+
+        entry = add("entry", synthetic=True)
+        exit_id = add("exit", synthetic=True)
+        self.exit_id = exit_id
+        param_tail = entry
+        arguments = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
+        arguments += [arg for arg in (fn.args.vararg, fn.args.kwarg) if arg is not None]
+        for arg in arguments:
+            nid = add("parameter", arg, arg.arg, (arg.arg,))
+            edge(entry, nid, "AST", "parameter")
+            edge(param_tail, nid, "CFG", "parameter")
+            param_tail = nid
+        # Each source statement gets a node; predicates use only their header span.
+        stmt_id = self.stmt_id = {}
+        self.with_parts = {}
+        self.try_parts = {}
+        inline_after, inline_before = {}, {}
+        self.inline_after, self.inline_before = inline_after, inline_before
+        self.source = source
+        self.diagnostics = diagnostics
+        self.weak_definitions = {}
+        weak_definitions = self.weak_definitions
+        add, edge = self.add, self.edge
+        collect = self.collect
+        block = self.block
+        structured_block = self.structured_block
+        self.exception_origins = {}
+        self.active_exception_handler = []
+        self.has_exception_binding = any(
+            isinstance(node, ast.ExceptHandler) and node.name for node in ast.walk(fn)
+        )
+
+
+
+        collect(fn.body)
+        for st in fn.body:
+            edge(entry, stmt_id[st], "AST", "body")
+        for st in ast.walk(fn):
+            if isinstance(st, ast.stmt) and not isinstance(
+                st, _SUPPORTED_STMTS + _UNSUPPORTED + (ast.AsyncFunctionDef,)
+            ):
+                raise UnsupportedFlowError(
+                    f"unsupported {type(st).__name__} in {path}:{st.lineno}"
+                )
+        for st, nid in stmt_id.items():
+            if isinstance(st, ast.For):
+                continue
+            expression = st.test if isinstance(st, (ast.If, ast.While)) else st
+            if any(isinstance(child, ast.Call) for child in ast.walk(expression)):
                 diagnostics.append(
                     {
-                        "code": "unknown-live-in",
-                        "node": n["id"],
-                        "line": n["line"],
-                        "message": f"{name!r} has no observed local definition; provenance is live-in/unknown",
+                        "code": "opaque-call-effects",
+                        "node": nid,
+                        "line": nodes[int(nid[1:])]["line"],
+                        "message": "call effects and implicit exceptions are unknown",
                     }
                 )
-    edges = [
-        {"source": source_id, "target": target_id, "kind": kind, "label": label}
-        for kind, source_id, target_id, label in sorted(
-            {(e["kind"], e["source"], e["target"], e["label"]) for e in edges}
+        # AST statement hierarchy edges and normal CFG, with explicit abrupt exits.
+
+
+
+
+
+        structured = any(isinstance(st, (ast.Try, ast.TryStar, ast.With, ast.AsyncWith)) for st in ast.walk(fn))
+        if structured:
+            completions = structured_block(fn.body, {param_tail})
+            for key, tails in completions.items():
+                for tail in tails:
+                    edge(tail, exit_id, "CFG", "exit" if key == "normal" else key + "-exit")
+        else:
+            tails = block(fn.body, {param_tail}, {exit_id})
+            for tail in tails:
+                edge(tail, exit_id, "CFG", "exit")
+        # Postdominators identify control dependence, including a false guard that
+        # continues after an early return in the true arm.
+        reachable = _mark_reachability_and_control(nodes, edges, entry, exit_id)
+        _resolve_reaching_definitions(
+            nodes, edges, diagnostics, fn, arguments, entry, reachable,
+            inline_after, inline_before, weak_definitions,
         )
-    ]
-    diagnostics_by_key = {
-        (d["line"], d["node"], d["code"], d["message"]): d for d in diagnostics
-    }
-    diagnostics = [diagnostics_by_key[key] for key in sorted(diagnostics_by_key)]
-    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    engine_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    limitations = [
-        "Calls are opaque; aliases and unknown call side effects can affect memory dependencies.",
-        "Statement-level reads are conservative; wildcard object/subscript paths retain possible overlaps, but aliases are not resolved and implicit exception flow is not modeled.",
-    ]
-    if structured:
-        limitations[1] = "Statement-level exception transfers preserve pre-store and post-store possibilities; exception matching and context-manager suppression are conservative, aliases are not resolved."
-    if any(isinstance(item, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) for statement in fn.body for item in ast.walk(statement)):
-        limitations.append("Comprehensions collapse into enclosing statement reads; targets are scoped locally and deferred outer captures are refused.")
-    if structured_depth > 4:
-        limitations.append(
-            f"Nested cleanup/context-manager depth is {structured_depth} (threshold 4) at {path}:{deepest_structured[0]}; graph size grows exponentially with cleanup nesting depth."
-        )
-    return {
-        "profile": "python-local-cpg-v3",
-        "path": path,
-        "function": qualname,
-        "source_sha256": digest,
-        "engine_sha256": engine_digest,
-        "python_version": ".".join(map(str, sys.version_info[:3])),
-        "nodes": nodes,
-        "edges": edges,
-        "diagnostics": diagnostics,
-        "limitations": limitations,
-    }
+        edges = [
+            {"source": source_id, "target": target_id, "kind": kind, "label": label}
+            for kind, source_id, target_id, label in sorted(
+                {(e["kind"], e["source"], e["target"], e["label"]) for e in edges}
+            )
+        ]
+        diagnostics_by_key = {
+            (d["line"], d["node"], d["code"], d["message"]): d for d in diagnostics
+        }
+        diagnostics = [diagnostics_by_key[key] for key in sorted(diagnostics_by_key)]
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        engine_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        limitations = [
+            "Calls are opaque; aliases and unknown call side effects can affect memory dependencies.",
+            "Statement-level reads are conservative; wildcard object/subscript paths retain possible overlaps, but aliases are not resolved and implicit exception flow is not modeled.",
+        ]
+        if structured:
+            limitations[1] = "Statement-level exception transfers preserve pre-store and post-store possibilities; exception matching and context-manager suppression are conservative, aliases are not resolved."
+        if any(isinstance(item, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)) for statement in fn.body for item in ast.walk(statement)):
+            limitations.append("Comprehensions collapse into enclosing statement reads; targets are scoped locally and deferred outer captures are refused.")
+        if structured_depth > 4:
+            limitations.append(
+                f"Nested cleanup/context-manager depth is {structured_depth} (threshold 4) at {path}:{deepest_structured[0]}; graph size grows exponentially with cleanup nesting depth."
+            )
+        return {
+            "profile": "python-local-cpg-v3",
+            "path": path,
+            "function": qualname,
+            "source_sha256": digest,
+            "engine_sha256": engine_digest,
+            "python_version": ".".join(map(str, sys.version_info[:3])),
+            "nodes": nodes,
+            "edges": edges,
+            "diagnostics": diagnostics,
+            "limitations": limitations,
+        }
+
+def _validate_slice_query(direction, line, max_tokens):
+    if direction not in ("backward", "forward"):
+        raise FlowQueryError(f"invalid direction: {direction}")
+    if line is not None and (not isinstance(line, int) or isinstance(line, bool) or line <= 0):
+        raise FlowQueryError("line must be a positive integer")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise InvalidBudgetError("max_tokens must be a positive integer")
+
+
+def _all_flow_report(graph, direction, include_control):
+    report = {k: v for k, v in graph.items() if k not in ("nodes", "edges", "diagnostics")}
+    report.update({
+        "query": {"variable": None, "line": None, "direction": direction, "include_control": include_control},
+        "seeds": [],
+        "nodes": graph["nodes"],
+        "edges": [edge for edge in graph["edges"] if include_control or edge["kind"] != "CONTROL_DEP"],
+        "diagnostics": graph.get("diagnostics", []),
+    })
+    return report
+
+
+def _flow_seeds(nodes, variable, line):
+    candidates = [n for n in nodes if (variable is None or variable in n["defs"] or variable in n["uses"]) and (line is None or n["line"] <= line <= n["end_line"])]
+    if (variable is not None or line is not None) and not candidates:
+        raise FlowQueryError(f"no flow node matches variable={variable!r}, line={line!r}")
+    if variable is not None and line is None:
+        defined = [n for n in candidates if variable in n["defs"]]
+        candidates = defined or candidates
+    return [n["id"] for n in candidates]
+
+
+def _flow_reachable(graph, seeds, kinds, direction):
+    adjacency = defaultdict(set)
+    for edge in graph["edges"]:
+        if edge["kind"] in kinds:
+            source, target = edge["source"], edge["target"]
+            if direction == "backward":
+                source, target = target, source
+            adjacency[source].add(target)
+    selected = set(seeds)
+    queue = deque(seeds)
+    while queue:
+        for node_id in adjacency[queue.popleft()] - selected:
+            selected.add(node_id)
+            queue.append(node_id)
+    return selected
+
+
+def _selected_flow_report(graph, variable, line, direction, include_control, seeds, selected):
+    report = {k: v for k, v in graph.items() if k not in ("nodes", "edges", "diagnostics")}
+    report.update({
+        "query": {"variable": variable, "line": line, "direction": direction, "include_control": include_control},
+        "seeds": seeds,
+        "nodes": [node for node in graph["nodes"] if node["id"] in selected],
+        "edges": [edge for edge in graph["edges"] if edge["source"] in selected and edge["target"] in selected and (include_control or edge["kind"] != "CONTROL_DEP")],
+        "diagnostics": [item for item in graph.get("diagnostics", []) if item.get("node") in selected],
+    })
+    return report
+
+
+def _budgeted_flow_result(report, max_tokens, render_estimator):
+    tokens = _flow_output_tokens(report, render_estimator)
+    if tokens > max_tokens:
+        raise FlowBudgetExceeded(f"flow needs {tokens} tokens, budget is {max_tokens}")
+    return {"tokens": tokens, "flow": report}
 
 
 def slice_flow(
@@ -1334,101 +1434,12 @@ def slice_flow(
     max_tokens=8000,
     render_estimator=None,
 ) -> dict:
-    if direction not in ("backward", "forward"):
-        raise FlowQueryError(f"invalid direction: {direction}")
-    if line is not None and (
-        not isinstance(line, int) or isinstance(line, bool) or line <= 0
-    ):
-        raise FlowQueryError("line must be a positive integer")
-    if (
-        not isinstance(max_tokens, int)
-        or isinstance(max_tokens, bool)
-        or max_tokens <= 0
-    ):
-        raise InvalidBudgetError("max_tokens must be a positive integer")
-    nodes = graph["nodes"]
+    _validate_slice_query(direction, line, max_tokens)
     if variable is None and line is None:
-        report = {
-            k: v for k, v in graph.items() if k not in ("nodes", "edges", "diagnostics")
-        }
-        report.update(
-            {
-                "query": {
-                    "variable": None,
-                    "line": None,
-                    "direction": direction,
-                    "include_control": include_control,
-                },
-                "seeds": [],
-                "nodes": nodes,
-                "edges": [
-                    edge
-                    for edge in graph["edges"]
-                    if include_control or edge["kind"] != "CONTROL_DEP"
-                ],
-                "diagnostics": graph.get("diagnostics", []),
-            }
-        )
-        tokens = _flow_output_tokens(report, render_estimator)
-        if tokens > max_tokens:
-            raise FlowBudgetExceeded(
-                f"flow needs {tokens} tokens, budget is {max_tokens}"
-            )
-        return {"tokens": tokens, "flow": report}
-    candidates = [
-        n
-        for n in nodes
-        if (variable is None or variable in n["defs"] or variable in n["uses"])
-        and (line is None or n["line"] <= line <= n["end_line"])
-    ]
-    if (variable is not None or line is not None) and not candidates:
-        raise FlowQueryError(
-            f"no flow node matches variable={variable!r}, line={line!r}"
-        )
-    if variable is not None and line is None:
-        defined = [n for n in candidates if variable in n["defs"]]
-        candidates = defined or candidates
-    seeds = [n["id"] for n in candidates]
+        report = _all_flow_report(graph, direction, include_control)
+        return _budgeted_flow_result(report, max_tokens, render_estimator)
+    seeds = _flow_seeds(graph["nodes"], variable, line)
     kinds = {"DATA_DEP"} | ({"CONTROL_DEP"} if include_control else set())
-    adjacency = defaultdict(set)
-    for e in graph["edges"]:
-        if e["kind"] in kinds:
-            a, b = (e["source"], e["target"])
-            if direction == "backward":
-                a, b = b, a
-            adjacency[a].add(b)
-    selected = set(seeds)
-    q = deque(seeds)
-    while q:
-        for v in adjacency[q.popleft()] - selected:
-            selected.add(v)
-            q.append(v)
-    report = {
-        k: v for k, v in graph.items() if k not in ("nodes", "edges", "diagnostics")
-    }
-    report.update(
-        {
-            "query": {
-                "variable": variable,
-                "line": line,
-                "direction": direction,
-                "include_control": include_control,
-            },
-            "seeds": seeds,
-            "nodes": [n for n in nodes if n["id"] in selected],
-            "edges": [
-                e
-                for e in graph["edges"]
-                if e["source"] in selected
-                and e["target"] in selected
-                and (include_control or e["kind"] != "CONTROL_DEP")
-            ],
-            "diagnostics": [
-                d for d in graph.get("diagnostics", []) if d.get("node") in selected
-            ],
-        }
-    )
-    tokens = _flow_output_tokens(report, render_estimator)
-    if tokens > max_tokens:
-        raise FlowBudgetExceeded(f"flow needs {tokens} tokens, budget is {max_tokens}")
-    return {"tokens": tokens, "flow": report}
+    selected = _flow_reachable(graph, seeds, kinds, direction)
+    report = _selected_flow_report(graph, variable, line, direction, include_control, seeds, selected)
+    return _budgeted_flow_result(report, max_tokens, render_estimator)
