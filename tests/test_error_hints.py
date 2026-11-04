@@ -113,11 +113,32 @@ def test_open_database_operational_error_names_resolved_path(tmp_path, capsys, m
     assert hints == [f"hint: database {db.resolve()}; exists=False, parent_writable=False"]
 
 
-def test_stale_snapshot_has_no_additional_hint(tmp_path, capsys):
+def test_changed_python_source_stale_snapshot_adds_refresh_hint(tmp_path, capsys):
     root, db = _indexed(tmp_path, "def calculate():\n    return 1\n")
     (root / "sample.py").write_text("def calculate():\n    return 2\n")
     hints = _error(capsys, ["slice", "--db", str(db), "sample:calculate"],
                    "StaleSnapshotError", "snapshot is stale: Python source differs at sample.py; run codegraph-slicer sync ROOT --db DB")
+    assert hints == ["hint: for symbols you did not edit, add --snapshot to read the indexed bytes; re-run sync for symbols you edited"]
+
+
+def test_moved_git_head_stale_snapshot_has_no_additional_hint(tmp_path, capsys):
+    root = tmp_path / "src"
+    root.mkdir()
+    source = root / "sample.py"
+    source.write_text("def calculate():\n    return 1\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "hints@example.invalid"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Hint Fixture"], cwd=root, check=True)
+    subprocess.run(["git", "add", "sample.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_git_tree(root, "HEAD")
+    source.write_text("def calculate():\n    return 2\n")
+    subprocess.run(["git", "add", "sample.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "move head"], cwd=root, check=True)
+    hints = _error(capsys, ["slice", "--db", str(db), "sample:calculate"],
+                   "StaleSnapshotError", "snapshot is stale: repository HEAD moved; run codegraph-slicer sync ROOT --revision HEAD --db DB")
     assert hints == []
 
 

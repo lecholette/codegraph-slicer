@@ -24,7 +24,7 @@ from .slicer import (
     slice_context,
     tokens_for_length,
 )
-from .store import GraphStore
+from .store import GraphStore, StaleSnapshotError
 
 _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
@@ -418,7 +418,7 @@ def main(argv=None):
             "context budget. Anchors may be symbol IDs, package.module:,\n"
             "path.py:qualname, or path.py:line."
         ),
-        epilog="Example: codegraph-slicer slice --db /tmp/project.sqlite package.module:run --max-tokens 4000\nNext: inspect the JSON, or add --format markdown for readable context.",
+        epilog="Example: codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.module:helper\nNext: inspect the JSON, or add --format markdown for readable context.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     slicing.add_argument("--db", required=True, help="existing indexed SQLite database")
@@ -650,7 +650,13 @@ def main(argv=None):
     except (CodeGraphError, OSError, sqlite3.Error) as exc:
         message = f"codegraph-slicer: {type(exc).__name__}: {exc}\n"
         hints = []
-        if isinstance(exc, AnchorNotFoundError):
+        if (isinstance(exc, StaleSnapshotError)
+                and str(exc).startswith("snapshot is stale: Python source differs at ")):
+            hints.append(
+                "hint: for symbols you did not edit, add --snapshot to read the indexed bytes; "
+                "re-run sync for symbols you edited"
+            )
+        elif isinstance(exc, AnchorNotFoundError):
             hints.extend(f"hint: nearest anchor: {anchor}" for anchor in getattr(exc, "nearest_anchors", []))
             revision = getattr(exc, "snapshot_revision", "")
             if revision:

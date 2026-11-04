@@ -7,7 +7,7 @@ codegraph-slicer sync /path/to/project --db /tmp/graph.sqlite
 codegraph-slicer sync /path/to/git/repo --revision HEAD --db /tmp/head.sqlite
 codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 1800
 codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --outline --max-tokens 1800
-codegraph-slicer slice --db /tmp/graph.sqlite package.module:thing --max-tokens 4000
+codegraph-slicer slice --db /tmp/graph.sqlite package.module:thing package.module:helper
 codegraph-slicer impact package.module:thing --db /tmp/graph.sqlite --max-depth 3 --max-nodes 200
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:thing --format markdown
 codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:42 --include-callee-bodies

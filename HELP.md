@@ -195,7 +195,7 @@ When several anchors share required type definitions, those required types are
 kept in the required section and are not repeated as optional callee entries.
 
 ```sh
-codegraph-slicer slice --db /tmp/project.sqlite package.module:run --max-tokens 4000
+codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.module:helper
 codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-callee-bodies --format markdown
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --format json
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --include-imports
