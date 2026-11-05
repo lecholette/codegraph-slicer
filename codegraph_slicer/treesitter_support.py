@@ -16,19 +16,33 @@ def parser_for(grammar: str):
     return get_parser(grammar)
 
 
-def _has_non_jsx_syntax_error(root) -> bool:
+def _has_non_jsx_syntax_error(root, data: bytes) -> bool:
     for node in descendants(root):
         if node.type == "ERROR" or node.is_missing:
+            if node.is_missing:
+                return True
+            raw_err = data[node.start_byte : node.end_byte]
+            if b"&" not in raw_err:
+                return True
             curr = node.parent
-            in_jsx = False
+            in_jsx_text = False
             while curr is not None:
-                if curr.type.startswith("jsx_"):
-                    in_jsx = True
+                if curr.type == "jsx_expression":
+                    return True
+                if curr.type in {"jsx_element", "jsx_self_closing_element", "jsx_Opening_element"} or curr.type.startswith("jsx_"):
+                    in_jsx_text = True
                     break
                 curr = curr.parent
-            if not in_jsx:
+            if not in_jsx_text:
                 return True
     return False
+
+
+def split_source_lines(text: str) -> list[str]:
+    if not text:
+        return []
+    trimmed = text[:-1] if text.endswith("\n") else text
+    return [line.rstrip("\r") for line in trimmed.split("\n")]
 
 
 def parse_tree(source: bytes, path: str, grammar: str):
@@ -43,7 +57,7 @@ def parse_tree(source: bytes, path: str, grammar: str):
     data = text.encode("utf-8")
     tree = parser_for(grammar).parse(data)
     if tree.root_node.has_error and (
-        grammar != "tsx" or _has_non_jsx_syntax_error(tree.root_node)
+        grammar != "tsx" or _has_non_jsx_syntax_error(tree.root_node, data)
     ):
         raise CodeGraphParseError(f"cannot parse {path}: syntax error")
     return text, data, tree.root_node
@@ -79,6 +93,17 @@ def descendants(node):
     stack = [node]
     while stack:
         current = stack.pop()
+        yield current
+        stack.extend(reversed(current.children))
+
+
+def scoped_descendants(node, skip_types: set[str] | frozenset[str]):
+    root_id = node.id
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.id != root_id and current.type in skip_types:
+            continue
         yield current
         stack.extend(reversed(current.children))
 

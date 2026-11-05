@@ -657,3 +657,251 @@ def test_revision_3_1_hidden_scratch_exclusion_and_bounded_delta_summary(
     assert full_res["omitted"]["untested_modified_symbols"] == 0
 
 
+def test_v0_2_1_mixed_language_collision_and_incremental_rebind(tmp_path) -> None:
+    """Verify mixed-language same-stem module disambiguation and incremental sync re-extraction."""
+    repo = tmp_path / "poly"
+    _write(
+        repo,
+        {
+            "a.ts": "export function run(): number { return 1; }\n",
+            "b.ts": "import { run } from './a';\nexport function callRun(): number { return run(); }\n",
+        },
+    )
+    db = tmp_path / "poly.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(repo)
+        # Initially only a.ts exists, so its module is 'a'
+        edges_initial = {
+            (r["source_id"], r["target_id"], r["kind"])
+            for r in store.rows("SELECT source_id,target_id,kind FROM edges")
+        }
+        assert ("b:callRun", "a:run", "CALLS") in edges_initial
+
+        # Now add a.py so a.py and a.ts collide on stem 'a'
+        (repo / "a.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+        store.sync_workspace(repo)
+
+        # Incremental sync must re-extract a.ts as 'a_ts' and rebind b.ts -> a_ts:run
+        edges_collided = {
+            (r["source_id"], r["target_id"], r["kind"])
+            for r in store.rows("SELECT source_id,target_id,kind FROM edges")
+        }
+        assert ("b:callRun", "a_ts:run", "CALLS") in edges_collided
+        assert ("b:callRun", "a:run", "CALLS") not in edges_collided
+
+        # Remove a.py and re-sync: a.ts reverts to 'a' and b.ts rebinds to a:run
+        (repo / "a.py").unlink()
+        store.sync_workspace(repo)
+        edges_restored = {
+            (r["source_id"], r["target_id"], r["kind"])
+            for r in store.rows("SELECT source_id,target_id,kind FROM edges")
+        }
+        assert ("b:callRun", "a:run", "CALLS") in edges_restored
+
+
+def test_v0_2_1_ts_accessors_overloads_tsconfig_urls_and_relative_imports(
+    tmp_path,
+) -> None:
+    """Verify TS getters/setters, interface/method overloads, URL strings in tsconfig, and ../ imports."""
+    repo = tmp_path / "ts_edge_cases"
+    _write(
+        repo,
+        {
+            "tsconfig.json": """{
+  // Comment before URL string
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@shared/*": ["shared/*"]
+    }
+  }
+}
+""",
+            "shared/helper.ts": """function internalHelper(x: string): string {
+  return x.trim();
+}
+export { internalHelper as formatValue };
+export default (n: number) => n + 1;
+""",
+            "src/box.ts": """import bump, { formatValue } from '../shared/helper';
+
+export interface Parser {
+  parse(input: string): string;
+  parse(input: number): string;
+}
+
+export class Box implements Parser {
+  private _val: string = formatValue("init");
+
+  get value(): string {
+    return this._val;
+  }
+
+  set value(v: string) {
+    this._val = formatValue(v);
+  }
+
+  parse(input: string): string;
+  parse(input: number): string;
+  parse(input: string | number): string {
+    const fn = x => formatValue(String(x));
+    function nestedIgnored() {
+      return bump(10);
+    }
+    return String(bump(1));
+  }
+}
+""",
+        },
+    )
+    db = tmp_path / "ts.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(repo)
+        store.assert_fresh()
+
+        syms = {r["symbol_id"]: r for r in store.rows("SELECT * FROM symbols")}
+        assert "box:Box.value" in syms
+        assert "box:Box.parse" in syms
+        assert "box:Parser.parse" in syms
+        assert "shared.helper:default" in syms
+
+        edges = {
+            (r["source_id"], r["target_id"], r["kind"])
+            for r in store.rows("SELECT source_id,target_id,kind FROM edges")
+        }
+        # Setter & field initializer call formatValue -> shared.helper:internalHelper
+        assert ("box:Box.value", "shared.helper:internalHelper", "CALLS") in edges
+        assert ("box:Box", "shared.helper:internalHelper", "CALLS") in edges
+        # Box.parse calls bump (shared.helper:default) and arrow fn calls formatValue
+        assert ("box:Box.parse", "shared.helper:default", "CALLS") in edges
+        assert ("box:Box.parse", "shared.helper:internalHelper", "CALLS") in edges
+
+        # Modify tsconfig.json -> assert_fresh() must detect staleness
+        from codegraph_slicer.store import StaleSnapshotError
+
+        (repo / "tsconfig.json").write_text(
+            '{"compilerOptions": {"baseUrl": ".", "paths": {"@other/*": ["shared/*"]}}}\n',
+            encoding="utf-8",
+        )
+        with pytest.raises(StaleSnapshotError, match="tsconfig.json"):
+            store.assert_fresh()
+
+        # Re-sync updates tsconfig_sha and restores freshness
+        store.sync_workspace(repo)
+        store.assert_fresh()
+
+
+def test_v0_2_1_file_anchors_hidden_freshness_python_types_and_java_enums(
+    tmp_path,
+) -> None:
+    """Verify file/line anchors for Java/TS, hidden dir assert_fresh parity, Python class types, and Java enums/default pkg."""
+    from codegraph_slicer.delta import compute_delta
+
+    repo = tmp_path / "workspace"
+    _write(
+        repo,
+        {
+            ".scratch/temp.py": "def ignored():\n    return 0\n",
+            ".scratch/temp.ts": "export const ignored = () => 0;\n",
+            "pkg/service.py": """class Config:
+    timeout: int = 30
+
+class Runner:
+    def execute(self, cfg: Config) -> Runner:
+        return self
+""",
+            "src/util.ts": """export function computeTotal(a: number, b: number): number {
+  return a + b;
+}
+""",
+            "Helper.java": """public class Helper {
+    public static int doubleIt(int x) {
+        return x * 2;
+    }
+}
+""",
+            "Mode.java": """import org.junit.jupiter.api.Test;
+
+public enum Mode {
+    FAST,
+    SAFE;
+
+    private static final int INIT = Helper.doubleIt(2);
+
+    public int apply(int v) {
+        return Helper.doubleIt(v);
+    }
+
+    @Test
+    public void verifyApply() {
+        apply(3);
+    }
+}
+""",
+        },
+    )
+
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(repo)
+        # P1 #4: Hidden .scratch directory must not trip assert_fresh()
+        store.assert_fresh()
+
+        # P1 #3: File-path and line anchors work for .ts and .java
+        ts_slice_path = slice_context(store, ["src/util.ts:computeTotal"], max_tokens=2000)
+        assert ts_slice_path["sections"]["target_implementations"][0]["symbol"] == "util:computeTotal"
+
+        ts_slice_line = slice_context(store, ["src/util.ts:2"], max_tokens=2000)
+        assert ts_slice_line["sections"]["target_implementations"][0]["symbol"] == "util:computeTotal"
+
+        java_slice_path = slice_context(store, ["Mode.java:Mode.apply"], max_tokens=2000)
+        assert java_slice_path["sections"]["target_implementations"][0]["symbol"] == "Mode:Mode.apply"
+
+        # P1 #6: Python method slice retains enclosing class in types_and_schemas
+        py_slice = slice_context(store, ["pkg.service:Runner.execute"], max_tokens=4000)
+        py_types = {e["symbol"] for e in py_slice["sections"]["types_and_schemas"]}
+        assert "pkg.service:Runner" in py_types
+        assert "pkg.service:Config" in py_types
+
+        # P2 #12 & #16: Java enum methods + default-package Helper resolution + @Test in non-*Test.java
+        edges = {
+            (r["source_id"], r["target_id"], r["kind"])
+            for r in store.rows("SELECT source_id,target_id,kind FROM edges")
+        }
+        assert ("Mode:Mode.apply", "Helper:Helper.doubleIt", "CALLS") in edges
+        assert ("Mode:Mode", "Helper:Helper.doubleIt", "CALLS") in edges
+        assert ("Mode:Mode.verifyApply", "Mode:Mode.apply", "TESTS") in edges
+
+        # Verify delta recognizes @Test method Mode:Mode.verifyApply even though Mode.java is not *Test.java
+        db_head = tmp_path / "head.sqlite"
+        (repo / "Helper.java").write_text(
+            "public class Helper {\n    public static int doubleIt(int x) {\n        return x * 3;\n    }\n}\n",
+            encoding="utf-8",
+        )
+        with GraphStore(db_head) as head_store:
+            head_store.sync_workspace(repo)
+            delta_res = compute_delta(
+                store, head_store, selected_tests=("Mode:Mode.verifyApply",)
+            )
+            cov_by_sym = {c["symbol"]: c for c in delta_res["test_coverage"]}
+            assert "Mode:Mode.verifyApply" in cov_by_sym["Helper:Helper.doubleIt"]["reachable_tests"]
+            assert "Mode:Mode.verifyApply" in cov_by_sym["Helper:Helper.doubleIt"]["updated_or_selected_tests"]
+
+
+def test_v0_2_1_tsx_syntax_error_rejection_vs_jsx_ampersand() -> None:
+    """Verify real TSX syntax errors are rejected while bare '&' in JSX text is allowed."""
+    from codegraph_slicer.ast_extractor import CodeGraphParseError, extract_file
+
+    # Valid TSX with bare '&' in JSX text
+    valid_tsx = b"export const App = () => <div>Terms & Conditions</div>;\n"
+    analysis = extract_file("src/App.tsx", valid_tsx)
+    assert any(s.symbol_id == "App:App" for s in analysis.symbols)
+
+    # Broken TSX inside JSX expression must raise CodeGraphParseError
+    broken_tsx = b"export const App = () => <div>{foo(}</div>;\n"
+    with pytest.raises(CodeGraphParseError):
+        extract_file("src/App.tsx", broken_tsx)
+
+
+

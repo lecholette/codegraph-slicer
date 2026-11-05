@@ -5,7 +5,7 @@ import json
 import difflib
 import shlex
 import textwrap
-from .ast_extractor import CodeGraphError, is_test_path
+from .ast_extractor import CodeGraphError, is_supported_source_path, is_test_path
 
 
 class AnchorNotFoundError(CodeGraphError):
@@ -56,7 +56,7 @@ def _anchor(store, anchor):
     if exact:
         return exact[0]
     path, separator, target = anchor.rpartition(":")
-    if separator and path.endswith(".py"):
+    if separator and is_supported_source_path(path):
         if target.isdigit():
             try:
                 line = int(target)
@@ -447,7 +447,13 @@ def _slice_item(row, full):
     }
 
 
-def _target_item_with_preamble(store, row, chosen, max_tokens: int):
+def _target_item_with_preamble(
+    store,
+    row,
+    chosen,
+    max_tokens: int,
+    emitted_headers: set[str] | None = None,
+):
     base = _slice_item(row, True)
     if (
         max_tokens < 2000
@@ -465,56 +471,67 @@ def _target_item_with_preamble(store, row, chosen, max_tokens: int):
     limit_idx = min(len(file_lines), max(0, row["start_line"] - 1))
     header_lines = []
     header_end_line = 0
-    in_multiline_import = False
-    for idx in range(limit_idx):
-        raw = file_lines[idx]
-        stripped = raw.strip()
-        if in_multiline_import:
-            header_lines.append(raw)
-            header_end_line = idx + 1
-            if ";" in stripped or ")" in stripped or stripped.endswith(('"', "'")):
-                in_multiline_import = False
-            continue
-        if stripped.startswith(("import ", "from ", "package ")):
-            header_lines.append(raw)
-            header_end_line = idx + 1
-            if ("{" in stripped and "}" not in stripped) or (
-                "(" in stripped and ")" not in stripped
-            ):
-                in_multiline_import = True
-            continue
-        if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/", '"""', "'''")):
-            break
+    file_key = f"file:{row['file_path']}"
+    emit_file_imports = emitted_headers is None or file_key not in emitted_headers
+    if emit_file_imports:
+        in_multiline_import = False
+        for idx in range(limit_idx):
+            raw = file_lines[idx]
+            stripped = raw.strip()
+            if in_multiline_import:
+                header_lines.append(raw)
+                header_end_line = idx + 1
+                if ";" in stripped or ")" in stripped or stripped.endswith(('"', "'")):
+                    in_multiline_import = False
+                continue
+            if stripped.startswith(("import ", "from ", "package ")):
+                header_lines.append(raw)
+                header_end_line = idx + 1
+                if ("{" in stripped and "}" not in stripped) or (
+                    "(" in stripped and ")" not in stripped
+                ):
+                    in_multiline_import = True
+                continue
+            if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/", '"""', "'''")):
+                break
+        if emitted_headers is not None and header_lines:
+            emitted_headers.add(file_key)
     if row["kind"] == "method" and "." in row["qualname"]:
         class_qual = row["qualname"].rpartition(".")[0]
         class_sid = f"{row['module']}:{class_qual}"
         if class_sid in chosen:
             return base
-        class_rows = store.rows(
-            "SELECT start_line, end_line FROM symbols WHERE symbol_id=?",
-            (class_sid,),
-        )
-        if class_rows:
-            c_start = class_rows[0]["start_line"]
-            class_short = class_qual.rsplit(".", 1)[-1]
-            first_m_rows = store.rows(
-                "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ? AND qualname NOT GLOB ?",
-                (row["file_path"], c_start, f"*.{class_short}"),
+        class_key = f"class:{class_sid}"
+        if emitted_headers is None or class_key not in emitted_headers:
+            class_rows = store.rows(
+                "SELECT start_line, end_line FROM symbols WHERE symbol_id=?",
+                (class_sid,),
             )
-            first_m = (
-                first_m_rows[0]["first_m"]
-                if first_m_rows and first_m_rows[0]["first_m"] is not None
-                else row["start_line"]
-            )
-            c_end = min(first_m - 1, row["start_line"] - 1, c_start + 20)
-            for ln in range(c_start, c_end + 1):
-                if 1 <= ln <= len(file_lines):
-                    line_txt = file_lines[ln - 1]
-                    if line_txt.strip():
-                        header_lines.append(line_txt)
-                        header_end_line = max(header_end_line, ln)
+            if class_rows:
+                c_start = class_rows[0]["start_line"]
+                class_short = class_qual.rsplit(".", 1)[-1]
+                first_m_rows = store.rows(
+                    "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ? AND qualname NOT GLOB ? AND qualname NOT GLOB '*.constructor'",
+                    (row["file_path"], c_start, f"*.{class_short}"),
+                )
+                first_m = (
+                    first_m_rows[0]["first_m"]
+                    if first_m_rows and first_m_rows[0]["first_m"] is not None
+                    else row["start_line"]
+                )
+                c_end = min(first_m - 1, row["start_line"] - 1, c_start + 20)
+                added_class = False
+                for ln in range(c_start, c_end + 1):
+                    if 1 <= ln <= len(file_lines):
+                        line_txt = file_lines[ln - 1]
+                        if line_txt.strip():
+                            header_lines.append(line_txt)
+                            header_end_line = max(header_end_line, ln)
+                            added_class = True
+                if emitted_headers is not None and added_class:
+                    emitted_headers.add(class_key)
     comment_pfx = _comment_prefix(row["file_path"])
-    if row["file_path"].endswith((".ts", ".tsx")) and "." in row["module"]:
+    if emit_file_imports and row["file_path"].endswith((".ts", ".tsx")) and "." in row["module"]:
         parent_mod_sid = f"{row['module'].rpartition('.')[0]}:"
         barrel_rows = store.rows(
             "SELECT file_path, body FROM symbols WHERE symbol_id=?",
@@ -786,11 +803,15 @@ def slice_context(
     chosen_enclosing_classes = {
         f"{r['module']}:{r['qualname'].rpartition('.')[0]}"
         for r in chosen.values()
-        if r["kind"] == "method" and "." in r["qualname"]
+        if max_tokens >= 2000
+        and r["file_path"].endswith((".java", ".ts", ".tsx"))
+        and r["kind"] == "method"
+        and "." in r["qualname"]
     }
+    emitted_headers: set[str] = set()
     for sid, row in sorted(chosen.items()):
         sections["target_implementations"].append(
-            _target_item_with_preamble(store, row, chosen, max_tokens)
+            _target_item_with_preamble(store, row, chosen, max_tokens, emitted_headers)
         )
         for token in row["body"].replace("(", " ").replace(".", " ").split():
             if token.isidentifier():
@@ -947,6 +968,11 @@ def slice_context(
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
     required = result()
+    if required["tokens"] > max_tokens:
+        sections["target_implementations"] = [
+            item(row, True) for _, row in sorted(chosen.items())
+        ]
+        required = result()
     if required["tokens"] > max_tokens and compact_summaries:
         for sid, c_summary in compact_summaries.items():
             sections["types_and_schemas"] = [

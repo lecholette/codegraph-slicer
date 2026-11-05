@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import hashlib
+import importlib.metadata
 import os
 import sqlite3
 import subprocess
@@ -19,6 +20,7 @@ from .ast_extractor import (
     detect_layout,
     extract_file,
     is_supported_source_path,
+    module_name,
     plain_target,
     valid_path,
 )
@@ -35,6 +37,44 @@ _SKIP_DIRS = {
     ".gradle",
     ".next",
 }
+
+
+def _should_skip_rel_path(rel_parts: tuple[str, ...], include_hidden: bool = False) -> bool:
+    if not rel_parts:
+        return False
+    if any(
+        part in _SKIP_DIRS or (not include_hidden and part.startswith("."))
+        for part in rel_parts[:-1]
+    ):
+        return True
+    if not include_hidden and rel_parts[-1].startswith("."):
+        return True
+    return False
+
+
+def _lang_group(path: str) -> str:
+    if path.endswith(".py"):
+        return "py"
+    if path.endswith(".java"):
+        return "java"
+    if path.endswith((".ts", ".tsx")):
+        return "ts"
+    return ""
+
+
+def _raw_stem_module(path: str, source_root: str) -> str:
+    if path.endswith(".py"):
+        return module_name(path, source_root)
+    if path.endswith((".ts", ".tsx")):
+        from .ts_extractor import ts_module_name
+
+        return ts_module_name(path, source_root)
+    p = PurePosixPath(path).with_suffix("").as_posix()
+    for pfx in ("src/main/java/", "src/test/java/", "src/", "app/", "java/"):
+        if p.startswith(pfx):
+            p = p[len(pfx) :]
+            break
+    return p.replace("/", ".")
 
 
 def _disambiguate_analysis(
@@ -179,10 +219,7 @@ class GraphStore:
         files = {}
         for path in _iter_workspace_files(root):
             rel = path.relative_to(root)
-            if any(
-                part in _SKIP_DIRS or (not include_hidden and part.startswith("."))
-                for part in rel.parts[:-1]
-            ) or (not include_hidden and rel.name.startswith(".")):
+            if _should_skip_rel_path(rel.parts, include_hidden):
                 continue
             if path.is_symlink() or any(
                 parent.is_symlink()
@@ -204,10 +241,13 @@ class GraphStore:
             snapshot_root=str(root),
             snapshot_kind="workspace",
             tsconfig_bytes=tsconfig_bytes,
+            include_hidden=include_hidden,
         )
 
-    def sync_git_tree(self, root, revision):
+    def sync_git_tree(self, root, revision, *, include_hidden: bool = False):
         root = Path(root).resolve(strict=True)
+        if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
+            include_hidden = True
         if (
             not revision
             or revision.startswith("-")
@@ -248,6 +288,8 @@ class GraphStore:
                 name = valid_path(raw_path.decode("utf8"))
             except UnicodeError as exc:
                 raise CodeGraphError(f"non-UTF8 Python path: {raw_path!r}") from exc
+            if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden):
+                continue
             files[name] = ("git:" + oid.decode("ascii"), oid.decode("ascii"))
         tsconfig_bytes = git("cat-file", "blob", tsconfig_oid) if tsconfig_oid else b""
         return self._sync(
@@ -257,6 +299,7 @@ class GraphStore:
             snapshot_kind="git",
             snapshot_revision=rev,
             tsconfig_bytes=tsconfig_bytes,
+            include_hidden=include_hidden,
         )
 
     def _sync(
@@ -268,6 +311,7 @@ class GraphStore:
         snapshot_kind,
         snapshot_revision="",
         tsconfig_bytes=b"",
+        include_hidden=False,
     ):
         started = monotonic()
         digest = hashlib.sha256()
@@ -283,6 +327,12 @@ class GraphStore:
                 digest.update(source_path.read_bytes())
                 digest.update(b"\0")
         digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
+        for pkg_name in ("tree-sitter", "tree-sitter-language-pack"):
+            try:
+                ver = importlib.metadata.version(pkg_name)
+            except importlib.metadata.PackageNotFoundError:
+                ver = ""
+            digest.update(f"\0{pkg_name}:{ver}".encode())
         source_root, packages = detect_layout(files)
         # A layout change renames modules, so every file is re-extracted.
         digest.update(f"\0{source_root}\0{','.join(sorted(packages))}".encode())
@@ -290,6 +340,11 @@ class GraphStore:
             digest.update(b"\0")
             digest.update(tsconfig_bytes)
         engine_sha = digest.hexdigest()
+        tsconfig_sha = (
+            "sha256:" + hashlib.sha256(tsconfig_bytes).hexdigest()
+            if tsconfig_bytes
+            else ""
+        )
         path_aliases = None
         if tsconfig_bytes:
             from .ts_extractor import parse_tsconfig_paths
@@ -297,20 +352,36 @@ class GraphStore:
             path_aliases = parse_tsconfig_paths(tsconfig_bytes)
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
-            old = {
-                row["path"]: row["blob_sha"]
-                for row in self.db.execute("SELECT path,blob_sha FROM files")
-            }
+            old_rows = list(self.db.execute("SELECT path,blob_sha,module FROM files"))
+            old = {row["path"]: row["blob_sha"] for row in old_rows}
+            old_modules = {row["path"]: row["module"] for row in old_rows}
             prior_engine = self.db.execute(
                 "SELECT value FROM metadata WHERE key='engine_sha'"
             ).fetchone()
             engine_matches = prior_engine is not None and prior_engine[0] == engine_sha
             removed = set(old) - set(files)
-            changed = sorted(
+            changed_set = {
                 path
                 for path, (identity, _) in files.items()
                 if not engine_matches or old.get(path) != identity
-            )
+            }
+            if changed_set or removed:
+                stem_groups: dict[str, set[str]] = defaultdict(set)
+                for p in set(files) | set(old):
+                    stem_groups[_raw_stem_module(p, source_root)].add(p)
+                affected_stems = {
+                    _raw_stem_module(p, source_root) for p in (changed_set | removed)
+                }
+                for p, mod in old_modules.items():
+                    raw_m = _raw_stem_module(p, source_root)
+                    if mod != raw_m:
+                        affected_stems.add(raw_m)
+                        affected_stems.add(mod)
+                for stem in affected_stems:
+                    for p in stem_groups.get(stem, ()):
+                        if p in files:
+                            changed_set.add(p)
+            changed = sorted(changed_set)
             analyses = [
                 extract_file(
                     path,
@@ -363,13 +434,21 @@ class GraphStore:
                     ],
                 )
             if changed or removed:
-                self._rebind()
+                self._rebind(source_root=source_root)
             self.db.execute(
                 "INSERT INTO metadata(key,value) VALUES('engine_sha',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (engine_sha,),
             )
-            for key, value in (("snapshot_root", snapshot_root), ("snapshot_kind", snapshot_kind), ("snapshot_revision", snapshot_revision), ("source_root", source_root), ("packages", ",".join(sorted(packages)))):
+            for key, value in (
+                ("snapshot_root", snapshot_root),
+                ("snapshot_kind", snapshot_kind),
+                ("snapshot_revision", snapshot_revision),
+                ("source_root", source_root),
+                ("packages", ",".join(sorted(packages))),
+                ("include_hidden", "1" if include_hidden else "0"),
+                ("tsconfig_sha", tsconfig_sha),
+            ):
                 self.db.execute(
                     "INSERT INTO metadata(key,value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -396,20 +475,31 @@ class GraphStore:
         metadata = {
             row["key"]: row["value"]
             for row in self.db.execute(
-                "SELECT key,value FROM metadata WHERE key IN ('snapshot_root','snapshot_kind','snapshot_revision')"
+                "SELECT key,value FROM metadata WHERE key IN ('snapshot_root','snapshot_kind','snapshot_revision','include_hidden','tsconfig_sha')"
             )
         }
         root_text = metadata.get("snapshot_root")
         kind = metadata.get("snapshot_kind")
+        include_hidden = metadata.get("include_hidden") == "1"
         if not root_text or kind not in {"workspace", "git"}:
             raise StaleSnapshotError("snapshot freshness cannot be verified: missing source metadata; run codegraph-slicer sync ROOT --db DB")
         try:
             root = Path(root_text).resolve(strict=True)
+            tsconfig_path = root / "tsconfig.json"
+            actual_tsconfig_sha = (
+                "sha256:" + hashlib.sha256(tsconfig_path.read_bytes()).hexdigest()
+                if tsconfig_path.is_file() and not tsconfig_path.is_symlink()
+                else ""
+            )
+            if "tsconfig_sha" in metadata and actual_tsconfig_sha != metadata.get("tsconfig_sha", ""):
+                raise StaleSnapshotError(
+                    "snapshot is stale: Python source differs at tsconfig.json; run codegraph-slicer sync ROOT --db DB"
+                )
             if kind == "workspace":
                 actual = {}
                 for path in _iter_workspace_files(root):
                     rel = path.relative_to(root)
-                    if any(part in _SKIP_DIRS for part in rel.parts):
+                    if _should_skip_rel_path(rel.parts, include_hidden):
                         continue
                     if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
                         raise StaleSnapshotError(f"snapshot is stale: symlink source refused: {rel.as_posix()}")
@@ -440,13 +530,15 @@ class GraphStore:
                     if typ != b"blob" or mode not in {b"100644", b"100755"}:
                         raise StaleSnapshotError(f"snapshot source cannot be verified: non-regular Python source {raw_path!r}")
                     name = valid_path(raw_path.decode("utf8"))
+                    if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden):
+                        continue
                     actual[name] = "git:" + oid.decode("ascii")
                 working = {}
                 for path in _iter_workspace_files(root):
                     rel = path.relative_to(root)
                     if ".git" in rel.parts:
                         continue
-                    if any(part in _SKIP_DIRS for part in rel.parts) and rel.as_posix() not in actual:
+                    if _should_skip_rel_path(rel.parts, include_hidden) and rel.as_posix() not in actual:
                         continue
                     if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
                         raise StaleSnapshotError(f"snapshot freshness cannot be verified: symlink source refused: {rel.as_posix()}")
@@ -468,22 +560,61 @@ class GraphStore:
             detail = changed[0] if changed else "Python file set"
             raise StaleSnapshotError(f"snapshot is stale: Python source differs at {detail}; run codegraph-slicer sync ROOT --db DB")
 
-    def _rebind(self):
+    def _rebind(self, source_root: str = ""):
         symbols = {
             row["symbol_id"]: row["kind"]
             for row in self.db.execute("SELECT symbol_id,kind FROM symbols")
         }
-        modules = {row["module"] for row in self.db.execute("SELECT module FROM files")}
+        file_rows = self.db.execute("SELECT path,module FROM files").fetchall()
+        modules = {row["module"] for row in file_rows}
+        file_lang = {row["path"]: _lang_group(row["path"]) for row in file_rows}
+        lang_mod_map: dict[tuple[str, str], str] = {}
+        for row in file_rows:
+            raw_mod = _raw_stem_module(row["path"], source_root)
+            if row["module"] != raw_mod:
+                lang_mod_map[(_lang_group(row["path"]), raw_mod)] = row["module"]
+
+        def _rewrite_lang_target(t: str, lg: str) -> str:
+            if not lang_mod_map or t.startswith("?"):
+                return t
+            if MODULE_END in t:
+                mod_part, sep, rest = t.partition(MODULE_END)
+                mapped = lang_mod_map.get((lg, mod_part))
+                if mapped:
+                    return f"{mapped}{sep}{rest}"
+                return t
+            if ":" in t:
+                mod_part, sep, rest = t.partition(":")
+                mapped = lang_mod_map.get((lg, mod_part))
+                if mapped:
+                    return f"{mapped}{sep}{rest}"
+                return t
+            parts = t.split(".")
+            for idx in range(len(parts), 0, -1):
+                prefix = ".".join(parts[:idx])
+                mapped = lang_mod_map.get((lg, prefix))
+                if mapped:
+                    return ".".join([mapped, *parts[idx:]])
+            return t
+
         # Module-level import bindings: "pkg.Name" -> dotted import target.
         aliases = {
-            row["source_id"]: row["target_id"]
-            for row in self.db.execute("SELECT source_id,target_id FROM raw_edges WHERE kind='ALIAS'")
+            row["source_id"]: _rewrite_lang_target(
+                row["target_id"], file_lang.get(row["source_file"], "py")
+            )
+            for row in self.db.execute(
+                "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='ALIAS'"
+            )
         }
         wildcard_exports = defaultdict(list)
         for row in self.db.execute(
-            "SELECT source_id,target_id FROM raw_edges WHERE kind='WILDCARD_EXPORT'"
+            "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='WILDCARD_EXPORT'"
         ):
-            wildcard_exports[row["source_id"]].append(row["target_id"])
+            wildcard_exports[row["source_id"]].append(
+                _rewrite_lang_target(
+                    row["target_id"], file_lang.get(row["source_file"], "py")
+                )
+            )
         if wildcard_exports:
             changed_wc = True
             while changed_wc:
@@ -499,9 +630,13 @@ class GraphStore:
                                     changed_wc = True
         wildcard_imports = defaultdict(list)
         for row in self.db.execute(
-            "SELECT source_id,target_id FROM raw_edges WHERE kind='WILDCARD_IMPORT'"
+            "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='WILDCARD_IMPORT'"
         ):
-            wildcard_imports[row["source_id"]].append(row["target_id"])
+            wildcard_imports[row["source_id"]].append(
+                _rewrite_lang_target(
+                    row["target_id"], file_lang.get(row["source_file"], "py")
+                )
+            )
         for src_mod, tgt_pkgs in wildcard_imports.items():
             for tgt_pkg in tgt_pkgs:
                 prefix = tgt_pkg + "."
@@ -563,14 +698,17 @@ class GraphStore:
             "SELECT * FROM raw_edges WHERE kind NOT IN ('ALIAS','WILDCARD_EXPORT','WILDCARD_IMPORT') "
             "ORDER BY source_file,source_id,target_id,kind,line"
         ).fetchall():
-            target = resolve(row["target_id"])
+            raw_target = _rewrite_lang_target(
+                row["target_id"], file_lang.get(row["source_file"], "py")
+            )
+            target = resolve(raw_target)
             if target is None:
                 self.db.execute(
                     "INSERT INTO diagnostics VALUES(?,?,?,?,?,?)",
                     (
                         row["source_file"],
                         row["source_id"],
-                        plain_target(row["target_id"]),
+                        plain_target(raw_target),
                         row["kind"],
                         row["line"],
                         "external, dynamic, shadowed, or unobserved reference",

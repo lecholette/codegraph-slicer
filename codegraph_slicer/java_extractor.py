@@ -13,7 +13,9 @@ from .treesitter_support import (
     end_line,
     node_text,
     parse_tree,
+    scoped_descendants,
     signature_before_body,
+    split_source_lines,
     start_line,
 )
 
@@ -231,7 +233,7 @@ def extract_java_file(
     text, data, root = parse_tree(source, path, "java")
     package = _extract_package(data, root)
     module = java_module_name(path, package, source_root)
-    lines = text.splitlines()
+    lines = split_source_lines(text)
     file_is_test = is_test_path(path)
 
     symbols: list[Symbol] = []
@@ -240,9 +242,9 @@ def extract_java_file(
 
     imports: dict[str, str] = {}
     local_types_defined: set[str] = set()
+    pkg_scope = package or "__default_pkg__"
 
-    if package:
-        edges.append(Edge(module, package, "WILDCARD_IMPORT", 0))
+    edges.append(Edge(module, pkg_scope, "WILDCARD_IMPORT", 0))
 
     for child in root.children:
         if child.type in _JAVA_TYPE_NODES:
@@ -252,8 +254,7 @@ def extract_java_file(
                 local_types_defined.add(tname)
                 sid = f"{module}:{tname}"
                 edges.append(Edge(f"{module}.{tname}", sid, "ALIAS", 0))
-                if package:
-                    edges.append(Edge(f"{package}.{tname}", sid, "ALIAS", 0))
+                edges.append(Edge(f"{pkg_scope}.{tname}", sid, "ALIAS", 0))
 
     for child in root.children:
         if child.type != "import_declaration":
@@ -378,8 +379,15 @@ def extract_java_file(
         if body_node is None:
             return
 
-        own_methods: set[str] = set()
+        member_nodes = []
         for member in body_node.children:
+            if member.type == "enum_body_declarations":
+                member_nodes.extend(member.children)
+            else:
+                member_nodes.append(member)
+
+        own_methods: set[str] = set()
+        for member in member_nodes:
             if member.type == "method_declaration":
                 m_ident = child_of_type(member, "identifier")
                 if m_ident is not None:
@@ -401,7 +409,7 @@ def extract_java_file(
                             field_types[node_text(data, fident)] = base_t
 
         method_counts: dict[str, int] = {}
-        for member in body_node.children:
+        for member in member_nodes:
             if member.type in _JAVA_TYPE_NODES:
                 visit_type_decl(member, qual_parts)
             elif member.type in {"method_declaration", "constructor_declaration"}:
@@ -413,6 +421,79 @@ def extract_java_file(
                     own_methods,
                     superclass_target,
                     method_counts,
+                )
+            elif member.type in {"field_declaration", "static_initializer"}:
+                _scan_java_expressions(
+                    member,
+                    sid,
+                    sid,
+                    qual_parts,
+                    field_types,
+                    own_methods,
+                    {},
+                    superclass_target,
+                    False,
+                )
+
+    def _scan_java_expressions(
+        root_expr,
+        sid: str,
+        class_sid: str,
+        enclosing_types: list[str],
+        field_types: dict[str, str],
+        own_methods: set[str],
+        local_types: dict[str, str],
+        superclass_target: str | None,
+        in_test: bool,
+    ):
+        for desc in scoped_descendants(root_expr, _JAVA_TYPE_NODES):
+            if desc.type == "local_variable_declaration":
+                ltype = child_of_type(
+                    desc,
+                    "type_identifier",
+                    "scoped_type_identifier",
+                    "generic_type",
+                    "array_type",
+                )
+                emit_type_uses(sid, ltype, enclosing_types, in_test)
+                base_t = _base_type_name(data, ltype)
+                for decl in desc.children:
+                    if decl.type == "variable_declarator":
+                        vident = child_of_type(decl, "identifier")
+                        init_creation = child_of_type(decl, "object_creation_expression")
+                        inferred_t = base_t
+                        if (inferred_t is None or inferred_t == "var") and init_creation is not None:
+                            ctype = child_of_type(
+                                init_creation,
+                                "type_identifier",
+                                "scoped_type_identifier",
+                                "generic_type",
+                            )
+                            inferred_t = _base_type_name(data, ctype)
+                        if vident is not None:
+                            local_types[node_text(data, vident)] = inferred_t or "?"
+            elif desc.type == "object_creation_expression":
+                ctype = child_of_type(
+                    desc, "type_identifier", "scoped_type_identifier", "generic_type"
+                )
+                base_t = _base_type_name(data, ctype)
+                if base_t:
+                    resolved_t = resolve_type_ref(base_t, enclosing_types)
+                    if resolved_t:
+                        emit(sid, resolved_t, "CALLS", start_line(desc), in_test)
+                if ctype is not None and ctype.type == "generic_type":
+                    emit_type_uses(sid, child_of_type(ctype, "type_arguments"), enclosing_types, in_test)
+            elif desc.type == "method_invocation":
+                _handle_method_invocation(
+                    desc,
+                    sid,
+                    class_sid,
+                    enclosing_types,
+                    field_types,
+                    own_methods,
+                    local_types,
+                    superclass_target,
+                    in_test,
                 )
 
     def visit_executable(
@@ -494,57 +575,17 @@ def extract_java_file(
         if body_block is None:
             return
 
-        for desc in descendants(body_block):
-            if desc.id != body_block.id and desc.type in _JAVA_TYPE_NODES:
-                continue
-            if desc.type == "local_variable_declaration":
-                ltype = child_of_type(
-                    desc,
-                    "type_identifier",
-                    "scoped_type_identifier",
-                    "generic_type",
-                    "array_type",
-                )
-                emit_type_uses(sid, ltype, enclosing_types, in_test)
-                base_t = _base_type_name(data, ltype)
-                for decl in desc.children:
-                    if decl.type == "variable_declarator":
-                        vident = child_of_type(decl, "identifier")
-                        init_creation = child_of_type(decl, "object_creation_expression")
-                        inferred_t = base_t
-                        if (inferred_t is None or inferred_t == "var") and init_creation is not None:
-                            ctype = child_of_type(
-                                init_creation,
-                                "type_identifier",
-                                "scoped_type_identifier",
-                                "generic_type",
-                            )
-                            inferred_t = _base_type_name(data, ctype)
-                        if vident is not None:
-                            local_types[node_text(data, vident)] = inferred_t or "?"
-            elif desc.type == "object_creation_expression":
-                ctype = child_of_type(
-                    desc, "type_identifier", "scoped_type_identifier", "generic_type"
-                )
-                base_t = _base_type_name(data, ctype)
-                if base_t:
-                    resolved_t = resolve_type_ref(base_t, enclosing_types)
-                    if resolved_t:
-                        emit(sid, resolved_t, "CALLS", start_line(desc), in_test)
-                if ctype is not None and ctype.type == "generic_type":
-                    emit_type_uses(sid, child_of_type(ctype, "type_arguments"), enclosing_types, in_test)
-            elif desc.type == "method_invocation":
-                _handle_method_invocation(
-                    desc,
-                    sid,
-                    class_sid,
-                    enclosing_types,
-                    field_types,
-                    own_methods,
-                    local_types,
-                    superclass_target,
-                    in_test,
-                )
+        _scan_java_expressions(
+            body_block,
+            sid,
+            class_sid,
+            enclosing_types,
+            field_types,
+            own_methods,
+            local_types,
+            superclass_target,
+            in_test,
+        )
 
     def _handle_method_invocation(
         call_node,

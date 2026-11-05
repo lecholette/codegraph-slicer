@@ -135,10 +135,15 @@ def compute_delta(
         for prefix, forbidden in boundary_rules:
             if _prefix(source, prefix) and _prefix(target, forbidden):
                 violations.add((source, target))
+    test_sources = {
+        src for (src, _tgt, kind) in head_edges if kind == "TESTS"
+    } | {
+        src for (src, _tgt, kind) in base_edges if kind == "TESTS"
+    }
     tests = {
         sid
         for sid, row in head.items()
-        if is_test_path(row["file_path"])
+        if is_test_path(row["file_path"]) or sid in test_sources
     }
     selected = set()
     for name in selected_tests:
@@ -163,7 +168,7 @@ def compute_delta(
         current = head.get(sid, base.get(sid))
         if current is None:
             continue
-        is_test = is_test_path(current["file_path"])
+        is_test = is_test_path(current["file_path"]) or sid in test_sources
         for node in upstream:
             row = head.get(node, base.get(node))
             if row and (
@@ -267,22 +272,22 @@ def summarize_delta(
         priority = (
             ("boundary_violations", result["boundary_violations"], None),
             ("new_cycles", result["new_cycles"], None),
-            ("untested_modified_symbols", result["untested_modified_symbols"], 5 if render_estimator is None and max_tokens >= 2000 else None),
+            ("untested_modified_symbols", result["untested_modified_symbols"], 5 if render_estimator is None and max_tokens == 8000 else None),
             ("test_coverage", [
                 {**item, "status": status}
                 for item, status in zip(result["test_coverage"], statuses)
-            ], 5 if render_estimator is None and max_tokens >= 2000 else None),
+            ], 5 if render_estimator is None and max_tokens == 8000 else None),
             ("complexity_drift", sorted(
                 (item for item in result["complexity_drift"] if item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
             ), None),
-            ("import_changes", imports, 8 if render_estimator is None and max_tokens >= 2000 else None),
-            ("affected_entrypoints", result["affected_entrypoints"], 5 if render_estimator is None and max_tokens >= 2000 else None),
+            ("import_changes", imports, 8 if render_estimator is None else None),
+            ("affected_entrypoints", result["affected_entrypoints"], 5 if render_estimator is None else None),
             ("complexity_drift", sorted(
                 (item for item in result["complexity_drift"] if not item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
-            ), 5 if render_estimator is None and max_tokens >= 2000 else None),
-            ("modified_symbols", result["modified_symbols"], 5 if render_estimator is None and max_tokens >= 2000 else None),
+            ), 5 if render_estimator is None else None),
+            ("modified_symbols", result["modified_symbols"], 5 if render_estimator is None else None),
         )
         # Edge lists are intentionally not emitted in summary mode. Their exact
         # counts remain in summary/omitted and are retrievable with --full.

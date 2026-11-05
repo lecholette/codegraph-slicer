@@ -22,7 +22,9 @@ from .treesitter_support import (
     end_line,
     node_text,
     parse_tree,
+    scoped_descendants,
     signature_before_body,
+    split_source_lines,
     start_line,
 )
 
@@ -287,7 +289,11 @@ def ts_module_name(path: str, source_root: str = "") -> str:
 def parse_tsconfig_paths(raw: bytes) -> dict[str, str]:
     try:
         text = raw.decode("utf-8")
-        cleaned = re.sub(r"//.*?$|/\*.*?\*/", "", text, flags=re.MULTILINE | re.DOTALL)
+        cleaned = re.sub(
+            r'"(?:\\.|[^"\\])*"|(//[^\n]*|/\*[\s\S]*?\*/)',
+            lambda m: "" if m.group(1) else m.group(0),
+            text,
+        )
         cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
         data = json.loads(cleaned)
         compiler = data.get("compilerOptions") or {}
@@ -326,7 +332,7 @@ def _resolve_ts_import(
         if cleaned.startswith("@/"):
             cleaned = cleaned[2:]
         elif cleaned.startswith("."):
-            rel_file = _strip_ts_source_root(current_path, source_root)
+            rel_file = current_path.removeprefix(source_root)
             parent_parts = list(PurePosixPath(rel_file).parent.parts)
             if parent_parts == ["."]:
                 parent_parts = []
@@ -341,7 +347,7 @@ def _resolve_ts_import(
                     parent_parts.pop()
                 else:
                     parent_parts.append(part)
-            cleaned = "/".join(parent_parts)
+            cleaned = _strip_ts_source_root("/".join(parent_parts), "")
     dotted = cleaned.replace("/", ".")
     if dotted != "index" and dotted.endswith(".index"):
         dotted = dotted[: -len(".index")]
@@ -410,14 +416,37 @@ def extract_typescript_file(
     grammar = "tsx" if path.endswith(".tsx") else "typescript"
     text, data, root = parse_tree(source, path, grammar)
     module = ts_module_name(path, source_root)
-    lines = text.splitlines()
+    lines = split_source_lines(text)
     file_is_test = is_test_path(path)
     aliases_cfg = path_aliases or {}
 
     symbols: list[Symbol] = []
+    symbol_index: dict[str, int] = {}
     edges: list[Edge] = []
     block_nodes: list = []
     bindings: dict[str, str] = {}
+    deferred_local_exports: list[tuple[str, str]] = []
+
+    def add_or_merge_symbol(sym: Symbol, prefer_new_sig: bool = True):
+        idx = symbol_index.get(sym.symbol_id)
+        if idx is None:
+            symbol_index[sym.symbol_id] = len(symbols)
+            symbols.append(sym)
+            return
+        prev = symbols[idx]
+        s_line = min(prev.start, sym.start)
+        e_line = max(prev.end, sym.end)
+        sig = sym.signature if prefer_new_sig else prev.signature
+        cx = max(prev.cx, sym.cx)
+        symbols[idx] = Symbol(
+            sym.symbol_id,
+            sym.kind,
+            sig,
+            "\n".join(lines[s_line - 1 : e_line]),
+            s_line,
+            e_line,
+            cx,
+        )
 
     def emit(owner_sid: str, target: str, kind: str, line: int):
         edges.append(Edge(owner_sid, target, kind, line))
@@ -523,12 +552,29 @@ def extract_typescript_file(
                 elif any(c.type == "*" for c in node.children):
                     edges.append(Edge(module, mod_target, "WILDCARD_EXPORT", line))
                 return
+            eclause = child_of_type(node, "export_clause")
+            if eclause is not None:
+                for spec_node in eclause.children:
+                    if spec_node.type == "export_specifier":
+                        idents = [
+                            c
+                            for c in spec_node.children
+                            if c.type in {"identifier", "type_identifier"}
+                        ]
+                        if idents:
+                            orig = node_text(data, idents[0])
+                            exported = node_text(data, idents[-1])
+                            deferred_local_exports.append((orig, exported))
+                return
             is_def = any(c.type == "default" for c in node.children)
             for child in node.children:
                 if child.type in {
                     *_TS_TYPE_NODES,
                     "type_alias_declaration",
                     "function_declaration",
+                    "function_signature",
+                    "arrow_function",
+                    "function_expression",
                     "lexical_declaration",
                     "variable_declaration",
                     "identifier",
@@ -538,6 +584,7 @@ def extract_typescript_file(
             *_TS_TYPE_NODES,
             "type_alias_declaration",
             "function_declaration",
+            "function_signature",
         }:
             ident = child_of_type(node, "type_identifier", "identifier")
             if ident is not None:
@@ -546,6 +593,10 @@ def extract_typescript_file(
                 bindings[name] = sid
                 if is_default_export:
                     bindings["default"] = sid
+            elif is_default_export:
+                bindings["default"] = f"{module}:default"
+        elif node.type in {"arrow_function", "function_expression"} and is_default_export:
+            bindings["default"] = f"{module}:default"
         elif node.type in {"lexical_declaration", "variable_declaration"}:
             for decl in node.children:
                 if decl.type == "variable_declarator":
@@ -559,11 +610,16 @@ def extract_typescript_file(
                             bindings["default"] = sid
         elif node.type == "identifier" and is_default_export:
             name = node_text(data, node)
-            if name in bindings:
-                bindings["default"] = bindings[name]
+            deferred_local_exports.append((name, "default"))
 
     for child in root.children:
         _collect_top_level_bindings(child)
+
+    for orig, exported in deferred_local_exports:
+        if orig in bindings:
+            bindings[exported] = bindings[orig]
+        else:
+            bindings[exported] = f"{module}:{orig}"
 
     for name, target in bindings.items():
         edges.append(Edge(f"{module}.{name}", target, "ALIAS", 0))
@@ -589,13 +645,10 @@ def extract_typescript_file(
     ):
         if body_node is None:
             return
-        for desc in descendants(body_node):
-            if desc.id != body_node.id and desc.type in {
-                *_TS_TYPE_NODES,
-                "function_declaration",
-                "method_definition",
-            }:
-                continue
+        for desc in scoped_descendants(
+            body_node,
+            {*_TS_TYPE_NODES, "function_declaration", "method_definition"},
+        ):
             if desc.type in {"lexical_declaration", "variable_declaration"}:
                 for decl in desc.children:
                     if decl.type != "variable_declarator":
@@ -747,6 +800,9 @@ def extract_typescript_file(
         local_types: dict[str, str] = {}
         if params_node is None:
             return local_types
+        if params_node.type == "identifier":
+            local_types[node_text(data, params_node)] = "?"
+            return local_types
         for param in params_node.children:
             if param.type in {"required_parameter", "optional_parameter", "rest_pattern"}:
                 tann = child_of_type(param, "type_annotation")
@@ -766,16 +822,17 @@ def extract_typescript_file(
 
     def visit_class_or_interface(node, outer_node=None):
         ident = child_of_type(node, "type_identifier", "identifier")
-        if ident is None:
+        is_def = outer_node is not None and any(c.type == "default" for c in outer_node.children)
+        if ident is None and not is_def:
             return
-        cname = node_text(data, ident)
+        cname = node_text(data, ident) if ident is not None else "default"
         sid = f"{module}:{cname}"
         decl_node = outer_node or node
         body_node = child_of_type(node, "class_body", "interface_body", "enum_body")
         s_line = start_line(decl_node)
         e_line = end_line(decl_node)
         sig = signature_before_body(data, decl_node, body_node)
-        symbols.append(
+        add_or_merge_symbol(
             Symbol(
                 sid,
                 "class",
@@ -860,7 +917,7 @@ def extract_typescript_file(
                     if mbody is not None
                     else 1
                 )
-                symbols.append(
+                add_or_merge_symbol(
                     Symbol(
                         msid,
                         "method",
@@ -869,7 +926,8 @@ def extract_typescript_file(
                         ms_line,
                         me_line,
                         mcx,
-                    )
+                    ),
+                    prefer_new_sig=(mbody is not None),
                 )
                 mtparams = tparams | _type_params_set(member)
                 params = child_of_type(member, "formal_parameters")
@@ -901,7 +959,7 @@ def extract_typescript_file(
                     me_line = end_line(member)
                     msig = signature_before_body(data, member, mbody)
                     mcx = compute_complexity(fn_val, _is_ts_decision, _skip_ts_nested)
-                    symbols.append(
+                    add_or_merge_symbol(
                         Symbol(
                             msid,
                             "method",
@@ -913,7 +971,9 @@ def extract_typescript_file(
                         )
                     )
                     mtparams = tparams | _type_params_set(fn_val)
-                    params = child_of_type(fn_val, "formal_parameters")
+                    params = child_of_type(fn_val, "formal_parameters") or child_of_type(
+                        fn_val, "identifier"
+                    )
                     local_types = _extract_params(params, msid, mtparams)
                     for child in fn_val.children:
                         if child.type == "type_annotation":
@@ -927,21 +987,31 @@ def extract_typescript_file(
                         superclass_target,
                         mtparams,
                     )
+                else:
+                    _scan_body_expressions(
+                        member, sid, sid, field_types, {}, superclass_target, tparams
+                    )
 
     def visit_function(node, outer_node=None):
         ident = child_of_type(node, "identifier")
+        is_def = outer_node is not None and any(c.type == "default" for c in outer_node.children)
         fbody = child_of_type(node, "statement_block")
-        if ident is None or fbody is None:
+        if ident is None and not is_def:
             return
-        fname = node_text(data, ident)
+        fname = node_text(data, ident) if ident is not None else "default"
         sid = f"{module}:{fname}"
         decl_node = outer_node or node
-        block_nodes.append(fbody)
+        if fbody is not None:
+            block_nodes.append(fbody)
         s_line = start_line(decl_node)
         e_line = end_line(decl_node)
         sig = signature_before_body(data, decl_node, fbody)
-        cx = compute_complexity(node, _is_ts_decision, _skip_ts_nested)
-        symbols.append(
+        cx = (
+            compute_complexity(node, _is_ts_decision, _skip_ts_nested)
+            if fbody is not None
+            else 1
+        )
+        add_or_merge_symbol(
             Symbol(
                 sid,
                 "function",
@@ -950,15 +1020,26 @@ def extract_typescript_file(
                 s_line,
                 e_line,
                 cx,
-            )
+            ),
+            prefer_new_sig=(fbody is not None),
         )
         tparams = _type_params_set(node)
-        params = child_of_type(node, "formal_parameters")
+        params = child_of_type(node, "formal_parameters") or (
+            child_of_type(node, "identifier") if node.type == "arrow_function" else None
+        )
         local_types = _extract_params(params, sid, tparams)
         for child in node.children:
             if child.type == "type_annotation":
                 emit_type_uses(sid, child, tparams)
-        _scan_body_expressions(fbody, sid, None, {}, local_types, None, tparams)
+        _scan_body_expressions(
+            fbody or (node if node.type in {"arrow_function", "function_expression"} else None),
+            sid,
+            None,
+            {},
+            local_types,
+            None,
+            tparams,
+        )
 
     def visit_lexical_functions(node, outer_node=None):
         decl_root = outer_node or node
@@ -968,6 +1049,9 @@ def extract_typescript_file(
             ident = child_of_type(decl, "identifier")
             fn_val = child_of_type(decl, "arrow_function", "function_expression")
             if ident is None or fn_val is None:
+                decl_tann = child_of_type(decl, "type_annotation")
+                emit_type_uses(f"{module}:", decl_tann, set())
+                _scan_body_expressions(decl, f"{module}:", None, {}, {}, None, set())
                 continue
             fname = node_text(data, ident)
             sid = f"{module}:{fname}"
@@ -978,7 +1062,7 @@ def extract_typescript_file(
             e_line = end_line(decl)
             sig = signature_before_body(data, decl_root, fbody)
             cx = compute_complexity(fn_val, _is_ts_decision, _skip_ts_nested)
-            symbols.append(
+            add_or_merge_symbol(
                 Symbol(
                     sid,
                     "function",
@@ -992,7 +1076,9 @@ def extract_typescript_file(
             tparams = _type_params_set(fn_val)
             decl_tann = child_of_type(decl, "type_annotation")
             emit_type_uses(sid, decl_tann, tparams)
-            params = child_of_type(fn_val, "formal_parameters")
+            params = child_of_type(fn_val, "formal_parameters") or child_of_type(
+                fn_val, "identifier"
+            )
             local_types = _extract_params(params, sid, tparams)
             for child in fn_val.children:
                 if child.type == "type_annotation":
@@ -1012,7 +1098,7 @@ def extract_typescript_file(
         e_line = end_line(decl_node)
         body = "\n".join(lines[s_line - 1 : e_line])
         sig = " ".join(line.strip() for line in body.splitlines() if line.strip())
-        symbols.append(Symbol(sid, "type_alias", sig, body, s_line, e_line, 1))
+        add_or_merge_symbol(Symbol(sid, "type_alias", sig, body, s_line, e_line, 1))
         tparams = _type_params_set(node) | {tname}
         emit_type_uses(sid, node, tparams)
 
@@ -1026,6 +1112,9 @@ def extract_typescript_file(
                 *_TS_TYPE_NODES,
                 "type_alias_declaration",
                 "function_declaration",
+                "function_signature",
+                "arrow_function",
+                "function_expression",
                 "lexical_declaration",
                 "variable_declaration",
             )
@@ -1034,7 +1123,12 @@ def extract_typescript_file(
             target_node = inner
         if target_node.type in _TS_TYPE_NODES:
             visit_class_or_interface(target_node, outer)
-        elif target_node.type == "function_declaration":
+        elif target_node.type in {
+            "function_declaration",
+            "function_signature",
+            "arrow_function",
+            "function_expression",
+        }:
             visit_function(target_node, outer)
         elif target_node.type in {"lexical_declaration", "variable_declaration"}:
             visit_lexical_functions(target_node, outer)

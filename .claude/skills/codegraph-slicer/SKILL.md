@@ -13,10 +13,11 @@ Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecho
 Indexes Python (`.py`), Java (`.java`), and TypeScript (`.ts`, `.tsx`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
-## Routing Threshold (`>= 25` Source Files)
+## Routing Threshold (`>= 25` Source Files & Task-Local File Size)
 
-- **Start with `codegraph-slicer slice`** on repositories or modules with **`>= 25` relevant source files** (`.py`, `.java`, `.ts`, `.tsx`). Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading source files.
-- **Skip codegraph** for small repositories (**`< 25` relevant source files**), single-file edits, or unsupported languages. On small `< 25`-file repos, reading the target files directly is cheaper than graph indexing + slicing.
+- **Start with `codegraph-slicer slice`** on repositories or modules with **`>= 25` relevant source files** (`.py`, `.java`, `.ts`, `.tsx`) when the target symbols span large files (`>= 200` lines) or callers/callees are dispersed across the codebase. Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading source files.
+- **Skip codegraph (or use direct `Read`)** for small repositories (**`< 25` relevant source files**), single-file edits, when all target files are already known and small (`< 200` lines each), or unsupported languages. On small files that you will immediately edit with `Edit`, reading the target file directly avoids loading both the slice and the full file into context.
+- **Incremental head sync (`delta`):** When running `delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite`, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
 
 ## Index first
 
@@ -47,15 +48,16 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 
   ```bash
   codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite
+  cp /tmp/base.sqlite /tmp/head.sqlite
   codegraph-slicer sync . --db /tmp/head.sqlite
   codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite
   ```
 
-  Default `delta` JSON bounds each summary list to at most 5 items (`omitted_summary_items` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
+  Default `delta` JSON bounds each summary list to at most 5 items (`omitted` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
   Add `--forbid-import SRC_PREFIX TGT_PREFIX` for layer rules.
 
 Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`, `path/File.java:Class.method`, `path/file.ts:Class.method`, or `path/file:LINE`.
-`flow` takes only function or method anchors.
+`flow` takes only Python (`.py`) function or method anchors.
 
 ## Limits (state them when you cite output)
 
