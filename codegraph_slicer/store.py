@@ -3,6 +3,7 @@
 from collections import defaultdict
 import hashlib
 import importlib.metadata
+import json
 import os
 import sqlite3
 import subprocess
@@ -14,6 +15,7 @@ from .ast_extractor import (
     MODULE_END,
     SUPPORTED_EXTENSIONS,
     CodeGraphError,
+    CodeGraphParseError,
     Edge,
     FileAnalysis,
     Symbol,
@@ -212,7 +214,7 @@ class GraphStore:
     def close(self):
         self.db.close()
 
-    def sync_workspace(self, root, *, include_hidden: bool = False):
+    def sync_workspace(self, root, *, include_hidden: bool = False, skip_unparseable: bool = False):
         root = Path(root).resolve(strict=True)
         if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
             include_hidden = True
@@ -242,9 +244,10 @@ class GraphStore:
             snapshot_kind="workspace",
             tsconfig_bytes=tsconfig_bytes,
             include_hidden=include_hidden,
+            skip_unparseable=skip_unparseable,
         )
 
-    def sync_git_tree(self, root, revision, *, include_hidden: bool = False):
+    def sync_git_tree(self, root, revision, *, include_hidden: bool = False, skip_unparseable: bool = False):
         root = Path(root).resolve(strict=True)
         if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
             include_hidden = True
@@ -300,6 +303,7 @@ class GraphStore:
             snapshot_revision=rev,
             tsconfig_bytes=tsconfig_bytes,
             include_hidden=include_hidden,
+            skip_unparseable=skip_unparseable,
         )
 
     def _sync(
@@ -312,9 +316,10 @@ class GraphStore:
         snapshot_revision="",
         tsconfig_bytes=b"",
         include_hidden=False,
+        skip_unparseable=False,
     ):
         started = monotonic()
-        digest = hashlib.sha256()
+        base_digest = hashlib.sha256()
         for source_name in (
             "ast_extractor.py",
             "treesitter_support.py",
@@ -324,22 +329,15 @@ class GraphStore:
         ):
             source_path = Path(__file__).with_name(source_name)
             if source_path.exists():
-                digest.update(source_path.read_bytes())
-                digest.update(b"\0")
-        digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
+                base_digest.update(source_path.read_bytes())
+                base_digest.update(b"\0")
+        base_digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
         for pkg_name in ("tree-sitter", "tree-sitter-language-pack"):
             try:
                 ver = importlib.metadata.version(pkg_name)
             except importlib.metadata.PackageNotFoundError:
                 ver = ""
-            digest.update(f"\0{pkg_name}:{ver}".encode())
-        source_root, packages = detect_layout(files)
-        # A layout change renames modules, so every file is re-extracted.
-        digest.update(f"\0{source_root}\0{','.join(sorted(packages))}".encode())
-        if tsconfig_bytes:
-            digest.update(b"\0")
-            digest.update(tsconfig_bytes)
-        engine_sha = digest.hexdigest()
+            base_digest.update(f"\0{pkg_name}:{ver}".encode())
         tsconfig_sha = (
             "sha256:" + hashlib.sha256(tsconfig_bytes).hexdigest()
             if tsconfig_bytes
@@ -350,27 +348,53 @@ class GraphStore:
             from .ts_extractor import parse_tsconfig_paths
 
             path_aliases = parse_tsconfig_paths(tsconfig_bytes)
+        raw_cache = {}
+
+        def get_raw(p):
+            if p not in raw_cache:
+                raw_cache[p] = loader(files[p][1]) if loader else files[p][1]
+            return raw_cache[p]
+
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
             old_rows = list(self.db.execute("SELECT path,blob_sha,module FROM files"))
             old = {row["path"]: row["blob_sha"] for row in old_rows}
             old_modules = {row["path"]: row["module"] for row in old_rows}
+            skipped = {}
+            if skip_unparseable:
+                for path, (identity, _) in sorted(files.items()):
+                    if path.endswith("__init__.py") and old.get(path) != identity:
+                        try:
+                            extract_file(path, get_raw(path))
+                        except CodeGraphParseError as exc:
+                            skipped[path] = identity
+                            sys.stderr.write(
+                                f"codegraph-slicer: warning: skipping unparseable file {path}: {exc}\n"
+                            )
+            source_root, packages = detect_layout(p for p in files if p not in skipped)
+            digest = base_digest.copy()
+            # A layout change renames modules, so every file is re-extracted.
+            digest.update(f"\0{source_root}\0{','.join(sorted(packages))}".encode())
+            if tsconfig_bytes:
+                digest.update(b"\0")
+                digest.update(tsconfig_bytes)
+            engine_sha = digest.hexdigest()
             prior_engine = self.db.execute(
                 "SELECT value FROM metadata WHERE key='engine_sha'"
             ).fetchone()
             engine_matches = prior_engine is not None and prior_engine[0] == engine_sha
-            removed = set(old) - set(files)
+            deleted = set(old) - set(files)
             changed_set = {
                 path
                 for path, (identity, _) in files.items()
-                if not engine_matches or old.get(path) != identity
+                if path not in skipped and (not engine_matches or old.get(path) != identity)
             }
-            if changed_set or removed:
+            if changed_set or deleted:
                 stem_groups: dict[str, set[str]] = defaultdict(set)
-                for p in set(files) | set(old):
+                for p in (set(files) - set(skipped)) | set(old):
                     stem_groups[_raw_stem_module(p, source_root)].add(p)
                 affected_stems = {
-                    _raw_stem_module(p, source_root) for p in (changed_set | removed)
+                    _raw_stem_module(p, source_root) for p in (changed_set | deleted)
                 }
                 for p, mod in old_modules.items():
                     raw_m = _raw_stem_module(p, source_root)
@@ -379,19 +403,29 @@ class GraphStore:
                         affected_stems.add(mod)
                 for stem in affected_stems:
                     for p in stem_groups.get(stem, ()):
-                        if p in files:
+                        if p in files and p not in skipped:
                             changed_set.add(p)
             changed = sorted(changed_set)
-            analyses = [
-                extract_file(
-                    path,
-                    loader(files[path][1]) if loader else files[path][1],
-                    packages,
-                    source_root,
-                    *( [path_aliases] if path_aliases else [] ),
-                )
-                for path in changed
-            ]
+            analyses = []
+            for path in changed:
+                try:
+                    analyses.append(
+                        extract_file(
+                            path,
+                            get_raw(path),
+                            packages,
+                            source_root,
+                            *( [path_aliases] if path_aliases else [] ),
+                        )
+                    )
+                except CodeGraphParseError as exc:
+                    if not skip_unparseable:
+                        raise
+                    skipped[path] = files[path][0]
+                    sys.stderr.write(
+                        f"codegraph-slicer: warning: skipping unparseable file {path}: {exc}\n"
+                    )
+            removed = deleted | (set(old) & set(skipped))
             for path in sorted(removed | set(changed)):
                 self.db.execute("DELETE FROM files WHERE path=?", (path,))
             taken_modules = {
@@ -448,16 +482,17 @@ class GraphStore:
                 ("packages", ",".join(sorted(packages))),
                 ("include_hidden", "1" if include_hidden else "0"),
                 ("tsconfig_sha", tsconfig_sha),
+                ("skipped_files", json.dumps(skipped, sort_keys=True)),
             ):
                 self.db.execute(
                     "INSERT INTO metadata(key,value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, value),
                 )
-            return {
+            res = {
                 "parsed_files": len(analyses),
-                "cached_files": len(files) - len(analyses),
-                "deleted_files": len(removed),
+                "cached_files": len(files) - len(analyses) - len(skipped),
+                "deleted_files": len(deleted),
                 "total_symbols": self.db.execute(
                     "SELECT count(*) FROM symbols"
                 ).fetchone()[0],
@@ -469,13 +504,16 @@ class GraphStore:
                 "packages": sorted(packages),
                 "elapsed_ms": round((monotonic() - started) * 1000, 3),
             }
+            if skip_unparseable:
+                res["skipped_unparseable"] = sorted(skipped)
+            return res
 
     def assert_fresh(self):
         """Refuse ordinary queries unless the indexed Python source is current."""
         metadata = {
             row["key"]: row["value"]
             for row in self.db.execute(
-                "SELECT key,value FROM metadata WHERE key IN ('snapshot_root','snapshot_kind','snapshot_revision','include_hidden','tsconfig_sha')"
+                "SELECT key,value FROM metadata WHERE key IN ('snapshot_root','snapshot_kind','snapshot_revision','include_hidden','tsconfig_sha','skipped_files')"
             )
         }
         root_text = metadata.get("snapshot_root")
@@ -555,6 +593,8 @@ class GraphStore:
         except (OSError, UnicodeError, ValueError) as exc:
             raise StaleSnapshotError(f"snapshot freshness cannot be verified: {exc}; run codegraph-slicer sync ROOT --db DB") from exc
         indexed = {row["path"]: row["blob_sha"] for row in self.db.execute("SELECT path,blob_sha FROM files")}
+        if metadata.get("skipped_files"):
+            indexed.update(json.loads(metadata["skipped_files"]))
         if actual != indexed:
             changed = sorted(set(actual) ^ set(indexed) or {path for path in actual if actual.get(path) != indexed.get(path)})
             detail = changed[0] if changed else "Python file set"
@@ -739,7 +779,7 @@ class GraphStore:
         return [dict(row) for row in self.db.execute(sql, args)]
 
     def upstream(self, symbol_id):
-        """Reverse static reachability, including the containing module's importers."""
+        """Reverse static reachability, excluding module-level DEFINES and self-module entrypoint hub climbing."""
         return [
             row["node"]
             for row in self.db.execute(
@@ -747,7 +787,9 @@ class GraphStore:
             WITH RECURSIVE upstream(node) AS (
                 SELECT ?
                 UNION SELECT e.source_id FROM edges e JOIN upstream u ON e.target_id=u.node
-                    WHERE e.kind IN ('CALLS','IMPORTS','TESTS','DEFINES')
+                    WHERE e.kind IN ('IMPORTS','TESTS')
+                       OR (e.kind='CALLS' AND NOT (e.source_id LIKE '%:' AND u.node LIKE e.source_id || '%'))
+                       OR (e.kind='DEFINES' AND e.source_id NOT LIKE '%:')
             ) SELECT node FROM upstream ORDER BY node
         """,
                 (symbol_id,),

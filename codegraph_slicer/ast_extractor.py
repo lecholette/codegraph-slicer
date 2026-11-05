@@ -182,6 +182,17 @@ def extract_file(
     frame_kinds: list[str] = []
     frame_globals: list[set[str]] = []
     frame_nonlocals: list[set[str]] = []
+    frame_local_types: list[dict[str, tuple[str, ...]]] = []
+    frame_local_callables: list[dict[str, tuple[str, ...]]] = []
+    type_aliases: dict[str, tuple[str, ...]] = {}
+    class_bases: dict[str, tuple[str, ...]] = {}
+    class_methods: dict[str, set[str]] = {}
+    class_fields: dict[str, dict[str, tuple[str, ...]]] = {}
+    func_returns: dict[str, tuple[str, ...]] = {}
+    container_callables: dict[str, tuple[str, ...]] = {}
+    local_function_sids: set[str] = set()
+    local_class_sids: set[str] = set()
+    protocol_classes: set[str] = set()
     is_test = is_test_path(path)
 
     def owner() -> str:
@@ -405,6 +416,175 @@ def extract_file(
             for child in ast.iter_child_nodes(node):
                 annotation(child, origin_line)
 
+    def _type_targets(node, seen_aliases: frozenset[str] = frozenset()) -> tuple[str, ...]:
+        if node is None:
+            return ()
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                return _type_targets(ast.parse(node.value, mode="eval").body, seen_aliases)
+            except SyntaxError:
+                return ()
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            left = _type_targets(node.left, seen_aliases)
+            right = _type_targets(node.right, seen_aliases)
+            return tuple(dict.fromkeys([*left, *right]))
+        if isinstance(node, ast.Subscript):
+            head = (
+                node.value.id
+                if isinstance(node.value, ast.Name)
+                else (node.value.attr if isinstance(node.value, ast.Attribute) else "")
+            )
+            if head in {
+                "Optional", "Union", "list", "List", "set", "Set",
+                "frozenset", "FrozenSet", "tuple", "Tuple", "Sequence",
+                "Iterable", "Iterator",
+            }:
+                elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                out: list[str] = []
+                for elt in elts:
+                    out.extend(_type_targets(elt, seen_aliases))
+                return tuple(dict.fromkeys(out))
+            if head in {"Annotated", "ClassVar", "Final"}:
+                first = (
+                    node.slice.elts[0]
+                    if isinstance(node.slice, ast.Tuple) and node.slice.elts
+                    else node.slice
+                )
+                return _type_targets(first, seen_aliases)
+            return _type_targets(node.value, seen_aliases)
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            if isinstance(node, ast.Name) and node.id in {
+                "None", "Any", "object", "str", "int", "float", "bool", "bytes",
+                "list", "dict", "set", "tuple", "frozenset", "Sequence", "Mapping",
+                "Iterable", "Iterator", "Callable", "Path",
+            }:
+                return ()
+            ref = reference(node)
+            if ref.startswith("?"):
+                return ()
+            if ref in type_aliases and ref not in seen_aliases:
+                return type_aliases[ref]
+            return (ref,)
+        return ()
+
+    def _extract_callable_elements(node) -> tuple[str, ...]:
+        elts: list[ast.AST] = []
+        if isinstance(node, ast.Dict):
+            elts = [v for v in node.values if v is not None]
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            elts = list(node.elts)
+        else:
+            return ()
+        targets: list[str] = []
+        for elt in elts:
+            if isinstance(elt, (ast.Name, ast.Attribute)):
+                ref = reference(elt)
+                if not ref.startswith("?"):
+                    targets.append(ref)
+            elif isinstance(elt, ast.Lambda) and isinstance(elt.body, ast.Call):
+                ref = reference(elt.body.func)
+                if not ref.startswith("?"):
+                    targets.append(ref)
+        return tuple(dict.fromkeys(targets))
+
+    def _container_lookup_targets(node) -> tuple[str, ...]:
+        # Match `TABLE.get(...)` or `TABLE[...]`
+        container_node = None
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+        ):
+            container_node = node.func.value
+        elif isinstance(node, ast.Subscript):
+            container_node = node.value
+        if isinstance(container_node, ast.Name):
+            for lcalls in reversed(frame_local_callables):
+                if container_node.id in lcalls:
+                    return lcalls[container_node.id]
+            return container_callables.get(container_node.id, ())
+        return ()
+
+    def _resolve_class_method(cls_target: str, method_name: str, visited: frozenset[str] = frozenset()) -> str:
+        if cls_target in visited:
+            return f"{cls_target}.{method_name}"
+        if cls_target in class_methods:
+            if method_name in class_methods[cls_target]:
+                return f"{cls_target}.{method_name}"
+            for base in class_bases.get(cls_target, ()):
+                if base in class_methods or base in class_bases:
+                    resolved = _resolve_class_method(base, method_name, visited | {cls_target})
+                    base_cls = resolved.rpartition(".")[0]
+                    if base_cls in class_methods and method_name in class_methods[base_cls]:
+                        return resolved
+        return f"{cls_target}.{method_name}"
+
+    def _expr_types(node) -> tuple[str, ...]:
+        if isinstance(node, ast.Name):
+            for index in range(len(frame_local_types) - 1, -1, -1):
+                if frame_kinds[index] == "class" and frame_kinds[-1] != "class":
+                    continue
+                if node.id in frame_local_types[index]:
+                    return frame_local_types[index][node.id]
+            ref = reference(node)
+            if not ref.startswith("?"):
+                return type_aliases.get(ref, (ref,))
+            return ()
+        if isinstance(node, ast.Attribute):
+            owner_types = _expr_types(node.value)
+            out: list[str] = []
+            for ot in owner_types:
+                for cls_cand in (ot, *class_bases.get(ot, ())):
+                    ftypes = class_fields.get(cls_cand, {}).get(node.attr, ())
+                    for ft in ftypes:
+                        out.extend(type_aliases.get(ft, (ft,)))
+            return tuple(dict.fromkeys(out))
+        if isinstance(node, ast.Subscript):
+            return _expr_types(node.value)
+        if isinstance(node, ast.Call):
+            out_call: list[str] = []
+            for cref in _call_targets(node.func):
+                if cref in func_returns:
+                    out_call.extend(func_returns[cref])
+                elif not cref.startswith("?") and (
+                    cref in local_class_sids
+                    or cref.rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("|", 1)[-1][:1].isupper()
+                ):
+                    out_call.append(cref)
+            return tuple(dict.fromkeys(out_call))
+        return ()
+
+    def _call_targets(func_node) -> tuple[str, ...]:
+        primary = reference(func_node)
+        if not primary.startswith("?"):
+            if "." in primary:
+                cls_part, _, m_part = primary.rpartition(".")
+                if cls_part in class_methods:
+                    return (_resolve_class_method(cls_part, m_part),)
+            return (primary,)
+        if isinstance(func_node, ast.Name):
+            for index in range(len(frame_local_callables) - 1, -1, -1):
+                if frame_kinds[index] == "class" and frame_kinds[-1] != "class":
+                    continue
+                if func_node.id in frame_local_callables[index]:
+                    return frame_local_callables[index][func_node.id]
+            return (primary,)
+        if isinstance(func_node, (ast.Call, ast.Subscript)):
+            c_targets = _container_lookup_targets(func_node)
+            if c_targets:
+                return c_targets
+        if isinstance(func_node, ast.Attribute):
+            recv_types = _expr_types(func_node.value)
+            if recv_types:
+                resolved: list[str] = []
+                for rt in recv_types:
+                    resolved.append(_resolve_class_method(rt, func_node.attr))
+                    for base in class_bases.get(rt, ()):
+                        if base in protocol_classes and func_node.attr in class_methods.get(base, ()):
+                            resolved.append(f"{base}.{func_node.attr}")
+                return tuple(dict.fromkeys(resolved))
+        return (primary,)
+
     class Visitor(ast.NodeVisitor):
         def visit_Import(self, node):
             for alias in node.names:
@@ -509,18 +689,27 @@ def extract_file(
             scope.append(node.name)
             scope_kinds.append(kind)
             local = bindings(node.body)
+            local_types: dict[str, tuple[str, ...]] = {}
+            local_callables: dict[str, tuple[str, ...]] = {}
             if not is_class:
                 args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
                 args += [
                     a for a in (node.args.vararg, node.args.kwarg) if a is not None
                 ]
+                body_rebound = set(local.keys())
                 for arg in args:
                     local[arg.arg] = "?" + arg.arg
                 # A conventional receiver is statically bound only inside its defining class.
                 if kind == "method" and args and args[0].arg in {"self", "cls"}:
-                    local[args[0].arg] = module + ":" + ".".join(scope[:-1])
+                    cls_sid = module + ":" + ".".join(scope[:-1])
+                    local[args[0].arg] = cls_sid
+                    local_types[args[0].arg] = (cls_sid,)
                 for arg in args:
                     annotation(arg.annotation)
+                    if arg.annotation is not None and arg.arg not in body_rebound:
+                        tt = _type_targets(arg.annotation)
+                        if tt:
+                            local_types[arg.arg] = tt
                 annotation(node.returns)
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
                     if default is not None:
@@ -533,8 +722,71 @@ def extract_file(
             global_names, nonlocal_names = declarations(node.body) if not is_class else (set(), set())
             frame_globals.append(global_names)
             frame_nonlocals.append(nonlocal_names)
+            frame_local_types.append(local_types)
+            frame_local_callables.append(local_callables)
+            if not is_class:
+                for stmt in branches(node):
+                    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                        vname = stmt.target.id
+                        tt = _type_targets(stmt.annotation)
+                        if tt:
+                            local_types[vname] = tt
+                        if stmt.value is not None:
+                            ct = _extract_callable_elements(stmt.value) or _container_lookup_targets(stmt.value)
+                            if ct:
+                                local_callables[vname] = ct
+                    elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                        target_node = stmt.targets[0]
+                        target_names = (
+                            [target_node.id]
+                            if isinstance(target_node, ast.Name)
+                            else (
+                                [e.id for e in target_node.elts if isinstance(e, ast.Name)]
+                                if isinstance(target_node, (ast.Tuple, ast.List))
+                                else []
+                            )
+                        )
+                        if len(target_names) == 1:
+                            ct = _extract_callable_elements(stmt.value) or _container_lookup_targets(stmt.value)
+                            if ct:
+                                local_callables[target_names[0]] = ct
+                        if target_names and isinstance(stmt.value, ast.Call):
+                            ret_types: list[str] = []
+                            for cref in _call_targets(stmt.value.func):
+                                if cref in func_returns:
+                                    ret_types.extend(func_returns[cref])
+                                elif not cref.startswith("?") and (
+                                    cref in local_class_sids
+                                    or cref.rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("|", 1)[-1][:1].isupper()
+                                ):
+                                    ret_types.append(cref)
+                            if ret_types:
+                                dedup_rt = tuple(dict.fromkeys(ret_types))
+                                for vname in target_names:
+                                    local_types[vname] = dedup_rt
+                    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                        iter_types = list(_expr_types(stmt.iter))
+                        if not iter_types and isinstance(stmt.iter, ast.Call):
+                            for cref in _call_targets(stmt.iter.func):
+                                if cref in func_returns:
+                                    iter_types.extend(func_returns[cref])
+                        if iter_types:
+                            dedup_it = tuple(dict.fromkeys(iter_types))
+                            target_names = (
+                                [stmt.target.id]
+                                if isinstance(stmt.target, ast.Name)
+                                else (
+                                    [e.id for e in stmt.target.elts if isinstance(e, ast.Name)]
+                                    if isinstance(stmt.target, (ast.Tuple, ast.List))
+                                    else []
+                                )
+                            )
+                            for vname in target_names:
+                                local_types[vname] = dedup_it
             for statement in node.body:
                 self.visit(statement)
+            frame_local_callables.pop()
+            frame_local_types.pop()
             frames.pop()
             frame_kinds.pop()
             frame_globals.pop()
@@ -561,7 +813,11 @@ def extract_file(
             frame_kinds.append("function")
             frame_globals.append(set())
             frame_nonlocals.append(set())
+            frame_local_types.append({})
+            frame_local_callables.append({})
             self.visit(node.body)
+            frame_local_callables.pop()
+            frame_local_types.pop()
             frames.pop()
             frame_kinds.pop()
             frame_globals.pop()
@@ -573,6 +829,8 @@ def extract_file(
             frame_kinds.append("comprehension")
             frame_globals.append(set())
             frame_nonlocals.append(set())
+            frame_local_types.append({})
+            frame_local_callables.append({})
 
             def bind_target(target):
                 if isinstance(target, ast.Name):
@@ -587,12 +845,32 @@ def extract_file(
                 if index:
                     self.visit(generator.iter)
                 bind_target(generator.target)
+                iter_types = list(_expr_types(generator.iter))
+                if not iter_types and isinstance(generator.iter, ast.Call):
+                    for cref in _call_targets(generator.iter.func):
+                        if cref in func_returns:
+                            iter_types.extend(func_returns[cref])
+                if iter_types:
+                    dedup_it = tuple(dict.fromkeys(iter_types))
+                    target_names = (
+                        [generator.target.id]
+                        if isinstance(generator.target, ast.Name)
+                        else (
+                            [e.id for e in generator.target.elts if isinstance(e, ast.Name)]
+                            if isinstance(generator.target, (ast.Tuple, ast.List))
+                            else []
+                        )
+                    )
+                    for vname in target_names:
+                        frame_local_types[-1][vname] = dedup_it
                 for condition in generator.ifs:
                     self.visit(condition)
             for value in values:
                 if value is not None:
                     self.visit(value)
 
+            frame_local_callables.pop()
+            frame_local_types.pop()
             frames.pop()
             frame_kinds.pop()
             frame_globals.pop()
@@ -625,7 +903,13 @@ def extract_file(
                 self.visit(node.value)
 
         def visit_Call(self, node):
-            emit(reference(node.func), "CALLS", node.lineno)
+            for target in _call_targets(node.func):
+                emit(target, "CALLS", node.lineno)
+            for arg in [*node.args, *(kw.value for kw in node.keywords if kw.value is not None)]:
+                if isinstance(arg, (ast.Name, ast.Attribute)):
+                    arg_ref = reference(arg)
+                    if not arg_ref.startswith("?") and arg_ref in local_function_sids:
+                        emit(arg_ref, "CALLS", getattr(arg, "lineno", node.lineno))
             self.generic_visit(node)
 
         def visit_Constant(self, node):
@@ -648,6 +932,119 @@ def extract_file(
     frame_kinds.append("module")
     frame_globals.append(set())
     frame_nonlocals.append(set())
+    frame_local_types.append({})
+    frame_local_callables.append({})
+
+    # Pre-scan top-level classes, methods, type aliases, fields, and dispatch tables
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            local_function_sids.add(f"{module}:{stmt.name}")
+        elif isinstance(stmt, ast.ClassDef):
+            csid = f"{module}:{stmt.name}"
+            local_class_sids.add(csid)
+            class_bases[csid] = tuple(
+                ref for b in stmt.bases if not (ref := reference(b)).startswith("?")
+            )
+            mset: set[str] = set()
+            for member in stmt.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    mset.add(member.name)
+                    local_function_sids.add(f"{csid}.{member.name}")
+            class_methods[csid] = mset
+            if any(
+                (isinstance(b, ast.Name) and b.id in {"Protocol", "ABC"})
+                or (isinstance(b, ast.Attribute) and b.attr in {"Protocol", "ABC"})
+                for b in stmt.bases
+            ):
+                protocol_classes.add(csid)
+    for psid in sorted(protocol_classes):
+        req_methods = {m for m in class_methods.get(psid, ()) if not m.startswith("__")}
+        if req_methods:
+            impls = sorted(
+                csid
+                for csid in (local_class_sids - protocol_classes)
+                if req_methods <= class_methods.get(csid, set()) or psid in class_bases.get(csid, ())
+            )
+            if impls:
+                type_aliases[psid] = (psid, *impls)
+                for impl_sid in impls:
+                    if psid not in class_bases.get(impl_sid, ()):
+                        class_bases[impl_sid] = (*class_bases.get(impl_sid, ()), psid)
+    for stmt in tree.body:
+        if isinstance(stmt, ast.TypeAlias):
+            tsid = f"{module}:{stmt.name.id}"
+            tt = _type_targets(stmt.value, frozenset({tsid}))
+            if tt:
+                type_aliases[tsid] = tt
+        elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            tname = stmt.targets[0].id
+            tsid = f"{module}:{tname}"
+            if isinstance(stmt.value, (ast.Subscript, ast.BinOp)):
+                tt = _type_targets(stmt.value, frozenset({tsid}))
+                if tt:
+                    type_aliases[tsid] = tt
+                    frames[0][tname] = tsid
+            ct = _extract_callable_elements(stmt.value)
+            if ct:
+                container_callables[tname] = ct
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.value is not None:
+            ct = _extract_callable_elements(stmt.value)
+            if ct:
+                container_callables[stmt.target.id] = ct
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.returns is not None:
+            rt = _type_targets(stmt.returns)
+            if rt:
+                func_returns[f"{module}:{stmt.name}"] = rt
+        elif isinstance(stmt, ast.ClassDef):
+            csid = f"{module}:{stmt.name}"
+            fmap: dict[str, tuple[str, ...]] = {}
+            for member in stmt.body:
+                if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.returns is not None:
+                    mrt = _type_targets(member.returns)
+                    if mrt:
+                        func_returns[f"{csid}.{member.name}"] = mrt
+                if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
+                    tt = _type_targets(member.annotation)
+                    if tt:
+                        fmap[member.target.id] = tt
+                elif isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == "__init__":
+                    init_args = [*member.args.posonlyargs, *member.args.args, *member.args.kwonlyargs]
+                    self_name = init_args[0].arg if init_args else "self"
+                    param_types: dict[str, tuple[str, ...]] = {}
+                    for a in init_args[1:]:
+                        if a.annotation is not None:
+                            att = _type_targets(a.annotation)
+                            if att:
+                                param_types[a.arg] = att
+                    for istmt in member.body:
+                        if (
+                            isinstance(istmt, ast.AnnAssign)
+                            and isinstance(istmt.target, ast.Attribute)
+                            and isinstance(istmt.target.value, ast.Name)
+                            and istmt.target.value.id == self_name
+                        ):
+                            att = _type_targets(istmt.annotation)
+                            if att:
+                                fmap[istmt.target.attr] = att
+                        elif (
+                            isinstance(istmt, ast.Assign)
+                            and len(istmt.targets) == 1
+                            and isinstance(istmt.targets[0], ast.Attribute)
+                            and isinstance(istmt.targets[0].value, ast.Name)
+                            and istmt.targets[0].value.id == self_name
+                        ):
+                            fname = istmt.targets[0].attr
+                            if isinstance(istmt.value, ast.Name) and istmt.value.id in param_types:
+                                fmap[fname] = param_types[istmt.value.id]
+                            elif isinstance(istmt.value, ast.Call) and isinstance(
+                                istmt.value.func, (ast.Name, ast.Attribute)
+                            ):
+                                cref = reference(istmt.value.func)
+                                if not cref.startswith("?"):
+                                    fmap[fname] = (cref,)
+            class_fields[csid] = fmap
+
     Visitor().visit(tree)
     skeleton = ast.unparse(_Strip().visit(copy.deepcopy(tree))) + "\n"
     symbols.insert(

@@ -547,6 +547,7 @@ def main(argv=None):
     sync.add_argument("root", help="workspace directory or Git repository")
     sync.add_argument("--db", required=True, help="SQLite database to create or replace")
     sync.add_argument("--revision", help="Git revision to index instead of workspace files (default: workspace)")
+    sync.add_argument("--skip-unparseable", action="store_true", help="skip source files that fail syntax parsing instead of aborting")
     mapping = sub.add_parser(
         "map",
         help="rank files and render a bounded repository map",
@@ -708,9 +709,9 @@ def main(argv=None):
                 opening_db = False
                 if args.cmd == "sync":
                     result = (
-                        store.sync_git_tree(args.root, args.revision)
+                        store.sync_git_tree(args.root, args.revision, skip_unparseable=args.skip_unparseable)
                         if args.revision is not None
-                        else store.sync_workspace(args.root)
+                        else store.sync_workspace(args.root, skip_unparseable=args.skip_unparseable)
                     )
                 elif args.cmd == "map":
                     if not args.snapshot:

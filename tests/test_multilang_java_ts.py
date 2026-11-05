@@ -904,4 +904,141 @@ def test_v0_2_1_tsx_syntax_error_rejection_vs_jsx_ampersand() -> None:
         extract_file("src/App.tsx", broken_tsx)
 
 
+def test_v0_2_2_python_typed_dispatch_protocol_tables_and_skip_unparseable(
+    tmp_path,
+) -> None:
+    """Verify Python typed/Protocol/inherited dispatch, table lookups, upstream non-hub, and --skip-unparseable."""
+    from dataclasses import dataclass
+    from codegraph_slicer.cli import main
+
+    repo = tmp_path / "py_workspace"
+    _write(
+        repo,
+        {
+            "pkg/__init__.py": "def broken_init(:\n",
+            "pkg/scheduler.py": """from dataclasses import dataclass
+from typing import Protocol, Union
+
+class Session(Protocol):
+    def start(self) -> list[str]: ...
+    def add(self, item: str) -> None: ...
+
+class FileSession:
+    def start(self) -> list[str]:
+        return ["file"]
+    def add(self, item: str) -> None:
+        pass
+
+class PackSession:
+    def start(self) -> list[str]:
+        return ["pack"]
+    def add(self, item: str) -> None:
+        pass
+
+class BaseStrategy:
+    def open_session(self) -> FileSession:
+        return FileSession()
+
+class FullStrategy(BaseStrategy):
+    pass
+
+class PackStrategy:
+    def open_session(self) -> PackSession:
+        return PackSession()
+
+Strategy = Union[FullStrategy, PackStrategy]
+
+@dataclass
+class Job:
+    strategy: Strategy | None = None
+
+@dataclass
+class Schedule:
+    jobs: tuple[Job, ...] = ()
+
+def _parse_full() -> FullStrategy:
+    return FullStrategy()
+
+def _parse_pack() -> PackStrategy:
+    return PackStrategy()
+
+PARSERS = {"full": _parse_full, "pack": _parse_pack}
+
+def parse_strategy(kind: str) -> Strategy:
+    if kind in PARSERS:
+        fn = PARSERS.get(kind)
+        return fn()
+    return PARSERS[kind]()
+
+def run_schedule(sched: Schedule, session: Session | None) -> list[str]:
+    if session is not None:
+        session.add("init")
+    out = [
+        tag
+        for job in sched.jobs
+        if job.strategy is not None
+        for tag in job.strategy.open_session().start()
+    ]
+    if sched.jobs and sched.jobs[0].strategy is not None:
+        sess = sched.jobs[0].strategy.open_session()
+        out.extend(sess.start())
+    return out
+
+def helper_only() -> int:
+    return 42
+
+def main_cli() -> int:
+    parse_strategy("full")
+    return 0
+
+if __name__ == "__main__":
+    main_cli()
+""",
+            "tests/test_helper.py": """from pkg.scheduler import helper_only
+
+def test_helper() -> None:
+    assert helper_only() == 42
+""",
+            "tests/test_sched.py": """from pkg.scheduler import parse_strategy, run_schedule, Schedule
+
+def test_sched() -> None:
+    parse_strategy("full")
+    run_schedule(Schedule(), None)
+""",
+        },
+    )
+
+    db = tmp_path / "graph.sqlite"
+    assert main(["sync", str(repo), "--db", str(db), "--skip-unparseable"]) == 0
+
+    with GraphStore(db) as store:
+        store.assert_fresh()
+        edges = {
+            (r["source_id"], r["target_id"], r["kind"])
+            for r in store.rows("SELECT source_id,target_id,kind FROM edges")
+        }
+        # Dispatch table resolution inside conditional block
+        assert ("pkg.scheduler:parse_strategy", "pkg.scheduler:_parse_full", "CALLS") in edges
+        assert ("pkg.scheduler:parse_strategy", "pkg.scheduler:_parse_pack", "CALLS") in edges
+
+        # Base-class inherited method & union attribute resolution
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:BaseStrategy.open_session", "CALLS") in edges
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:PackStrategy.open_session", "CALLS") in edges
+
+        # Return-type and Protocol structural dispatch
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:Session.add", "CALLS") in edges
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:FileSession.add", "CALLS") in edges
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:PackSession.add", "CALLS") in edges
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:Session.start", "CALLS") in edges
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:FileSession.start", "CALLS") in edges
+        assert ("pkg.scheduler:run_schedule", "pkg.scheduler:PackSession.start", "CALLS") in edges
+
+        # Upstream reachability does not leak into test_helper via module root or __main__
+        up_full = set(store.upstream("pkg.scheduler:_parse_full"))
+        assert "tests.test_sched:test_sched" in up_full
+        assert "tests.test_helper:test_helper" not in up_full
+        assert "tests.test_helper:" not in up_full
+
+
+
 

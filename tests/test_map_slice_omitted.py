@@ -176,7 +176,8 @@ def test_slice_json_omissions_count_records_not_body_fallback(tmp_path, capsys, 
     assert "omitted" not in full
     assert counts["upstream_callers"] == 2
     assert counts["downstream_dependencies"] == 1
-    partial_text = _invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--max-tokens", "171", "--include-callee-bodies"])
+    budget = 151 + len(str(db)) // 4
+    partial_text = _invoke(capsys, ["slice", "--db", str(db), "pkg.target:target", "--max-tokens", str(budget), "--include-callee-bodies"])
     partial = json.loads(partial_text)
     assert partial["omitted"] == {
         "types_and_schemas": 0, "upstream_callers": 2,

@@ -733,9 +733,19 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
             compact_lines.append(f"    {comment_pfx} ... (+{omitted_m} more methods)")
         compact_rec = _slice_item(row, False)
         compact_rec["text"] = f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n" + "\n".join(compact_lines)
-        if len(methods) >= 2:
+        non_ctor_methods = [
+            m for m in methods if m["qualname"].rsplit(".", 1)[-1] not in ctor_names
+        ]
+        if len(methods) >= 2 or (
+            row["file_path"].endswith((".java", ".ts", ".tsx"))
+            and len(non_ctor_methods) >= 1
+        ):
             compact_summaries[sid] = compact_rec
-        if len(methods) >= 5 and full_size >= 500:
+        if (len(methods) >= 5 and full_size >= 500) or (
+            row["file_path"].endswith((".java", ".ts", ".tsx"))
+            and len(non_ctor_methods) >= 1
+            and full_size >= 200
+        ):
             auto_summarize_ids.add(sid)
     return summaries, compact_summaries, auto_summarize_ids
 
@@ -857,7 +867,14 @@ def slice_context(
     callees = {
         sid: row
         for sid, row in callees.items()
-        if sid not in types and sid not in chosen_enclosing_classes
+        if sid not in types
+        and sid not in chosen_enclosing_classes
+        and not (
+            row["file_path"].endswith(".py")
+            and row["kind"] == "method"
+            and "." in row["qualname"]
+            and f"{row['module']}:{row['qualname'].rpartition('.')[0]}" in (set(chosen) | set(types))
+        )
     }
     sections["types_and_schemas"] = [
         item(row, True) for _, row in sorted(types.items())
@@ -923,7 +940,7 @@ def slice_context(
             max_tokens >= 2000
             and cand_row["file_path"].endswith((".java", ".ts", ".tsx"))
             and cand_row["kind"] in {"method", "function", "async_function", "class"}
-            and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 40
+            and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 20
             and any(
                 c["file_path"] == cand_row["file_path"]
                 for c in chosen.values()
