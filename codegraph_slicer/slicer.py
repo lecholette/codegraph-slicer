@@ -864,11 +864,27 @@ def slice_context(
         ):
             if related["symbol_id"] not in chosen and related["symbol_id"] not in types:
                 callees[related["symbol_id"]] = related
+
+    def _is_enclosed_by_chosen(cand_row) -> bool:
+        if f"{cand_row['module']}:" in chosen:
+            return True
+        if cand_row["kind"] == "method" and "." in cand_row["qualname"]:
+            parent_sid = f"{cand_row['module']}:{cand_row['qualname'].rpartition('.')[0]}"
+            if parent_sid in chosen:
+                return True
+        return False
+
+    callers = {
+        sid: row
+        for sid, row in callers.items()
+        if not _is_enclosed_by_chosen(row)
+    }
     callees = {
         sid: row
         for sid, row in callees.items()
         if sid not in types
         and sid not in chosen_enclosing_classes
+        and not _is_enclosed_by_chosen(row)
         and not (
             row["file_path"].endswith(".py")
             and row["kind"] == "method"

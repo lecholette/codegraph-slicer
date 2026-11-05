@@ -366,7 +366,7 @@ def test_multilang_slice_m1_m4_and_delta_gates(tmp_path):
     }}
     return 0;
   }}"""
-        for i in range(1, 16)
+        for i in range(1, 21)
     )
     _write(
         root,
@@ -390,9 +390,10 @@ export function saveOrder(proc: OrderProcessor, x: number): number {
         )
         m1_text = sliced_m1["sections"]["types_and_schemas"][0]["text"]
         assert "step1(inputValue: number, multiplierFactor: number): number" in m1_text
-        assert "// ... (+11 more methods)" in m1_text
+        assert "// ... (+16 more methods)" in m1_text
 
         # M4: slicing on OrderProcessor + saveOrder under tight budget (>=1000) condenses with // ... (N lines condensed)
+        # and does not duplicate OrderProcessor.step1 in downstream_dependencies
         sliced_m4 = slice_context(
             base_store,
             [
@@ -401,6 +402,7 @@ export function saveOrder(proc: OrderProcessor, x: number): number {
             ],
             max_tokens=1000,
         )
+        assert sliced_m4["sections"]["downstream_dependencies"] == []
         m4_text = sliced_m4["sections"]["target_implementations"][0]["text"]
         assert "// ... (" in m4_text
         assert "lines condensed;" in m4_text
