@@ -772,13 +772,18 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
                             compact_lines.append(f"    {sline}")
         class_short_name = row["qualname"].rsplit(".", 1)[-1]
         ctor_names = {"__init__", "__new__", "constructor", class_short_name}
-        kept_methods = [
+        public_methods = [
             m for m in methods
+            if not m["signature"].lstrip().startswith("private ")
+        ]
+        candidate_methods = public_methods if public_methods else methods
+        kept_methods = [
+            m for m in candidate_methods
             if m["qualname"].rsplit(".", 1)[-1] in (ctor_names | referenced_names)
         ]
-        max_kept = 18 if (row["file_path"].endswith(".java") and len(methods) <= 18) else 4
-        max_cap = 18 if (row["file_path"].endswith(".java") and len(methods) <= 18) else 6
-        for m in methods:
+        max_kept = 18 if (row["file_path"].endswith(".java") and len(candidate_methods) <= 18) else 4
+        max_cap = 18 if (row["file_path"].endswith(".java") and len(candidate_methods) <= 18) else 6
+        for m in candidate_methods:
             if len(kept_methods) >= max_kept:
                 break
             if m not in kept_methods:
