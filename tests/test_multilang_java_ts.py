@@ -590,3 +590,70 @@ export function main(): string[] {
         )
         assert summary_payload["summary"]["complexity_threshold_exceeded"] == 1
 
+
+def test_revision_3_1_hidden_scratch_exclusion_and_bounded_delta_summary(
+    tmp_path: Path,
+) -> None:
+    """Verify R3.1 hidden scratch-dir exclusion, stale cleanup, and bounded delta summary."""
+    from codegraph_slicer.delta import summarize_delta
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / ".backup-check").mkdir(parents=True)
+    (repo / "src" / "main.ts").write_text(
+        "export function runApp(): number { return 1; }\n", encoding="utf-8"
+    )
+    (repo / ".backup-check" / "scratch.ts").write_text(
+        "export function tempHelper(): number { return 99; }\n", encoding="utf-8"
+    )
+
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        # 1. With include_hidden=True, scratch file is indexed
+        res_hidden = store.sync_workspace(repo, include_hidden=True)
+        assert res_hidden["parsed_files"] == 2
+        paths_hidden = {r["path"] for r in store.rows("SELECT path FROM files")}
+        assert ".backup-check/scratch.ts" in paths_hidden
+
+        # 2. Default sync_workspace ignores hidden scratch dir and cleans up stale rows
+        res_clean = store.sync_workspace(repo)
+        assert res_clean["deleted_files"] == 1
+        paths_clean = {r["path"] for r in store.rows("SELECT path FROM files")}
+        assert paths_clean == {"src/main.ts"}
+
+    # 3. Default delta summary bounds untested_modified_symbols and test_coverage to 5 entries
+    syms = [f"pkg.mod:fn_{i:02d}" for i in range(20)]
+    raw_delta = {
+        "added_edges": [],
+        "removed_edges": [],
+        "complexity_drift": [
+            {"symbol": s, "cx_delta": 14 if idx < 2 else 1, "fan_out_delta": 0, "threshold_exceeded": idx < 2}
+            for idx, s in enumerate(syms)
+        ],
+        "boundary_violations": [],
+        "modified_symbols": syms,
+        "untested_modified_symbols": syms,
+        "affected_entrypoints": ["pkg.mod:fn_00"],
+        "new_cycles": [],
+        "test_coverage": [
+            {"symbol": s, "reachable_tests": ["tests.test_mod:"], "updated_or_selected_tests": []}
+            for s in syms
+        ],
+        "test_gap_note": "Static TESTS reachability and changed/selected source only; no execution or behavioral coverage is claimed.",
+    }
+    summary = summarize_delta(raw_delta, max_tokens=8000, full=False)
+    assert summary["summary"]["counts"]["untested_modified_symbols"] == 20
+    assert len(summary["untested_modified_symbols"]) == 5
+    assert summary["omitted"]["untested_modified_symbols"] == 15
+    assert len(summary["test_coverage"]) == 5
+    assert summary["omitted"]["test_coverage"] == 15
+    assert len(summary["modified_symbols"]) == 5
+    assert summary["omitted"]["modified_symbols"] == 15
+    assert summary["summary"]["complexity_threshold_exceeded"] == 2
+    assert summary["serialized_tokens"] < 650
+
+    full_res = summarize_delta(raw_delta, max_tokens=8000, full=True)
+    assert len(full_res["untested_modified_symbols"]) == 20
+    assert full_res["omitted"]["untested_modified_symbols"] == 0
+
+

@@ -265,24 +265,24 @@ def summarize_delta(
         payload["omitted"]["added_edges"] = counts["added_edges"]
         payload["omitted"]["removed_edges"] = counts["removed_edges"]
         priority = (
-            ("boundary_violations", result["boundary_violations"]),
-            ("new_cycles", result["new_cycles"]),
-            ("untested_modified_symbols", result["untested_modified_symbols"]),
+            ("boundary_violations", result["boundary_violations"], None),
+            ("new_cycles", result["new_cycles"], None),
+            ("untested_modified_symbols", result["untested_modified_symbols"], 5 if render_estimator is None and max_tokens >= 2000 else None),
             ("test_coverage", [
                 {**item, "status": status}
                 for item, status in zip(result["test_coverage"], statuses)
-            ]),
+            ], 5 if render_estimator is None and max_tokens >= 2000 else None),
             ("complexity_drift", sorted(
                 (item for item in result["complexity_drift"] if item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
-            )),
-            ("import_changes", imports),
-            ("affected_entrypoints", result["affected_entrypoints"]),
+            ), None),
+            ("import_changes", imports, 8 if render_estimator is None and max_tokens >= 2000 else None),
+            ("affected_entrypoints", result["affected_entrypoints"], 5 if render_estimator is None and max_tokens >= 2000 else None),
             ("complexity_drift", sorted(
                 (item for item in result["complexity_drift"] if not item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
-            )),
-            ("modified_symbols", result["modified_symbols"]),
+            ), 5 if render_estimator is None and max_tokens >= 2000 else None),
+            ("modified_symbols", result["modified_symbols"], 5 if render_estimator is None and max_tokens >= 2000 else None),
         )
         # Edge lists are intentionally not emitted in summary mode. Their exact
         # counts remain in summary/omitted and are retrievable with --full.
@@ -291,9 +291,12 @@ def summarize_delta(
             _with_serialized_tokens(payload)
         ) > max_tokens:
             raise InvalidBudgetError("delta summary metadata exceeds rendered Markdown budget")
-        for kind, values in priority:
+        for kind, values, cap in priority:
             key = kind
+            emitted_in_pass = 0
             for value in values:
+                if cap is not None and emitted_in_pass >= cap:
+                    break
                 payload.setdefault(key, []).append(value)
                 payload["omitted"][kind] -= 1
                 candidate = _with_serialized_tokens(payload)
@@ -305,6 +308,7 @@ def summarize_delta(
                         del payload[key]
                     payload["omitted"][kind] += 1
                     continue
+                emitted_in_pass += 1
         payload["omitted"]["import_changes"] = len(imports) - len(payload.get("import_changes", []))
     payload = _with_serialized_tokens(payload)
     if payload["serialized_tokens"] > max_tokens:

@@ -172,12 +172,17 @@ class GraphStore:
     def close(self):
         self.db.close()
 
-    def sync_workspace(self, root):
+    def sync_workspace(self, root, *, include_hidden: bool = False):
         root = Path(root).resolve(strict=True)
+        if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
+            include_hidden = True
         files = {}
         for path in _iter_workspace_files(root):
             rel = path.relative_to(root)
-            if any(part in _SKIP_DIRS for part in rel.parts):
+            if any(
+                part in _SKIP_DIRS or (not include_hidden and part.startswith("."))
+                for part in rel.parts[:-1]
+            ) or (not include_hidden and rel.name.startswith(".")):
                 continue
             if path.is_symlink() or any(
                 parent.is_symlink()
