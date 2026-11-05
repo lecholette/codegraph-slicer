@@ -23,13 +23,16 @@ codegraph-slicer sync . --db "$GRAPH"
 ```
 
 Sync is incremental: unchanged files are not reparsed, so re-run it whenever source changed.
-`map`, `slice`, `impact` and `flow` exit 2 with `StaleSnapshotError` when files changed since the sync; re-sync then.
+`map`, `slice`, `impact` and `flow` exit 2 with `StaleSnapshotError` when files changed since the sync.
+Re-sync for symbols you edited. For symbols you did not edit, `--snapshot` reads the indexed bytes without a re-sync.
 Errors go to stderr with exit 2. An empty result is exit 0.
 
 ## Commands
 
-- Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --max-tokens 1500 --format markdown`
+- Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
 - One function with its types, callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format markdown`
+- Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b`), not a shell loop. One call shares types and callers across anchors.
+- Structure only (callers, callees, types, no bodies): `slice --outline`. Outlines are not always small; keep the default budget.
 - Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown`
 - Where does a value come from (backward line slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable total --line 42 --format markdown`
 - What a value feeds (forward data slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable x --direction forward --data-only --format markdown`
@@ -53,6 +56,7 @@ Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname` 
 - Output is static evidence, not a verdict. Unresolved references do not prove absence; confirm with `grep`.
 - `impact` follows resolved `CALLS` edges backward with explicit depth and caller-node bounds. Its witnesses show call reachability, not value flow or runtime execution. It reports unresolved `CALLS` references across the indexed snapshot as potential unknown boundaries, not linked to the selected anchor; excess boundary records are counted and a truncated walk is not a complete impact set.
 - `flow` is function-local. Calls are opaque. Aliases and implicit exceptions are not modelled.
-- `flow` refuses `try`, `with`, async, generators, comprehensions, nested definitions and imports. Use `slice` for those.
+- `flow` models `try`/`except`/`finally`, `with`, `async with` and comprehensions conservatively. It refuses `await`, `yield`, lambdas, nested definitions and imports with a source location. Use `slice` for those.
 - `delta` never runs tests. Run them separately.
-- Raise `--max-tokens` if `map`, `slice` or `flow` refuses for size.
+- Do not pick a budget below the default up front. If a command refuses for size, rerun once with `--max-tokens` at the N the error prints.
+- Errors print `hint:` lines (nearest anchors, snapshot commit). Use them before retrying.
