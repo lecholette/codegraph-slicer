@@ -1,20 +1,26 @@
 ---
 name: codegraph-slicer
 description: >-
-  Static Python code graph: map, slice, flow, delta. Use for structural questions about Python code:
-  who calls X, where a value comes from, what a change touches, import cycles, forbidden imports,
-  blast radius, or base-vs-head graph changes. Not for runtime behaviour or running tests.
+  Static Python, Java, and TypeScript code graph: map, slice, flow, delta. Use for structural questions
+  about Python (.py), Java (.java), or TypeScript (.ts, .tsx) code: who calls X, where a value comes from,
+  what a change touches, import cycles, forbidden imports, blast radius, or base-vs-head graph changes.
+  Not for runtime behaviour or running tests.
 ---
 
 # codegraph-slicer
 
 Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecholette/codegraph-slicer`) and Python 3.12+.
-The indexer parses with the running interpreter, so use a Python at least as new as the indexed code.
+Indexes Python (`.py`), Java (`.java`), and TypeScript (`.ts`, `.tsx`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
+
+## Routing Threshold (`>= 25` Source Files)
+
+- **Start with `codegraph-slicer slice`** on repositories or modules with **`>= 25` relevant source files** (`.py`, `.java`, `.ts`, `.tsx`). Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading source files.
+- **Skip codegraph** for small repositories (**`< 25` relevant source files**), single-file edits, or unsupported languages. On small `< 25`-file repos, reading the target files directly is cheaper than graph indexing + slicing.
 
 ## Index first
 
-Keep the index outside the repo (or in a git-ignored path). One database holds one snapshot.
+Keep the index outside the repo (or in a git-ignored dot-directory such as `.codegraph/`). Hidden dot-directories are automatically ignored during workspace sync. One database holds one snapshot.
 
 ```bash
 GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
@@ -28,11 +34,11 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 
 ## Commands
 
-- **Do not browse or read entire large module files** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context.
-- **Skip codegraph** for small repos (< 2 files), single-file edits, or non-Python code. Reading the file directly is cheaper.
+- **Do not browse or read entire large module files** when sliced anchors are known on repos with `>= 25` source files. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
+- **Skip codegraph** for small repos (`< 25` files), single-file edits, or languages outside Python/Java/TypeScript. Reading the file directly is cheaper.
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
-- One function with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
-- Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call shares types and callers across anchors.
+- One function/method with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
+- Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call deduplicates enclosing classes, shared types, and callers across anchors.
 - Structure only (callers, callees, types, no bodies): `slice --outline`. Outlines are not always small; keep the default budget.
 - Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown` (or `--format xml`)
 - Where does a value come from (backward line slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable total --line 42 --format markdown`
@@ -42,14 +48,13 @@ Errors go to stderr with exit 2. An empty result is exit 0.
   ```bash
   codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite
   codegraph-slicer sync . --db /tmp/head.sqlite
-  codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite --full --format json > /tmp/delta.json
-  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print({k: len(v) for k, v in d.items() if isinstance(v, list)})' /tmp/delta.json
+  codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite
   ```
 
-  `--full` requests raw delta details. Print counts first; JSON can be large, so inspect only the entries you need.
+  Default `delta` JSON bounds each summary list to at most 5 items (`omitted_summary_items` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
   Add `--forbid-import SRC_PREFIX TGT_PREFIX` for layer rules.
 
-Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname` or `path/file.py:LINE`.
+Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`, `path/File.java:Class.method`, `path/file.ts:Class.method`, or `path/file:LINE`.
 `flow` takes only function or method anchors.
 
 ## Limits (state them when you cite output)

@@ -458,3 +458,202 @@ def test_java_and_ts_parse_errors_raise_codegraph_parse_error():
         extract_file("broken.ts", b"export function f(a: number { return a; }")
     with pytest.raises(CodeGraphError, match="invalid Python path"):
         extract_file("ambient.d.ts", b"export declare function f(): void;")
+
+
+def test_revision_2_slice_headers_sibling_bodies_and_builtin_filtering(tmp_path):
+    from codegraph_slicer.delta import summarize_delta
+
+    root = tmp_path / "rev2_ts"
+    _write(
+        root,
+        {
+            "src/models/types.ts": """export type EventKind = "START" | "END";
+
+export interface EventRecord {
+  kind: EventKind;
+  name: string;
+}
+
+export interface JobInput {
+  id: string;
+}
+""",
+            "src/services/executor.ts": """import * as path from "node:path";
+import type { EventRecord, JobInput } from "../models/types.ts";
+
+export class Executor {
+  public events: EventRecord[] = [];
+
+  public run(job: JobInput): string[] {
+    const items: string[] = [];
+    const walk = (p: string) => {
+      items.push(p.trim());
+    };
+    walk(this.normalize(job.id));
+    return items.map((x) => String(x));
+  }
+
+  private normalize(raw: string): string {
+    return path.posix.normalize(raw);
+  }
+}
+""",
+            "src/cli.ts": """import { Executor } from "./services/executor.ts";
+
+export function main(): string[] {
+  const ex = new Executor();
+  return ex.run({ id: "a" });
+}
+""",
+        },
+    )
+
+    with GraphStore(":memory:") as store:
+        stats = store.sync_workspace(root)
+        # R5: local closure `walk`, built-in `String`, and `.push`/`.trim`/`.map` do not emit unresolved diagnostics
+        diag_targets = [
+            r["target"]
+            for r in store.rows(
+                "SELECT target FROM diagnostics WHERE source_id='services.executor:Executor.run'"
+            )
+        ]
+        assert not any(
+            t in {"?walk", "?String", "?items.push", "?items.map", "?p.trim"}
+            for t in diag_targets
+        )
+
+        # Slice on Executor.run and cli:main
+        sliced = slice_context(
+            store,
+            ["services.executor:Executor.run", "cli:main"],
+            max_tokens=4000,
+        )
+        sections = sliced["sections"]
+
+        # R1: Executor.run target includes file imports + class header & fields
+        run_entry = next(
+            e
+            for e in sections["target_implementations"]
+            if e["symbol"] == "services.executor:Executor.run"
+        )
+        assert "// File & class header" in run_entry["text"]
+        assert 'import * as path from "node:path";' in run_entry["text"]
+        assert "export class Executor {" in run_entry["text"]
+        assert "public events: EventRecord[] = [];" in run_entry["text"]
+
+        # R2: compact sibling method `Executor.normalize` includes its full body in downstream_dependencies
+        norm_entry = next(
+            e
+            for e in sections["downstream_dependencies"]
+            if e["symbol"] == "services.executor:Executor.normalize"
+        )
+        assert "return path.posix.normalize(raw);" in norm_entry["text"]
+
+        # R3: Enclosing class USES_TYPE closure pulls in EventRecord -> EventKind into types_and_schemas
+        type_syms = {e["symbol"] for e in sections["types_and_schemas"]}
+        assert "models.types:EventRecord" in type_syms
+        assert "models.types:EventKind" in type_syms
+        assert "models.types:JobInput" in type_syms
+
+        # R4: Bare enclosing class `services.executor:Executor` is suppressed from downstream_dependencies
+        downstream_syms = {e["symbol"] for e in sections["downstream_dependencies"]}
+        assert "services.executor:Executor" not in downstream_syms
+
+        # R6: summarize_delta includes `complexity_threshold_exceeded` count when complexity_drift > 0
+        summary_payload = summarize_delta(
+            {
+                "added_edges": [],
+                "removed_edges": [],
+                "complexity_drift": [
+                    {
+                        "symbol": "services.executor:Executor.run",
+                        "cx_delta": 12,
+                        "fan_out_delta": 0,
+                        "threshold_exceeded": True,
+                    },
+                    {
+                        "symbol": "cli:main",
+                        "cx_delta": 1,
+                        "fan_out_delta": 0,
+                        "threshold_exceeded": False,
+                    },
+                ],
+                "boundary_violations": [],
+                "modified_symbols": ["services.executor:Executor.run", "cli:main"],
+                "untested_modified_symbols": [],
+                "affected_entrypoints": ["cli:main"],
+                "new_cycles": [],
+                "test_coverage": [],
+                "test_gap_note": "note",
+            },
+            max_tokens=2000,
+        )
+        assert summary_payload["summary"]["complexity_threshold_exceeded"] == 1
+
+
+def test_revision_3_1_hidden_scratch_exclusion_and_bounded_delta_summary(
+    tmp_path,
+) -> None:
+    """Verify R3.1 hidden scratch-dir exclusion, stale cleanup, and bounded delta summary."""
+    from codegraph_slicer.delta import summarize_delta
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / ".backup-check").mkdir(parents=True)
+    (repo / "src" / "main.ts").write_text(
+        "export function runApp(): number { return 1; }\n", encoding="utf-8"
+    )
+    (repo / ".backup-check" / "scratch.ts").write_text(
+        "export function tempHelper(): number { return 99; }\n", encoding="utf-8"
+    )
+
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        # 1. With include_hidden=True, scratch file is indexed
+        res_hidden = store.sync_workspace(repo, include_hidden=True)
+        assert res_hidden["parsed_files"] == 2
+        paths_hidden = {r["path"] for r in store.rows("SELECT path FROM files")}
+        assert ".backup-check/scratch.ts" in paths_hidden
+
+        # 2. Default sync_workspace ignores hidden scratch dir and cleans up stale rows
+        res_clean = store.sync_workspace(repo)
+        assert res_clean["deleted_files"] == 1
+        paths_clean = {r["path"] for r in store.rows("SELECT path FROM files")}
+        assert paths_clean == {"src/main.ts"}
+
+    # 3. Default delta summary bounds untested_modified_symbols and test_coverage to 5 entries
+    syms = [f"pkg.mod:fn_{i:02d}" for i in range(20)]
+    raw_delta = {
+        "added_edges": [],
+        "removed_edges": [],
+        "complexity_drift": [
+            {"symbol": s, "cx_delta": 14 if idx < 2 else 1, "fan_out_delta": 0, "threshold_exceeded": idx < 2}
+            for idx, s in enumerate(syms)
+        ],
+        "boundary_violations": [],
+        "modified_symbols": syms,
+        "untested_modified_symbols": syms,
+        "affected_entrypoints": ["pkg.mod:fn_00"],
+        "new_cycles": [],
+        "test_coverage": [
+            {"symbol": s, "reachable_tests": ["tests.test_mod:"], "updated_or_selected_tests": []}
+            for s in syms
+        ],
+        "test_gap_note": "Static TESTS reachability and changed/selected source only; no execution or behavioral coverage is claimed.",
+    }
+    summary = summarize_delta(raw_delta, max_tokens=8000, full=False)
+    assert summary["summary"]["counts"]["untested_modified_symbols"] == 20
+    assert len(summary["untested_modified_symbols"]) == 5
+    assert summary["omitted"]["untested_modified_symbols"] == 15
+    assert len(summary["test_coverage"]) == 5
+    assert summary["omitted"]["test_coverage"] == 15
+    assert len(summary["modified_symbols"]) == 5
+    assert summary["omitted"]["modified_symbols"] == 15
+    assert summary["summary"]["complexity_threshold_exceeded"] == 2
+    assert summary["serialized_tokens"] < 650
+
+    full_res = summarize_delta(raw_delta, max_tokens=8000, full=True)
+    assert len(full_res["untested_modified_symbols"]) == 20
+    assert full_res["omitted"]["untested_modified_symbols"] == 0
+
+
