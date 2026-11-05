@@ -700,7 +700,21 @@ def _first_docstring_line(body: str):
         doc = ast.get_docstring(parsed.body[0]) if parsed.body else None
     except (SyntaxError, IndexError):
         doc = None
-    return doc.splitlines()[0] if doc else None
+    if doc:
+        return doc.splitlines()[0]
+    lines = body.splitlines()
+    comment_lines = []
+    for line in lines[1:10]:
+        s = line.strip()
+        if s.startswith("//"):
+            comment_lines.append(f"    {s}")
+        elif s.startswith(("/*", "*")) and not s.startswith("*/"):
+            cleaned = s.lstrip("/* ").rstrip("*/ ").strip()
+            if cleaned:
+                comment_lines.append(f"    // {cleaned}")
+        elif comment_lines or (s and not s.startswith("*/")):
+            break
+    return "\n".join(comment_lines) if comment_lines else None
 
 
 def _build_type_summaries(store, class_types, referenced_names, database, max_tokens):
