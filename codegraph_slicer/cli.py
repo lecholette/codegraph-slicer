@@ -9,6 +9,7 @@ import stat
 from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
+import xml.sax.saxutils as _saxutils
 
 from .ast_extractor import CodeGraphError
 from .delta import compute_delta, project_delta_v2, summarize_delta
@@ -171,6 +172,138 @@ def _flow_markdown(result):
             return rendered
         estimate = updated
     raise FlowBudgetExceeded("flow Markdown token estimate did not reach a fixed point")
+
+
+def _xml_attr(val):
+    return _saxutils.quoteattr(str(val))
+
+
+def _xml(result):
+    if "schema_version" in result and "entities" in result and "edges" in result:
+        blocks = [f'<slice_outline schema_version="{result["schema_version"]}" tokens="{result.get("tokens", 0)}">']
+        blocks.append("  <entities>")
+        for entity in result["entities"]:
+            blocks.append(
+                f'    <entity id={_xml_attr(entity.get("id", ""))} '
+                f'kind={_xml_attr(entity.get("kind", ""))} '
+                f'symbol={_xml_attr(entity.get("symbol", ""))} '
+                f'path={_xml_attr(entity.get("path", ""))} '
+                f'line={_xml_attr(entity.get("line", ""))} '
+                f'signature={_xml_attr(entity.get("signature", ""))} />'
+            )
+        blocks.append("  </entities>")
+        blocks.append("  <edges>")
+        for edge in result["edges"]:
+            blocks.append(
+                f'    <edge kind={_xml_attr(edge.get("kind", ""))} '
+                f'from={_xml_attr(edge.get("from", ""))} '
+                f'to={_xml_attr(edge.get("to", ""))} '
+                f'line={_xml_attr(edge.get("line", ""))} />'
+            )
+        blocks.append("  </edges>")
+        if result.get("omitted"):
+            blocks.append("  <omitted>")
+            for k, v in result["omitted"].items():
+                if v:
+                    blocks.append(f'    <{k} count="{v}" />')
+            blocks.append("  </omitted>")
+        blocks.append("</slice_outline>")
+        return "\n".join(blocks)
+
+    if "schema_version" in result and "files" in result and "edges" in result:
+        blocks = [f'<repository_outline schema_version="{result["schema_version"]}" tokens="{result.get("tokens", 0)}">']
+        for file in result["files"]:
+            blocks.append(f'  <file id={_xml_attr(file.get("id", ""))} path={_xml_attr(file.get("path", ""))}>')
+            for entity in file.get("entities", []):
+                blocks.append(
+                    f'    <entity id={_xml_attr(entity.get("id", ""))} '
+                    f'kind={_xml_attr(entity.get("kind", ""))} '
+                    f'name={_xml_attr(entity.get("name", ""))} '
+                    f'line={_xml_attr(entity.get("line", ""))} '
+                    f'signature={_xml_attr(entity.get("signature", ""))} />'
+                )
+            blocks.append("  </file>")
+        if result.get("edges"):
+            blocks.append("  <edges>")
+            for edge in result["edges"]:
+                blocks.append(
+                    f'    <edge kind={_xml_attr(edge.get("kind", ""))} '
+                    f'from={_xml_attr(edge.get("from", ""))} '
+                    f'to={_xml_attr(edge.get("to", ""))} />'
+                )
+            blocks.append("  </edges>")
+        blocks.append("</repository_outline>")
+        return "\n".join(blocks)
+
+    if result.get("profile") == "python-call-impact-v2":
+        blocks = [f'<call_impact anchor={_xml_attr(result.get("anchor", ""))} tokens="{result.get("tokens", 0)}">']
+        for caller in result.get("callers", []):
+            blocks.append(
+                f'  <caller id={_xml_attr(caller.get("id", ""))} '
+                f'symbol={_xml_attr(caller.get("symbol", ""))} '
+                f'depth={_xml_attr(caller.get("depth", ""))} '
+                f'file={_xml_attr(caller.get("file", ""))} '
+                f'line={_xml_attr(caller.get("line", ""))} />'
+            )
+        blocks.append("</call_impact>")
+        return "\n".join(blocks)
+
+    if "sections" in result:
+        blocks = [f'<context tokens="{result.get("tokens", 0)}">']
+        if "omitted" in result:
+            blocks.append("  <omitted>")
+            for k, v in result["omitted"].items():
+                if v:
+                    blocks.append(f'    <{k} count="{v}" />')
+            blocks.append("  </omitted>")
+        names = list(result["sections"])
+        if "target_implementations" in names:
+            names = ["target_implementations"] + [n for n in names if n != "target_implementations"]
+        for section_name in names:
+            items = result["sections"][section_name]
+            if not items:
+                continue
+            blocks.append(f"  <{section_name}>")
+            for item in items:
+                sym_attr = f' symbol={_xml_attr(item["symbol"])}' if "symbol" in item else ""
+                file_attr = f' file={_xml_attr(item["file_path"])}' if item.get("file_path") else ""
+                start = item.get("start_line")
+                end = item.get("end_line")
+                lines_attr = f' lines="{start}-{end}"' if start and end else ""
+                blocks.append(f'    <code_slice{sym_attr}{file_attr}{lines_attr}>')
+                blocks.append(item.get("text", "").rstrip())
+                blocks.append("    </code_slice>")
+            blocks.append(f"  </{section_name}>")
+        blocks.append("</context>")
+        return "\n".join(blocks)
+
+    if "items" in result:
+        blocks = [f'<repository_map tokens="{result.get("tokens", 0)}">']
+        if "omitted" in result:
+            blocks.append("  <omitted>")
+            for k, v in result["omitted"].items():
+                if v:
+                    blocks.append(f'    <{k} count="{v}" />')
+            blocks.append("  </omitted>")
+        for item in result["items"]:
+            file_path = item.get("file_path") or item.get("path")
+            file_attr = f' path={_xml_attr(file_path)}' if file_path else ""
+            sym_attr = f' symbol={_xml_attr(item["symbol"])}' if "symbol" in item else ""
+            blocks.append(f'  <file{file_attr}{sym_attr}>')
+            blocks.append(item.get("text", "").rstrip())
+            blocks.append("  </file>")
+        blocks.append("</repository_map>")
+        return "\n".join(blocks)
+
+    return f"<codegraph_report>\n{json.dumps(result, indent=2)}\n</codegraph_report>"
+
+
+def _render_budget_estimator(output_format, markdown_est=None):
+    if output_format == "markdown":
+        return markdown_est if markdown_est is not None else (lambda candidate: rendered_tokens(_markdown(candidate)))
+    if output_format == "xml":
+        return lambda candidate: rendered_tokens(_xml(candidate))
+    return None
 
 
 def _markdown(result):
@@ -418,7 +551,7 @@ def main(argv=None):
             "context budget. Anchors may be symbol IDs, package.module:,\n"
             "path.py:qualname, or path.py:line."
         ),
-        epilog="Example: codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.module:helper\nNext: inspect the JSON, or add --format markdown for readable context.",
+        epilog="Example: codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.module:helper\nNext: inspect the JSON, or add --format markdown or --format xml for readable context.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     slicing.add_argument("--db", required=True, help="existing indexed SQLite database")
@@ -504,7 +637,7 @@ def main(argv=None):
     delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
     for command in (sync, mapping, slicing, impact, flow, delta):
-        command.add_argument("--format", choices=("json", "markdown"), default="json", help="output representation (default: json)")
+        command.add_argument("--format", choices=("json", "markdown", "xml"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
     if args.cmd == "delta" and args.edge_sample_limit is not None and args.edge_sample_limit < 1:
         parser.error("--edge-sample-limit must be at least 1")
@@ -532,9 +665,7 @@ def main(argv=None):
                     base, head, args.forbid_import, selected_tests=args.selected_test,
                     _earliest_edge_lines=use_v2,
                 )
-                markdown_budget = (
-                    lambda candidate: rendered_tokens(_markdown(candidate))
-                ) if args.format == "markdown" else None
+                render_budget = _render_budget_estimator(args.format)
                 if use_v2:
                     result = project_delta_v2(
                         result, args.max_tokens, anchors=args.anchor, kinds=args.kind,
@@ -542,13 +673,13 @@ def main(argv=None):
                             20 if args.edge_sample_limit is None else args.edge_sample_limit
                         ),
                         selected_tests=bool(args.selected_test),
-                        render_estimator=markdown_budget,
+                        render_estimator=render_budget,
                     )
                 else:
                     result = summarize_delta(
                         result, args.max_tokens, full=args.full,
                         selected_tests=bool(args.selected_test),
-                        render_estimator=markdown_budget,
+                        render_estimator=render_budget,
                     )
             else:
                 opening_db_path = str(Path(args.db).resolve())
@@ -566,16 +697,12 @@ def main(argv=None):
                     if args.outline:
                         result = build_repo_outline(
                             store, args.seed, args.max_tokens,
-                            render_estimator=(
-                                _OutlineMarkdownEstimator()
-                            ) if args.format == "markdown" else None,
+                            render_estimator=_render_budget_estimator(args.format, _OutlineMarkdownEstimator()),
                         )
                     else:
                         result = build_repo_map(
                             store, args.seed, args.max_tokens,
-                            render_estimator=(
-                                _MapMarkdownEstimator()
-                            ) if args.format == "markdown" else None,
+                            render_estimator=_render_budget_estimator(args.format, _MapMarkdownEstimator()),
                         )
                 elif args.cmd == "flow":
                     if not args.snapshot:
@@ -587,6 +714,8 @@ def main(argv=None):
                         render_estimator=(
                             (lambda candidate: rendered_tokens(_markdown(candidate)))
                             if args.format == "markdown"
+                            else (lambda candidate: rendered_tokens(_xml(candidate)))
+                            if args.format == "xml"
                             else (lambda candidate: rendered_tokens(json.dumps(
                                 candidate, ensure_ascii=False, separators=(",", ":")
                             )))
@@ -598,6 +727,8 @@ def main(argv=None):
                             (
                                 (lambda candidate: rendered_tokens(_markdown(candidate)))
                                 if args.format == "markdown"
+                                else (lambda candidate: rendered_tokens(_xml(candidate)))
+                                if args.format == "xml"
                                 else (lambda candidate: rendered_tokens(json.dumps(
                                     candidate, ensure_ascii=False, separators=(",", ":")
                                 )))
@@ -612,9 +743,7 @@ def main(argv=None):
                         max_nodes=args.max_nodes,
                         unknown_boundary_limit=args.unknown_boundaries,
                         max_tokens=args.max_tokens, database=args.db, output_format=args.format,
-                        render_estimator=(
-                            lambda candidate: rendered_tokens(_markdown(candidate))
-                        ) if args.format == "markdown" else None,
+                        render_estimator=_render_budget_estimator(args.format),
                     )
                 else:
                     if not args.snapshot:
@@ -623,27 +752,30 @@ def main(argv=None):
                         result = build_slice_outline(
                             store, args.anchors, args.max_tokens,
                             include_imports=args.include_imports,
-                            render_estimator=(
-                                lambda candidate: rendered_tokens(_markdown(candidate))
-                            ) if args.format == "markdown" else None,
+                            render_estimator=_render_budget_estimator(args.format),
                         )
                     else:
                         result = slice_context(
                             store, args.anchors, args.max_tokens, args.include_callee_bodies,
                             database=args.db,
-                            render_estimator=(
-                                lambda candidate: rendered_tokens(_markdown(candidate))
-                            ) if args.format == "markdown" else None,
+                            render_estimator=_render_budget_estimator(args.format),
                         )
-        rendered = _markdown(result) if args.format == "markdown" else json.dumps(
-            result, ensure_ascii=False, separators=(",", ":")
-        )
+        if args.format == "markdown":
+            rendered = _markdown(result)
+        elif args.format == "xml":
+            rendered = _xml(result)
+        else:
+            rendered = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
         if args.cmd in ("map", "slice", "impact", "flow", "delta") and rendered_tokens(rendered) > args.max_tokens:
             from .slicer import InvalidBudgetError
             if args.cmd == "flow":
                 label = "printed flow output"
+            elif args.format == "markdown":
+                label = "rendered Markdown"
+            elif args.format == "xml":
+                label = "rendered XML"
             else:
-                label = "rendered Markdown" if args.format == "markdown" else "printed JSON"
+                label = "printed JSON"
             raise InvalidBudgetError(f"{label} exceeds budget {args.max_tokens}")
         print(rendered)
         return 0

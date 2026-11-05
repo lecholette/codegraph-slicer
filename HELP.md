@@ -92,7 +92,7 @@ Next, pass the created database to `map` or `slice`.
 ```text
 codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
                       [--max-tokens N] [--outline]
-                      [--format json|markdown]
+                      [--format json|markdown|xml]
 ```
 
 `--db` must name an existing index and is opened read-only. Repeat `--seed` to
@@ -135,7 +135,7 @@ its implementation and related context.
 ```text
 codegraph-slicer slice --db DATABASE ANCHOR [ANCHOR ...]
                        [--max-tokens N] [--include-callee-bodies] [--outline]
-                       [--format json|markdown]
+                       [--format json|markdown|xml]
 ```
 
 `--db` must be an existing index and is opened read-only. Supply one or more

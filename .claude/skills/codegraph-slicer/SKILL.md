@@ -30,10 +30,10 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 ## Commands
 
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
-- One function with its types, callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format markdown`
+- One function with its types, callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format markdown` (or `--format xml` for clean XML token-delimited code blocks)
 - Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b`), not a shell loop. One call shares types and callers across anchors.
 - Structure only (callers, callees, types, no bodies): `slice --outline`. Outlines are not always small; keep the default budget.
-- Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown`
+- Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown` (or `--format xml`)
 - Where does a value come from (backward line slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable total --line 42 --format markdown`
 - What a value feeds (forward data slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable x --direction forward --data-only --format markdown`
 - Branch vs base: sync each revision into its own database, then diff them:
