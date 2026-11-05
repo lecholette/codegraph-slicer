@@ -79,6 +79,34 @@ def _anchor(store, anchor):
             )
         if len(rows) >= 1:
             return rows[0]
+    if separator and "." in path and target:
+        java_cls = path.rsplit(".", 1)[-1]
+        java_cand = f"{path}:{java_cls}.{target}"
+        java_rows = store.rows(
+            "SELECT * FROM symbols WHERE symbol_id=? AND file_path LIKE '%.java'",
+            (java_cand,),
+        )
+        if java_rows:
+            return java_rows[0]
+    elif not separator and "." in anchor:
+        java_cls = anchor.rsplit(".", 1)[-1]
+        java_cand = f"{anchor}:{java_cls}"
+        java_rows = store.rows(
+            "SELECT * FROM symbols WHERE symbol_id=? AND file_path LIKE '%.java'",
+            (java_cand,),
+        )
+        if java_rows:
+            return java_rows[0]
+        cls_fqcn, _, member = anchor.rpartition(".")
+        if "." in cls_fqcn and member:
+            outer_cls = cls_fqcn.rsplit(".", 1)[-1]
+            java_method_cand = f"{cls_fqcn}:{outer_cls}.{member}"
+            java_m_rows = store.rows(
+                "SELECT * FROM symbols WHERE symbol_id=? AND file_path LIKE '%.java'",
+                (java_method_cand,),
+            )
+            if java_m_rows:
+                return java_m_rows[0]
     error = AnchorNotFoundError(anchor)
     rows = sorted(
         store.rows("SELECT file_path,module,qualname FROM symbols"),
@@ -714,18 +742,34 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
+        if row["file_path"].endswith(".java"):
+            nested_classes = store.rows(
+                """SELECT * FROM symbols WHERE file_path=? AND kind='class'
+                   AND qualname GLOB ? ORDER BY start_line, symbol_id""",
+                (row["file_path"], f"{row['qualname']}.*"),
+            )
+            for nc in nested_classes:
+                if nc["qualname"].rpartition(".")[0] == row["qualname"] and (
+                    nc["end_line"] - nc["start_line"] <= 30
+                ):
+                    for nline in nc["body"].splitlines():
+                        sline = nline.strip()
+                        if sline.startswith(("public final ", "public static class ", "public " + nc["qualname"].rsplit(".", 1)[-1] + "(")):
+                            compact_lines.append(f"    {sline}")
         class_short_name = row["qualname"].rsplit(".", 1)[-1]
         ctor_names = {"__init__", "__new__", "constructor", class_short_name}
         kept_methods = [
             m for m in methods
             if m["qualname"].rsplit(".", 1)[-1] in (ctor_names | referenced_names)
         ]
+        max_kept = 18 if (row["file_path"].endswith(".java") and len(methods) <= 18) else 4
+        max_cap = 18 if (row["file_path"].endswith(".java") and len(methods) <= 18) else 6
         for m in methods:
-            if len(kept_methods) >= 4:
+            if len(kept_methods) >= max_kept:
                 break
             if m not in kept_methods:
                 kept_methods.append(m)
-        kept_methods = kept_methods[:6]
+        kept_methods = kept_methods[:max_cap]
         compact_lines.extend(f"    {method['signature']}" for method in kept_methods)
         omitted_m = len(methods) - len(kept_methods)
         if omitted_m > 0:
@@ -831,6 +875,12 @@ def slice_context(
         if row["kind"] == "method" and "." in row["qualname"]:
             enclosing_class_sid = f"{row['module']}:{row['qualname'].rpartition('.')[0]}"
             type_seeds.append(enclosing_class_sid)
+        elif row["kind"] == "class" and row["file_path"].endswith((".java", ".ts", ".tsx")):
+            for mrow in store.rows(
+                "SELECT target_id FROM edges WHERE source_id=? AND kind='DEFINES'",
+                (sid,),
+            ):
+                type_seeds.append(mrow["target_id"])
         for seed_id in type_seeds:
             for related in store.rows(
                 """WITH RECURSIVE closure(node,depth) AS (
