@@ -31,12 +31,23 @@ _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
 
 
+def _fence_lang(path: str) -> str:
+    if path.endswith(".java"):
+        return "java"
+    if path.endswith(".tsx"):
+        return "tsx"
+    if path.endswith(".ts"):
+        return "typescript"
+    return "python"
+
+
 def _map_markdown_item(item):
     fence = "`" * max(
         3,
         1 + max((len(run) for run in re.findall(r"`+", item["text"])), default=0),
     )
-    return f"### {item['symbol']}\n\n{fence}python\n{item['text']}\n{fence}"
+    lang = _fence_lang(item.get("path", ""))
+    return f"### {item['symbol']}\n\n{fence}{lang}\n{item['text']}\n{fence}"
 
 
 class _MapMarkdownEstimator:

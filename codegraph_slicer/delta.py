@@ -1,6 +1,6 @@
 """Static graph differences; test reachability never asserts tests were executed."""
 
-from .ast_extractor import CodeGraphError, plain_target
+from .ast_extractor import CodeGraphError, is_test_path, plain_target
 from .slicer import rendered_tokens
 
 
@@ -138,8 +138,7 @@ def compute_delta(
     tests = {
         sid
         for sid, row in head.items()
-        if any(part == "tests" for part in row["file_path"].split("/"))
-        or row["file_path"].split("/")[-1].startswith("test_")
+        if is_test_path(row["file_path"])
     }
     selected = set()
     for name in selected_tests:
@@ -164,9 +163,7 @@ def compute_delta(
         current = head.get(sid, base.get(sid))
         if current is None:
             continue
-        is_test = any(part == "tests" for part in current["file_path"].split("/")) or (
-            current["file_path"].split("/")[-1].startswith("test_")
-        )
+        is_test = is_test_path(current["file_path"])
         for node in upstream:
             row = head.get(node, base.get(node))
             if row and (

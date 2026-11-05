@@ -5,7 +5,7 @@ import json
 import difflib
 import shlex
 import textwrap
-from .ast_extractor import CodeGraphError
+from .ast_extractor import CodeGraphError, is_test_path
 
 
 class AnchorNotFoundError(CodeGraphError):
@@ -448,7 +448,10 @@ def _slice_item(row, full):
 
 
 def _is_test_symbol(row):
-    parts = row["file_path"].replace("\\", "/").split("/")
+    path = row["file_path"].replace("\\", "/")
+    if is_test_path(path):
+        return True
+    parts = path.split("/")
     name = parts[-1]
     return (
         any(p in {"tests", "test", "t"} for p in parts[:-1])
@@ -456,6 +459,10 @@ def _is_test_symbol(row):
         or name.endswith("_test.py")
         or name in {"conftest.py", "tests.py"}
     )
+
+
+def _comment_prefix(path: str) -> str:
+    return "//" if path.endswith((".java", ".ts", ".tsx")) else "#"
 
 
 def _first_code_line_offset(body: str) -> int:
@@ -473,7 +480,10 @@ def _first_code_line_offset(body: str) -> int:
             if stmts:
                 return max(1, stmts[0].lineno - 1)
     except SyntaxError:
-        pass
+        lines = body.splitlines()
+        for idx, line in enumerate(lines[:15]):
+            if "{" in line:
+                return min(idx + 1, max(1, len(lines) - 1))
     return 1
 
 
@@ -483,6 +493,7 @@ def _caller_item(row, call_lines):
         return base
     body_lines = row["body"].splitlines()
     code_start = _first_code_line_offset(row["body"])
+    comment_pfx = _comment_prefix(row["file_path"])
     snippets = []
     seen_idxs = set()
     for ln in sorted(call_lines)[:2]:
@@ -495,11 +506,15 @@ def _caller_item(row, call_lines):
                 if k in seen_idxs:
                     continue
                 cl = body_lines[k].strip()
-                if cl and not cl.startswith("#") and not cl.startswith(('"""', "'''")):
+                if (
+                    cl
+                    and cl != "}"
+                    and not cl.startswith(("#", '"""', "'''", "//", "/*", "*", "*/"))
+                ):
                     cand.append((k, cl))
             for k, cl in cand[-5:]:
                 seen_idxs.add(k)
-                snippets.append(f"    # L{row['start_line'] + k}: {cl}")
+                snippets.append(f"    {comment_pfx} L{row['start_line'] + k}: {cl}")
     if snippets:
         base["text"] = base["text"] + "\n" + "\n".join(snippets)
     return base
@@ -589,9 +604,11 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
+        class_short_name = row["qualname"].rsplit(".", 1)[-1]
+        ctor_names = {"__init__", "__new__", "constructor", class_short_name}
         kept_methods = [
             m for m in methods
-            if m["qualname"].rsplit(".", 1)[-1] in ({"__init__", "__new__"} | referenced_names)
+            if m["qualname"].rsplit(".", 1)[-1] in (ctor_names | referenced_names)
         ]
         for m in methods:
             if len(kept_methods) >= 4:
@@ -602,7 +619,8 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
         compact_lines.extend(f"    {method['signature']}" for method in kept_methods)
         omitted_m = len(methods) - len(kept_methods)
         if omitted_m > 0:
-            compact_lines.append(f"    # ... (+{omitted_m} more methods)")
+            comment_pfx = _comment_prefix(row["file_path"])
+            compact_lines.append(f"    {comment_pfx} ... (+{omitted_m} more methods)")
         compact_rec = _slice_item(row, False)
         compact_rec["text"] = f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n" + "\n".join(compact_lines)
         if len(methods) >= 2:
@@ -624,9 +642,10 @@ def _condense_multi_anchor_targets(chosen, sections, result_fn, database, max_to
         if len(body_lines) <= 30:
             continue
         full_size = tokens_for_length(len(row["body"]))
+        comment_pfx = _comment_prefix(row["file_path"])
         condensed_body = (
             "\n".join(body_lines[:18])
-            + f"\n    # ... ({len(body_lines) - 26} lines condensed; fetch full body with: "
+            + f"\n    {comment_pfx} ... ({len(body_lines) - 26} lines condensed; fetch full body with: "
             + f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)})\n"
             + "\n".join(body_lines[-8:])
         )

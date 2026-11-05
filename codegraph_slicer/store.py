@@ -1,14 +1,103 @@
 """Transactional index, retaining raw references for rebinding across snapshots."""
 
+from collections import defaultdict
 import hashlib
 import os
 import sqlite3
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from time import monotonic
 from urllib.parse import quote
-from .ast_extractor import MODULE_END, CodeGraphError, detect_layout, extract_file, plain_target, valid_path
+from .ast_extractor import (
+    MODULE_END,
+    SUPPORTED_EXTENSIONS,
+    CodeGraphError,
+    Edge,
+    FileAnalysis,
+    Symbol,
+    detect_layout,
+    extract_file,
+    is_supported_source_path,
+    plain_target,
+    valid_path,
+)
+
+_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    ".gradle",
+    ".next",
+}
+
+
+def _disambiguate_analysis(
+    analysis: FileAnalysis, taken_modules: set[str]
+) -> FileAnalysis:
+    old_mod = analysis.module
+    if old_mod not in taken_modules:
+        taken_modules.add(old_mod)
+        return analysis
+    ext_tag = PurePosixPath(analysis.path).suffix.lstrip(".")
+    candidate = f"{old_mod}_{ext_tag}" if ext_tag else f"{old_mod}_2"
+    if candidate in taken_modules:
+        path_mod = PurePosixPath(analysis.path).with_suffix("").as_posix().replace("/", ".")
+        candidate = f"{path_mod}_{ext_tag}" if path_mod != old_mod else f"{old_mod}_{len(taken_modules)}"
+    idx = 2
+    base_cand = candidate
+    while candidate in taken_modules:
+        candidate = f"{base_cand}_{idx}"
+        idx += 1
+    taken_modules.add(candidate)
+
+    def _rewrite(ref: str) -> str:
+        if ref == old_mod:
+            return candidate
+        for sep in (":", ".", MODULE_END):
+            prefix = f"{old_mod}{sep}"
+            if ref.startswith(prefix):
+                return f"{candidate}{sep}{ref[len(prefix):]}"
+        return ref
+
+    new_symbols = tuple(
+        Symbol(
+            _rewrite(s.symbol_id),
+            s.kind,
+            candidate if s.kind == "module" else s.signature,
+            s.body,
+            s.start,
+            s.end,
+            s.cx,
+        )
+        for s in analysis.symbols
+    )
+    new_edges = tuple(
+        Edge(_rewrite(e.source), _rewrite(e.target), e.kind, e.line)
+        for e in analysis.edges
+    )
+    return FileAnalysis(
+        analysis.path,
+        candidate,
+        analysis.blob_sha,
+        analysis.skeleton,
+        new_symbols,
+        new_edges,
+    )
+
+
+def _iter_workspace_files(root: Path) -> list[Path]:
+    found: set[Path] = set()
+    for ext in SUPPORTED_EXTENSIONS:
+        for path in root.rglob(f"*{ext}"):
+            if not path.name.endswith(".d.ts"):
+                found.add(path)
+    return sorted(found)
 
 
 class InvalidRevisionError(CodeGraphError):
@@ -86,11 +175,9 @@ class GraphStore:
     def sync_workspace(self, root):
         root = Path(root).resolve(strict=True)
         files = {}
-        for path in sorted(root.rglob("*.py")):
+        for path in _iter_workspace_files(root):
             rel = path.relative_to(root)
-            if any(
-                part in {".git", ".venv", "venv", "__pycache__"} for part in rel.parts
-            ):
+            if any(part in _SKIP_DIRS for part in rel.parts):
                 continue
             if path.is_symlink() or any(
                 parent.is_symlink()
@@ -101,7 +188,18 @@ class GraphStore:
             name = valid_path(rel.as_posix())
             data = path.read_bytes()
             files[name] = ("sha256:" + hashlib.sha256(data).hexdigest(), data)
-        return self._sync(files, snapshot_root=str(root), snapshot_kind="workspace")
+        tsconfig_path = root / "tsconfig.json"
+        tsconfig_bytes = (
+            tsconfig_path.read_bytes()
+            if tsconfig_path.is_file() and not tsconfig_path.is_symlink()
+            else b""
+        )
+        return self._sync(
+            files,
+            snapshot_root=str(root),
+            snapshot_kind="workspace",
+            tsconfig_bytes=tsconfig_bytes,
+        )
 
     def sync_git_tree(self, root, revision):
         root = Path(root).resolve(strict=True)
@@ -128,12 +226,16 @@ class GraphStore:
 
         rev = git("rev-parse", "--verify", revision + "^{commit}").decode().strip()
         files = {}
+        tsconfig_oid = None
         for entry in git("ls-tree", "-r", "-z", rev).split(b"\0"):
             if not entry:
                 continue
             meta, raw_path = entry.split(b"\t", 1)
             mode, typ, oid = meta.split()
-            if not raw_path.endswith(b".py"):
+            if raw_path == b"tsconfig.json" and typ == b"blob":
+                tsconfig_oid = oid.decode("ascii")
+                continue
+            if not raw_path.endswith((b".py", b".java", b".ts", b".tsx")) or raw_path.endswith(b".d.ts"):
                 continue
             if typ != b"blob" or mode not in {b"100644", b"100755"}:
                 raise CodeGraphError(f"non-regular Python source refused: {raw_path!r}")
@@ -142,25 +244,52 @@ class GraphStore:
             except UnicodeError as exc:
                 raise CodeGraphError(f"non-UTF8 Python path: {raw_path!r}") from exc
             files[name] = ("git:" + oid.decode("ascii"), oid.decode("ascii"))
+        tsconfig_bytes = git("cat-file", "blob", tsconfig_oid) if tsconfig_oid else b""
         return self._sync(
             files,
             loader=lambda oid: git("cat-file", "blob", oid),
             snapshot_root=str(root),
             snapshot_kind="git",
             snapshot_revision=rev,
+            tsconfig_bytes=tsconfig_bytes,
         )
 
-    def _sync(self, files, loader=None, *, snapshot_root, snapshot_kind, snapshot_revision=""):
+    def _sync(
+        self,
+        files,
+        loader=None,
+        *,
+        snapshot_root,
+        snapshot_kind,
+        snapshot_revision="",
+        tsconfig_bytes=b"",
+    ):
         started = monotonic()
         digest = hashlib.sha256()
-        for source_path in (Path(__file__).with_name("ast_extractor.py"), Path(__file__)):
-            digest.update(source_path.read_bytes())
-            digest.update(b"\0")
+        for source_name in (
+            "ast_extractor.py",
+            "treesitter_support.py",
+            "java_extractor.py",
+            "ts_extractor.py",
+            "store.py",
+        ):
+            source_path = Path(__file__).with_name(source_name)
+            if source_path.exists():
+                digest.update(source_path.read_bytes())
+                digest.update(b"\0")
         digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
         source_root, packages = detect_layout(files)
         # A layout change renames modules, so every file is re-extracted.
         digest.update(f"\0{source_root}\0{','.join(sorted(packages))}".encode())
+        if tsconfig_bytes:
+            digest.update(b"\0")
+            digest.update(tsconfig_bytes)
         engine_sha = digest.hexdigest()
+        path_aliases = None
+        if tsconfig_bytes:
+            from .ts_extractor import parse_tsconfig_paths
+
+            path_aliases = parse_tsconfig_paths(tsconfig_bytes)
         self.db.execute("BEGIN IMMEDIATE")
         with self.db:
             old = {
@@ -179,13 +308,21 @@ class GraphStore:
             )
             analyses = [
                 extract_file(
-                    path, loader(files[path][1]) if loader else files[path][1], packages, source_root
+                    path,
+                    loader(files[path][1]) if loader else files[path][1],
+                    packages,
+                    source_root,
+                    *( [path_aliases] if path_aliases else [] ),
                 )
                 for path in changed
             ]
             for path in sorted(removed | set(changed)):
                 self.db.execute("DELETE FROM files WHERE path=?", (path,))
-            for analysis in analyses:
+            taken_modules = {
+                row[0] for row in self.db.execute("SELECT module FROM files")
+            }
+            for raw_analysis in analyses:
+                analysis = _disambiguate_analysis(raw_analysis, taken_modules)
                 self.db.execute(
                     "INSERT INTO files VALUES(?,?,?,?,?)",
                     (
@@ -265,9 +402,9 @@ class GraphStore:
             root = Path(root_text).resolve(strict=True)
             if kind == "workspace":
                 actual = {}
-                for path in sorted(root.rglob("*.py")):
+                for path in _iter_workspace_files(root):
                     rel = path.relative_to(root)
-                    if any(part in {".git", ".venv", "venv", "__pycache__"} for part in rel.parts):
+                    if any(part in _SKIP_DIRS for part in rel.parts):
                         continue
                     if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
                         raise StaleSnapshotError(f"snapshot is stale: symlink source refused: {rel.as_posix()}")
@@ -293,18 +430,18 @@ class GraphStore:
                         continue
                     meta, raw_path = entry.split(b"\t", 1)
                     mode, typ, oid = meta.split()
-                    if not raw_path.endswith(b".py"):
+                    if not raw_path.endswith((b".py", b".java", b".ts", b".tsx")) or raw_path.endswith(b".d.ts"):
                         continue
                     if typ != b"blob" or mode not in {b"100644", b"100755"}:
                         raise StaleSnapshotError(f"snapshot source cannot be verified: non-regular Python source {raw_path!r}")
                     name = valid_path(raw_path.decode("utf8"))
                     actual[name] = "git:" + oid.decode("ascii")
                 working = {}
-                for path in sorted(root.rglob("*.py")):
+                for path in _iter_workspace_files(root):
                     rel = path.relative_to(root)
                     if ".git" in rel.parts:
                         continue
-                    if any(part in {".venv", "venv", "__pycache__"} for part in rel.parts) and rel.as_posix() not in actual:
+                    if any(part in _SKIP_DIRS for part in rel.parts) and rel.as_posix() not in actual:
                         continue
                     if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != root and root in parent.parents):
                         raise StaleSnapshotError(f"snapshot freshness cannot be verified: symlink source refused: {rel.as_posix()}")
@@ -337,6 +474,46 @@ class GraphStore:
             row["source_id"]: row["target_id"]
             for row in self.db.execute("SELECT source_id,target_id FROM raw_edges WHERE kind='ALIAS'")
         }
+        wildcard_exports = defaultdict(list)
+        for row in self.db.execute(
+            "SELECT source_id,target_id FROM raw_edges WHERE kind='WILDCARD_EXPORT'"
+        ):
+            wildcard_exports[row["source_id"]].append(row["target_id"])
+        if wildcard_exports:
+            changed_wc = True
+            while changed_wc:
+                changed_wc = False
+                for src_mod, tgt_mods in wildcard_exports.items():
+                    for tgt_mod in tgt_mods:
+                        prefix = tgt_mod + "."
+                        for key, val in list(aliases.items()):
+                            if key.startswith(prefix):
+                                exported = key[len(prefix) :]
+                                if "." not in exported and f"{src_mod}.{exported}" not in aliases:
+                                    aliases[f"{src_mod}.{exported}"] = val
+                                    changed_wc = True
+        wildcard_imports = defaultdict(list)
+        for row in self.db.execute(
+            "SELECT source_id,target_id FROM raw_edges WHERE kind='WILDCARD_IMPORT'"
+        ):
+            wildcard_imports[row["source_id"]].append(row["target_id"])
+        for src_mod, tgt_pkgs in wildcard_imports.items():
+            for tgt_pkg in tgt_pkgs:
+                prefix = tgt_pkg + "."
+                for key, val in list(aliases.items()):
+                    if key.startswith(prefix):
+                        member = key[len(prefix) :]
+                        if "." not in member and f"{src_mod}.{member}" not in aliases:
+                            aliases[f"{src_mod}.{member}"] = val
+                class_sid = aliases.get(tgt_pkg)
+                if class_sid and class_sid in symbols:
+                    cprefix = class_sid + "."
+                    for sym_id in symbols:
+                        if sym_id.startswith(cprefix):
+                            member = sym_id[len(cprefix) :]
+                            if "." not in member and f"{src_mod}.{member}" not in aliases:
+                                aliases[f"{src_mod}.{member}"] = sym_id
+
         def direct(target, module_parts=1):
             if target in symbols:
                 return target
@@ -378,7 +555,8 @@ class GraphStore:
         self.db.execute("DELETE FROM edges")
         self.db.execute("DELETE FROM diagnostics")
         for row in self.db.execute(
-            "SELECT * FROM raw_edges WHERE kind!='ALIAS' ORDER BY source_file,source_id,target_id,kind,line"
+            "SELECT * FROM raw_edges WHERE kind NOT IN ('ALIAS','WILDCARD_EXPORT','WILDCARD_IMPORT') "
+            "ORDER BY source_file,source_id,target_id,kind,line"
         ).fetchall():
             target = resolve(row["target_id"])
             if target is None:

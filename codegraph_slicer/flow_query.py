@@ -2,7 +2,7 @@
 
 import ast
 
-from .flow import FlowQueryError, analyze_flow, slice_flow
+from .flow import FlowQueryError, UnsupportedFlowError, analyze_flow, slice_flow
 from .slicer import _anchor
 
 
@@ -11,6 +11,10 @@ def query_flow(store, anchor, *, variable=None, line=None, direction="backward",
     row = _anchor(store, anchor)
     if row["kind"] not in {"function", "method"}:
         raise FlowQueryError(f"flow requires an observed function or method anchor: {anchor}")
+    if not row["file_path"].endswith(".py"):
+        raise UnsupportedFlowError(
+            f"flow supports Python functions only ({row['file_path']}); use slice for {row['symbol_id']}"
+        )
     modules = store.rows(
         "SELECT body FROM symbols WHERE file_path=? AND kind='module'",
         (row["file_path"],),

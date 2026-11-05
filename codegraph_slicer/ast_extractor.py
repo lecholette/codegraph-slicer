@@ -49,6 +49,30 @@ class FileAnalysis:
 # Ends the module path of an import target: `from pkg.sub import x` is "pkg.sub|x".
 # The import system, not attribute lookup on `pkg`, finds the part before it.
 MODULE_END = "|"
+SUPPORTED_EXTENSIONS = (".py", ".java", ".ts", ".tsx")
+
+
+def is_supported_source_path(path: str) -> bool:
+    return path.endswith(SUPPORTED_EXTENSIONS) and not path.endswith(".d.ts")
+
+
+def is_test_path(path: str) -> bool:
+    parts = path.replace("\\", "/").split("/")
+    name = parts[-1]
+    if path.endswith(".py"):
+        return any(part == "tests" for part in parts) or name.startswith("test_")
+    if path.endswith(".java"):
+        return (
+            any(part in {"test", "tests"} for part in parts[:-1])
+            or name.endswith(("Test.java", "Tests.java", "IT.java"))
+            or name.startswith("Test")
+        )
+    if path.endswith((".ts", ".tsx")):
+        return (
+            any(part in {"test", "tests", "__tests__", "spec", "specs"} for part in parts[:-1])
+            or name.endswith((".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx"))
+        )
+    return False
 
 
 def plain_target(target: str) -> str:
@@ -64,7 +88,7 @@ def valid_path(path: str) -> str:
         or ".." in p.parts
         or "\\" in path
         or any(ord(c) < 32 for c in path)
-        or not path.endswith(".py")
+        or not is_supported_source_path(path)
         or p.as_posix() != path
     ):
         raise CodeGraphError(f"invalid Python path: {path!r}")
@@ -123,10 +147,22 @@ def detect_layout(paths) -> tuple[str, frozenset[str]]:
 
 
 def extract_file(
-    path: str, source: bytes, packages: frozenset[str] = frozenset(), source_root: str = ""
+    path: str,
+    source: bytes,
+    packages: frozenset[str] = frozenset(),
+    source_root: str = "",
+    path_aliases: dict[str, str] | None = None,
 ) -> FileAnalysis:
     """Extract one file; string constants naming a module in `packages` become IMPORTS."""
     valid_path(path)
+    if path.endswith(".java"):
+        from .java_extractor import extract_java_file
+
+        return extract_java_file(path, source, source_root)
+    if path.endswith((".ts", ".tsx")):
+        from .ts_extractor import extract_typescript_file
+
+        return extract_typescript_file(path, source, source_root, path_aliases)
     if b"\0" in source:
         raise CodeGraphParseError(f"binary source: {path}")
     try:
@@ -146,9 +182,7 @@ def extract_file(
     frame_kinds: list[str] = []
     frame_globals: list[set[str]] = []
     frame_nonlocals: list[set[str]] = []
-    is_test = any(
-        part == "tests" for part in PurePosixPath(path).parts
-    ) or PurePosixPath(path).name.startswith("test_")
+    is_test = is_test_path(path)
 
     def owner() -> str:
         return module + ":" + ".".join(scope)
