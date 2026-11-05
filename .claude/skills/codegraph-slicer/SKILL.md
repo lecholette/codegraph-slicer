@@ -29,6 +29,8 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 
 ## Commands
 
+- **Do not browse or read entire large module files** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context.
+- **Skip codegraph** for small repos (< 2 files), single-file edits, or non-Python code. Reading the file directly is cheaper.
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
 - One function with its types, callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format markdown` (or `--format xml` for clean XML token-delimited code blocks)
 - Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b`), not a shell loop. One call shares types and callers across anchors.
