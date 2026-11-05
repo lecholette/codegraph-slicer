@@ -258,7 +258,7 @@ def _xml(result):
             blocks.append("  </omitted>")
         names = list(result["sections"])
         if "target_implementations" in names:
-            names = ["target_implementations"] + [n for n in names if n != "target_implementations"]
+            names = [n for n in names if n != "target_implementations"] + ["target_implementations"]
         for section_name in names:
             items = result["sections"][section_name]
             if not items:
@@ -266,12 +266,22 @@ def _xml(result):
             blocks.append(f"  <{section_name}>")
             for item in items:
                 sym_attr = f' symbol={_xml_attr(item["symbol"])}' if "symbol" in item else ""
-                file_attr = f' file={_xml_attr(item["file_path"])}' if item.get("file_path") else ""
+                raw_text = item.get("text", "").rstrip()
+                first_nl = raw_text.find("\n")
+                header = raw_text[:first_nl] if first_nl != -1 else ""
+                file_path = item.get("file_path")
+                lines_span = None
+                if not file_path and ":" in header:
+                    cand_path, _, cand_span = header.rpartition(":")
+                    if "-" in cand_span and cand_span.replace("-", "").isdigit():
+                        file_path = cand_path
+                        lines_span = cand_span
+                file_attr = f' file={_xml_attr(file_path)}' if file_path else ""
                 start = item.get("start_line")
                 end = item.get("end_line")
-                lines_attr = f' lines="{start}-{end}"' if start and end else ""
+                lines_attr = f' lines="{start}-{end}"' if start and end else (f' lines="{lines_span}"' if lines_span else "")
                 blocks.append(f'    <code_slice{sym_attr}{file_attr}{lines_attr}>')
-                blocks.append(item.get("text", "").rstrip())
+                blocks.append(raw_text)
                 blocks.append("    </code_slice>")
             blocks.append(f"  </{section_name}>")
         blocks.append("</context>")

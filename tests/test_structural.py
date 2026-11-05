@@ -409,3 +409,71 @@ def test_unsafe_paths_symlinks_and_duplicate_definitions(tmp_path):
         b"def f():\n    def old():\n        return 1\n    return old()\ndef f():\n    return 2\n",
     )
     assert [s.symbol_id for s in rebound.symbols] == ["repeat:", "repeat:f"]
+
+
+def test_rsi_mutations_m1_m2_m3_m4(tmp_path, capsys):
+    root = tmp_path / "src"
+    large_methods = "\n".join(
+        f"    def m_{i}(self, x: int) -> int:\n        '''Doc {i}'''\n"
+        + "\n".join(f"        v_{j} = x + {j} * 100" for j in range(30))
+        + "\n        return x\n"
+        for i in range(6)
+    )
+    write(
+        root,
+        {
+            "pkg/core.py": (
+                "class HugeSchema:\n"
+                "    '''A large schema class.'''\n"
+                "    def __init__(self, name: str):\n"
+                "        self.name = name\n"
+                + large_methods
+                + "\n"
+                "def target_fn(s: HugeSchema) -> int:\n"
+                "    return s.m_3(10)\n"
+                "\n"
+                "def prod_caller(\n"
+                "    s: HugeSchema,\n"
+                ") -> int:\n"
+                "    '''Multi-line caller docstring.\n"
+                "    Interior docstring prose line.\n"
+                "    '''\n"
+                "    a = 1\n"
+                "    b = 2\n"
+                "    res = target_fn(s)\n"
+                "    return res + a + b\n"
+            ),
+            "tests/test_core.py": (
+                "from pkg.core import HugeSchema, target_fn\n"
+                "def test_target():\n"
+                "    assert target_fn(HugeSchema('x')) == 10\n"
+            ),
+        },
+    )
+    db = tmp_path / "graph.sqlite"
+    assert main(["sync", str(root), "--db", str(db)]) == 0
+    capsys.readouterr()
+
+    # M1 + M2 + M3 verification in XML output
+    assert main(["slice", "--db", str(db), "pkg.core:target_fn", "--format", "xml"]) == 0
+    xml_out = capsys.readouterr().out
+    # M2: target_implementations appears AFTER upstream_callers (recency bias tail)
+    assert xml_out.index("<upstream_callers>") < xml_out.index("<target_implementations>")
+    assert 'file="pkg/core.py"' in xml_out
+    assert 'lines="' in xml_out
+    # M1: HugeSchema is auto-skeletonized to constructor + referenced m_3 (+ omitted count)
+    assert "def __init__(self, name: str):" in xml_out
+    assert "def m_3(self, x: int) -> int:" in xml_out
+    assert "# ... (+3 more methods)" in xml_out
+    assert "v_14 = x + 14" not in xml_out
+    # M3: test_target filtered out of upstream_callers; prod_caller includes # L<line> snippet without docstring/sig noise
+    assert "test_target" not in xml_out
+    assert "pkg.core:prod_caller" in xml_out
+    assert "Interior docstring prose line" not in xml_out
+    assert "# L" in xml_out and "res = target_fn(s)" in xml_out
+    # M4: Multi-anchor batch condensation under tight budget >= 1000
+    assert main(["slice", "--db", str(db), "pkg.core:HugeSchema", "pkg.core:target_fn", "--max-tokens", "1000"]) == 0
+    batch_out = json.loads(capsys.readouterr().out)
+    assert batch_out["tokens"] <= 1000
+    assert "lines condensed" in batch_out["sections"]["target_implementations"][0]["text"]
+

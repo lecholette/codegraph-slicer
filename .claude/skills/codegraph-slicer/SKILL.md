@@ -17,8 +17,7 @@ Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`
 Keep the index outside the repo (or in a git-ignored path). One database holds one snapshot.
 
 ```bash
-GRAPH="${CODEGRAPH_DB:-$HOME/.cache/codegraph-slicer/$(basename "$PWD").sqlite}"
-mkdir -p "$(dirname "$GRAPH")"
+GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
 codegraph-slicer sync . --db "$GRAPH"
 ```
 
@@ -32,8 +31,8 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 - **Do not browse or read entire large module files** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context.
 - **Skip codegraph** for small repos (< 2 files), single-file edits, or non-Python code. Reading the file directly is cheaper.
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
-- One function with its types, callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format markdown` (or `--format xml` for clean XML token-delimited code blocks)
-- Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b`), not a shell loop. One call shares types and callers across anchors.
+- One function with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
+- Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call shares types and callers across anchors.
 - Structure only (callers, callees, types, no bodies): `slice --outline`. Outlines are not always small; keep the default budget.
 - Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown` (or `--format xml`)
 - Where does a value come from (backward line slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable total --line 42 --format markdown`
