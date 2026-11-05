@@ -439,6 +439,209 @@ def build_slice_outline(
     return payload
 
 
+def _slice_item(row, full):
+    text = row["body"] if full else row["signature"]
+    return {
+        "symbol": row["symbol_id"],
+        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{text}",
+    }
+
+
+def _is_test_symbol(row):
+    parts = row["file_path"].replace("\\", "/").split("/")
+    name = parts[-1]
+    return (
+        any(p in {"tests", "test", "t"} for p in parts[:-1])
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name in {"conftest.py", "tests.py"}
+    )
+
+
+def _first_code_line_offset(body: str) -> int:
+    try:
+        mod = ast.parse(textwrap.dedent(body))
+        if mod.body and isinstance(mod.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            stmts = mod.body[0].body
+            if (
+                stmts
+                and isinstance(stmts[0], ast.Expr)
+                and isinstance(getattr(stmts[0], "value", None), ast.Constant)
+                and isinstance(stmts[0].value.value, str)
+            ):
+                stmts = stmts[1:]
+            if stmts:
+                return max(1, stmts[0].lineno - 1)
+    except SyntaxError:
+        pass
+    return 1
+
+
+def _caller_item(row, call_lines):
+    base = _slice_item(row, False)
+    if row["end_line"] - row["start_line"] < 3 or not call_lines:
+        return base
+    body_lines = row["body"].splitlines()
+    code_start = _first_code_line_offset(row["body"])
+    snippets = []
+    seen_idxs = set()
+    for ln in sorted(call_lines)[:2]:
+        idx = ln - row["start_line"]
+        if 0 < idx < len(body_lines):
+            window_start = max(code_start, idx - 5)
+            window_end = min(len(body_lines) - 1, idx + 1)
+            cand = []
+            for k in range(window_start, window_end + 1):
+                if k in seen_idxs:
+                    continue
+                cl = body_lines[k].strip()
+                if cl and not cl.startswith("#") and not cl.startswith(('"""', "'''")):
+                    cand.append((k, cl))
+            for k, cl in cand[-5:]:
+                seen_idxs.add(k)
+                snippets.append(f"    # L{row['start_line'] + k}: {cl}")
+    if snippets:
+        base["text"] = base["text"] + "\n" + "\n".join(snippets)
+    return base
+
+
+def _recover_chained_callers(store, row, chosen, all_target_in_test, callers, caller_lines):
+    if row["kind"] != "method":
+        return
+    mname = row["qualname"].rsplit(".", 1)[-1]
+    if len(mname) < 4 or mname.startswith("__") or not mname.isidentifier():
+        return
+    mcount = store.rows(
+        "SELECT count(*) AS c FROM symbols WHERE kind='method' AND qualname GLOB ?",
+        (f"*.{mname}",),
+    )[0]["c"]
+    if mcount > 3:
+        return
+    for related in store.rows(
+        """SELECT s.*, d.line AS call_line FROM diagnostics d
+           JOIN symbols s ON s.symbol_id=d.source_id
+           WHERE d.kind='CALLS' AND d.target GLOB ?
+           ORDER BY d.line""",
+        (f"*.{mname}",),
+    ):
+        csid = related["symbol_id"]
+        if csid in chosen or related["kind"] not in {"function", "async_function", "method"}:
+            continue
+        if not all_target_in_test and _is_test_symbol(related):
+            continue
+        caller_body = related["body"].splitlines()
+        idx = related["call_line"] - related["start_line"]
+        if 0 <= idx < len(caller_body):
+            span = "".join(
+                line.strip()
+                for line in caller_body[max(0, idx - 1) : min(len(caller_body), idx + 2)]
+            )
+            if f".{mname}(" in span:
+                callers[csid] = related
+                caller_lines.setdefault(csid, set()).add(related["call_line"])
+
+
+def _first_docstring_line(body: str):
+    try:
+        parsed = ast.parse(textwrap.dedent(body))
+        doc = ast.get_docstring(parsed.body[0]) if parsed.body else None
+    except (SyntaxError, IndexError):
+        doc = None
+    return doc.splitlines()[0] if doc else None
+
+
+def _build_type_summaries(store, class_types, referenced_names, database, max_tokens):
+    summaries = {}
+    compact_summaries = {}
+    auto_summarize_ids = set()
+    db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
+    for sid, row in class_types:
+        methods = store.rows(
+            """SELECT s.* FROM symbols s JOIN edges e ON s.symbol_id=e.target_id
+               WHERE e.source_id=? AND e.kind='DEFINES' AND s.kind='method'
+               ORDER BY s.start_line, s.symbol_id""",
+            (sid,),
+        )
+        if not methods:
+            methods = store.rows(
+                "SELECT * FROM symbols WHERE file_path=? AND kind='method' AND qualname GLOB ? ORDER BY start_line, symbol_id",
+                (row["file_path"], f"{row['qualname']}.*"),
+            )
+            methods = [m for m in methods if m["qualname"].rpartition(".")[0] == row["qualname"]]
+        doc_line = _first_docstring_line(row["body"])
+        lines = [row["signature"]]
+        if doc_line:
+            lines.append(doc_line)
+        for method in methods:
+            lines.append(f"{method['file_path']}:{method['start_line']}-{method['end_line']} {method['signature']}")
+            method_doc = _first_docstring_line(method["body"])
+            if method_doc:
+                lines.append(method_doc)
+        item_record = _slice_item(row, False)
+        full_size = tokens_for_length(len(row["body"]))
+        item_record["text"] = (
+            f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n"
+            + "\n".join(lines)
+            + f"\nExpansion {sid} ({full_size} tokens): codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)}"
+        )
+        summaries[sid] = item_record
+
+        compact_lines = [row["signature"]]
+        if doc_line:
+            compact_lines.append(doc_line)
+        kept_methods = [
+            m for m in methods
+            if m["qualname"].rsplit(".", 1)[-1] in ({"__init__", "__new__"} | referenced_names)
+        ]
+        for m in methods:
+            if len(kept_methods) >= 4:
+                break
+            if m not in kept_methods:
+                kept_methods.append(m)
+        kept_methods = kept_methods[:6]
+        compact_lines.extend(f"    {method['signature']}" for method in kept_methods)
+        omitted_m = len(methods) - len(kept_methods)
+        if omitted_m > 0:
+            compact_lines.append(f"    # ... (+{omitted_m} more methods)")
+        compact_rec = _slice_item(row, False)
+        compact_rec["text"] = f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n" + "\n".join(compact_lines)
+        if len(methods) >= 2:
+            compact_summaries[sid] = compact_rec
+        if len(methods) >= 5 and full_size >= 500:
+            auto_summarize_ids.add(sid)
+    return summaries, compact_summaries, auto_summarize_ids
+
+
+def _condense_multi_anchor_targets(chosen, sections, result_fn, database, max_tokens):
+    required = result_fn()
+    if required["tokens"] <= max_tokens or len(chosen) <= 1 or max_tokens < 1000:
+        return required
+    db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
+    for sid, row in sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"])):
+        if required["tokens"] <= max_tokens:
+            break
+        body_lines = row["body"].splitlines()
+        if len(body_lines) <= 30:
+            continue
+        full_size = tokens_for_length(len(row["body"]))
+        condensed_body = (
+            "\n".join(body_lines[:18])
+            + f"\n    # ... ({len(body_lines) - 26} lines condensed; fetch full body with: "
+            + f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)})\n"
+            + "\n".join(body_lines[-8:])
+        )
+        condensed_item = {
+            "symbol": sid,
+            "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{condensed_body}",
+        }
+        sections["target_implementations"] = [
+            condensed_item if entry["symbol"] == sid else entry
+            for entry in sections["target_implementations"]
+        ]
+        required = result_fn()
+    return required
+
+
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
     render_estimator=None, database=None,
@@ -461,19 +664,18 @@ def slice_context(
             "downstream_dependencies",
         )
     }
-
-    def item(row, full):
-        text = row["body"] if full else row["signature"]
-        return {
-            "symbol": row["symbol_id"],
-            "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{text}",
-        }
-
+    item = _slice_item
+    all_target_in_test = all(_is_test_symbol(r) for r in chosen.values())
     types = {}
     callers = {}
+    caller_lines = {}
     callees = {}
+    referenced_names = set()
     for sid, row in sorted(chosen.items()):
         sections["target_implementations"].append(item(row, True))
+        for token in row["body"].replace("(", " ").replace(".", " ").split():
+            if token.isidentifier():
+                referenced_names.add(token)
         for related in store.rows(
             """WITH RECURSIVE closure(node,depth) AS (
                 SELECT ?,0 UNION SELECT e.target_id,c.depth+1 FROM edges e
@@ -486,12 +688,16 @@ def slice_context(
             if related["symbol_id"] not in chosen:
                 types[related["symbol_id"]] = related
         for related in store.rows(
-            """SELECT DISTINCT s.* FROM symbols s JOIN edges e
-                ON s.symbol_id=e.source_id WHERE e.target_id=? AND e.kind='CALLS' """,
+            """SELECT s.*, e.line AS call_line FROM symbols s JOIN edges e
+                ON s.symbol_id=e.source_id WHERE e.target_id=? AND e.kind='CALLS'
+                ORDER BY e.line""",
             (sid,),
         ):
-            if related["symbol_id"] not in chosen:
-                callers[related["symbol_id"]] = related
+            csid = related["symbol_id"]
+            if csid not in chosen and (all_target_in_test or not _is_test_symbol(related)):
+                callers[csid] = related
+                caller_lines.setdefault(csid, set()).add(related["call_line"])
+        _recover_chained_callers(store, row, chosen, all_target_in_test, callers, caller_lines)
         for related in store.rows(
             """SELECT DISTINCT s.* FROM symbols s JOIN edges e
                 ON s.symbol_id=e.target_id WHERE e.source_id=? AND e.kind='CALLS' """,
@@ -504,35 +710,9 @@ def slice_context(
         item(row, True) for _, row in sorted(types.items())
     ]
     class_types = [(sid, row) for sid, row in sorted(types.items()) if row["kind"] == "class"]
-    summaries = {}
-    for sid, row in class_types:
-        methods = store.rows(
-            "SELECT * FROM symbols WHERE file_path=? AND kind='method' AND qualname LIKE ? ORDER BY start_line, symbol_id",
-            (row["file_path"], row["qualname"] + ".%"),
-        )
-        methods = [m for m in methods if m["qualname"].rpartition(".")[0] == row["qualname"]]
-        lines = [row["signature"]]
-        try:
-            parsed = ast.parse(textwrap.dedent(row["body"]))
-            doc = ast.get_docstring(parsed.body[0]) if parsed.body else None
-        except SyntaxError:
-            doc = None
-        if doc:
-            lines.append(doc.splitlines()[0])
-        for method in methods:
-            lines.append(f"{method['file_path']}:{method['start_line']}-{method['end_line']} {method['signature']}")
-            try:
-                node = ast.parse(textwrap.dedent(method["body"])).body[0]
-                method_doc = ast.get_docstring(node)
-            except (SyntaxError, IndexError):
-                method_doc = None
-            if method_doc:
-                lines.append(method_doc.splitlines()[0])
-        db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
-        item_record = item(row, False)
-        full_size = tokens_for_length(len(row["body"]))
-        item_record["text"] = f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n" + "\n".join(lines) + f"\nExpansion {sid} ({full_size} tokens): codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)}"
-        summaries[sid] = item_record
+    summaries, compact_summaries, auto_summarize_ids = _build_type_summaries(
+        store, class_types, referenced_names, database, max_tokens
+    )
     totals = {name: len(items) for name, items in sections.items()}
     totals["upstream_callers"] = len(callers)
     totals["downstream_dependencies"] = len(callees)
@@ -578,17 +758,27 @@ def slice_context(
     from .pagerank import rank
 
     scores = rank(store)
+    for sid in auto_summarize_ids:
+        sections["types_and_schemas"] = [
+            compact_summaries[sid] if entry["symbol"] == sid else entry
+            for entry in sections["types_and_schemas"]
+        ]
     for name, candidates in (
         ("upstream_callers", callers),
         ("downstream_dependencies", callees),
     ):
         for sid in sorted(candidates, key=lambda s: (-scores.get(s, 0), s)):
-            full = name == "downstream_dependencies" and include_callee_bodies
-            sections[name].append(item(candidates[sid], full))
+            if name == "upstream_callers":
+                sections[name].append(_caller_item(candidates[sid], caller_lines.get(sid)))
+            else:
+                full = name == "downstream_dependencies" and include_callee_bodies
+                sections[name].append(item(candidates[sid], full))
     complete = result()
     if complete["tokens"] <= max_tokens:
         return complete
     for sid, summary in summaries.items():
+        if sid in auto_summarize_ids:
+            continue
         original = next(entry for entry in sections["types_and_schemas"] if entry["symbol"] == sid)
         sections["types_and_schemas"] = [
             summary if entry["symbol"] == sid else entry
@@ -607,6 +797,14 @@ def slice_context(
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
     required = result()
+    if required["tokens"] > max_tokens and compact_summaries:
+        for sid, c_summary in compact_summaries.items():
+            sections["types_and_schemas"] = [
+                c_summary if entry["symbol"] == sid else entry
+                for entry in sections["types_and_schemas"]
+            ]
+        required = result()
+    required = _condense_multi_anchor_targets(chosen, sections, result, database, max_tokens)
     if required["tokens"] > max_tokens and any(
         totals[name] > len(sections[name])
         for name in ("upstream_callers", "downstream_dependencies")
@@ -625,8 +823,12 @@ def slice_context(
         ("downstream_dependencies", callees),
     ):
         for sid in sorted(candidates, key=lambda s: (-scores.get(s, 0), s)):
-            full = name == "downstream_dependencies" and include_callee_bodies
-            candidate = item(candidates[sid], full)
+            if name == "upstream_callers":
+                candidate = _caller_item(candidates[sid], caller_lines.get(sid))
+                full = False
+            else:
+                full = name == "downstream_dependencies" and include_callee_bodies
+                candidate = item(candidates[sid], full)
             sections[name].append(candidate)
             if result()["tokens"] > max_tokens:
                 sections[name].pop()
