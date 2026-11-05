@@ -447,6 +447,98 @@ def _slice_item(row, full):
     }
 
 
+def _target_item_with_preamble(store, row, chosen, max_tokens: int):
+    base = _slice_item(row, True)
+    if (
+        max_tokens < 2000
+        or not row["file_path"].endswith((".java", ".ts", ".tsx"))
+        or row["kind"] not in {"method", "function", "async_function", "class", "type_alias"}
+    ):
+        return base
+    module_sid = f"{row['module']}:"
+    if module_sid in chosen:
+        return base
+    mod_rows = store.rows("SELECT body FROM symbols WHERE symbol_id=?", (module_sid,))
+    if not mod_rows:
+        return base
+    file_lines = mod_rows[0]["body"].splitlines()
+    limit_idx = min(len(file_lines), max(0, row["start_line"] - 1))
+    header_lines = []
+    header_end_line = 0
+    in_multiline_import = False
+    for idx in range(limit_idx):
+        raw = file_lines[idx]
+        stripped = raw.strip()
+        if in_multiline_import:
+            header_lines.append(raw)
+            header_end_line = idx + 1
+            if ";" in stripped or ")" in stripped or stripped.endswith(('"', "'")):
+                in_multiline_import = False
+            continue
+        if stripped.startswith(("import ", "from ", "package ")):
+            header_lines.append(raw)
+            header_end_line = idx + 1
+            if ("{" in stripped and "}" not in stripped) or (
+                "(" in stripped and ")" not in stripped
+            ):
+                in_multiline_import = True
+            continue
+        if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/", '"""', "'''")):
+            break
+    if row["kind"] == "method" and "." in row["qualname"]:
+        class_qual = row["qualname"].rpartition(".")[0]
+        class_sid = f"{row['module']}:{class_qual}"
+        if class_sid in chosen:
+            return base
+        class_rows = store.rows(
+            "SELECT start_line, end_line FROM symbols WHERE symbol_id=?",
+            (class_sid,),
+        )
+        if class_rows:
+            c_start = class_rows[0]["start_line"]
+            first_m_rows = store.rows(
+                "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ?",
+                (row["file_path"], c_start),
+            )
+            first_m = (
+                first_m_rows[0]["first_m"]
+                if first_m_rows and first_m_rows[0]["first_m"] is not None
+                else row["start_line"]
+            )
+            c_end = min(first_m - 1, row["start_line"] - 1, c_start + 15)
+            for ln in range(c_start, c_end + 1):
+                if 1 <= ln <= len(file_lines):
+                    line_txt = file_lines[ln - 1]
+                    if line_txt.strip():
+                        header_lines.append(line_txt)
+                        header_end_line = max(header_end_line, ln)
+    comment_pfx = _comment_prefix(row["file_path"])
+    if row["file_path"].endswith((".ts", ".tsx")) and "." in row["module"]:
+        parent_mod_sid = f"{row['module'].rpartition('.')[0]}:"
+        barrel_rows = store.rows(
+            "SELECT file_path, body FROM symbols WHERE symbol_id=?",
+            (parent_mod_sid,),
+        )
+        if barrel_rows and barrel_rows[0]["file_path"].endswith(("index.ts", "index.tsx")):
+            b_lines = [ln.strip() for ln in barrel_rows[0]["body"].splitlines() if ln.strip()]
+            if 1 <= len(b_lines) <= 8:
+                header_lines.append(
+                    f"{comment_pfx} Barrel ({barrel_rows[0]['file_path']}): {' '.join(b_lines)}"
+                )
+    if not header_lines:
+        return base
+    label = f"lines 1-{header_end_line}" if header_end_line > 0 else "module metadata"
+    preamble = (
+        f"{comment_pfx} File & class header ({label}):\n"
+        + "\n".join(header_lines)
+        + "\n"
+    )
+    return {
+        "symbol": row["symbol_id"],
+        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{preamble}{row['body']}",
+    }
+
+
 def _is_test_symbol(row):
     path = row["file_path"].replace("\\", "/")
     if is_test_path(path):
@@ -691,21 +783,32 @@ def slice_context(
     callees = {}
     referenced_names = set()
     for sid, row in sorted(chosen.items()):
-        sections["target_implementations"].append(item(row, True))
+        sections["target_implementations"].append(
+            _target_item_with_preamble(store, row, chosen, max_tokens)
+        )
         for token in row["body"].replace("(", " ").replace(".", " ").split():
             if token.isidentifier():
                 referenced_names.add(token)
-        for related in store.rows(
-            """WITH RECURSIVE closure(node,depth) AS (
-                SELECT ?,0 UNION SELECT e.target_id,c.depth+1 FROM edges e
-                JOIN closure c ON e.source_id=c.node
-                WHERE e.kind IN ('USES_TYPE','INHERITS') AND c.depth<2
-            ) SELECT DISTINCT s.* FROM symbols s JOIN closure c ON s.symbol_id=c.node
-                WHERE c.depth>0 AND s.kind IN ('class','type_alias') ORDER BY s.symbol_id""",
-            (sid,),
-        ):
-            if related["symbol_id"] not in chosen:
-                types[related["symbol_id"]] = related
+        type_seeds = [sid]
+        enclosing_class_sid = None
+        if row["kind"] == "method" and "." in row["qualname"]:
+            enclosing_class_sid = f"{row['module']}:{row['qualname'].rpartition('.')[0]}"
+            type_seeds.append(enclosing_class_sid)
+        for seed_id in type_seeds:
+            for related in store.rows(
+                """WITH RECURSIVE closure(node,depth) AS (
+                    SELECT ?,0 UNION SELECT e.target_id,c.depth+1 FROM edges e
+                    JOIN closure c ON e.source_id=c.node
+                    WHERE e.kind IN ('USES_TYPE','INHERITS') AND c.depth<3
+                ) SELECT DISTINCT s.* FROM symbols s JOIN closure c ON s.symbol_id=c.node
+                    WHERE c.depth>0 AND s.kind IN ('class','type_alias') ORDER BY s.symbol_id""",
+                (seed_id,),
+            ):
+                if (
+                    related["symbol_id"] not in chosen
+                    and related["symbol_id"] != enclosing_class_sid
+                ):
+                    types[related["symbol_id"]] = related
         for related in store.rows(
             """SELECT s.*, e.line AS call_line FROM symbols s JOIN edges e
                 ON s.symbol_id=e.source_id WHERE e.target_id=? AND e.kind='CALLS'
@@ -724,7 +827,16 @@ def slice_context(
         ):
             if related["symbol_id"] not in chosen and related["symbol_id"] not in types:
                 callees[related["symbol_id"]] = related
-    callees = {sid: row for sid, row in callees.items() if sid not in types}
+    chosen_enclosing_classes = {
+        f"{r['module']}:{r['qualname'].rpartition('.')[0]}"
+        for r in chosen.values()
+        if r["kind"] == "method" and "." in r["qualname"]
+    }
+    callees = {
+        sid: row
+        for sid, row in callees.items()
+        if sid not in types and sid not in chosen_enclosing_classes
+    }
     sections["types_and_schemas"] = [
         item(row, True) for _, row in sorted(types.items())
     ]
@@ -782,6 +894,22 @@ def slice_context(
             compact_summaries[sid] if entry["symbol"] == sid else entry
             for entry in sections["types_and_schemas"]
         ]
+    def _should_include_callee_body(cand_row) -> bool:
+        if include_callee_bodies:
+            return True
+        if (
+            max_tokens >= 2000
+            and cand_row["file_path"].endswith((".java", ".ts", ".tsx"))
+            and cand_row["kind"] in {"method", "function", "async_function", "class"}
+            and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 30
+            and any(
+                c["file_path"] == cand_row["file_path"]
+                for c in chosen.values()
+            )
+        ):
+            return True
+        return False
+
     for name, candidates in (
         ("upstream_callers", callers),
         ("downstream_dependencies", callees),
@@ -790,7 +918,9 @@ def slice_context(
             if name == "upstream_callers":
                 sections[name].append(_caller_item(candidates[sid], caller_lines.get(sid)))
             else:
-                full = name == "downstream_dependencies" and include_callee_bodies
+                full = name == "downstream_dependencies" and _should_include_callee_body(
+                    candidates[sid]
+                )
                 sections[name].append(item(candidates[sid], full))
     complete = result()
     if complete["tokens"] <= max_tokens:
@@ -846,7 +976,9 @@ def slice_context(
                 candidate = _caller_item(candidates[sid], caller_lines.get(sid))
                 full = False
             else:
-                full = name == "downstream_dependencies" and include_callee_bodies
+                full = name == "downstream_dependencies" and _should_include_callee_body(
+                    candidates[sid]
+                )
                 candidate = item(candidates[sid], full)
             sections[name].append(candidate)
             if result()["tokens"] > max_tokens:

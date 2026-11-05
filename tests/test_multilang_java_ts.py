@@ -458,3 +458,135 @@ def test_java_and_ts_parse_errors_raise_codegraph_parse_error():
         extract_file("broken.ts", b"export function f(a: number { return a; }")
     with pytest.raises(CodeGraphError, match="invalid Python path"):
         extract_file("ambient.d.ts", b"export declare function f(): void;")
+
+
+def test_revision_2_slice_headers_sibling_bodies_and_builtin_filtering(tmp_path):
+    from codegraph_slicer.delta import summarize_delta
+
+    root = tmp_path / "rev2_ts"
+    _write(
+        root,
+        {
+            "src/models/types.ts": """export type EventKind = "START" | "END";
+
+export interface EventRecord {
+  kind: EventKind;
+  name: string;
+}
+
+export interface JobInput {
+  id: string;
+}
+""",
+            "src/services/executor.ts": """import * as path from "node:path";
+import type { EventRecord, JobInput } from "../models/types.ts";
+
+export class Executor {
+  public events: EventRecord[] = [];
+
+  public run(job: JobInput): string[] {
+    const items: string[] = [];
+    const walk = (p: string) => {
+      items.push(p.trim());
+    };
+    walk(this.normalize(job.id));
+    return items.map((x) => String(x));
+  }
+
+  private normalize(raw: string): string {
+    return path.posix.normalize(raw);
+  }
+}
+""",
+            "src/cli.ts": """import { Executor } from "./services/executor.ts";
+
+export function main(): string[] {
+  const ex = new Executor();
+  return ex.run({ id: "a" });
+}
+""",
+        },
+    )
+
+    with GraphStore(":memory:") as store:
+        stats = store.sync_workspace(root)
+        # R5: local closure `walk`, built-in `String`, and `.push`/`.trim`/`.map` do not emit unresolved diagnostics
+        diag_targets = [
+            r["target"]
+            for r in store.rows(
+                "SELECT target FROM diagnostics WHERE source_id='services.executor:Executor.run'"
+            )
+        ]
+        assert not any(
+            t in {"?walk", "?String", "?items.push", "?items.map", "?p.trim"}
+            for t in diag_targets
+        )
+
+        # Slice on Executor.run and cli:main
+        sliced = slice_context(
+            store,
+            ["services.executor:Executor.run", "cli:main"],
+            max_tokens=4000,
+        )
+        sections = sliced["sections"]
+
+        # R1: Executor.run target includes file imports + class header & fields
+        run_entry = next(
+            e
+            for e in sections["target_implementations"]
+            if e["symbol"] == "services.executor:Executor.run"
+        )
+        assert "// File & class header" in run_entry["text"]
+        assert 'import * as path from "node:path";' in run_entry["text"]
+        assert "export class Executor {" in run_entry["text"]
+        assert "public events: EventRecord[] = [];" in run_entry["text"]
+
+        # R2: compact sibling method `Executor.normalize` includes its full body in downstream_dependencies
+        norm_entry = next(
+            e
+            for e in sections["downstream_dependencies"]
+            if e["symbol"] == "services.executor:Executor.normalize"
+        )
+        assert "return path.posix.normalize(raw);" in norm_entry["text"]
+
+        # R3: Enclosing class USES_TYPE closure pulls in EventRecord -> EventKind into types_and_schemas
+        type_syms = {e["symbol"] for e in sections["types_and_schemas"]}
+        assert "models.types:EventRecord" in type_syms
+        assert "models.types:EventKind" in type_syms
+        assert "models.types:JobInput" in type_syms
+
+        # R4: Bare enclosing class `services.executor:Executor` is suppressed from downstream_dependencies
+        downstream_syms = {e["symbol"] for e in sections["downstream_dependencies"]}
+        assert "services.executor:Executor" not in downstream_syms
+
+        # R6: summarize_delta includes `complexity_threshold_exceeded` count when complexity_drift > 0
+        summary_payload = summarize_delta(
+            {
+                "added_edges": [],
+                "removed_edges": [],
+                "complexity_drift": [
+                    {
+                        "symbol": "services.executor:Executor.run",
+                        "cx_delta": 12,
+                        "fan_out_delta": 0,
+                        "threshold_exceeded": True,
+                    },
+                    {
+                        "symbol": "cli:main",
+                        "cx_delta": 1,
+                        "fan_out_delta": 0,
+                        "threshold_exceeded": False,
+                    },
+                ],
+                "boundary_violations": [],
+                "modified_symbols": ["services.executor:Executor.run", "cli:main"],
+                "untested_modified_symbols": [],
+                "affected_entrypoints": ["cli:main"],
+                "new_cycles": [],
+                "test_coverage": [],
+                "test_gap_note": "note",
+            },
+            max_tokens=2000,
+        )
+        assert summary_payload["summary"]["complexity_threshold_exceeded"] == 1
+

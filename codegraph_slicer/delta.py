@@ -250,6 +250,10 @@ def summarize_delta(
         "test_gap_note": result["test_gap_note"],
         "retrieve_details": "rerun with --full --max-tokens N",
     }
+    if counts["complexity_drift"] > 0 and render_estimator is None:
+        summary["complexity_threshold_exceeded"] = sum(
+            1 for item in result["complexity_drift"] if item.get("threshold_exceeded")
+        )
     if full:
         payload = dict(result)
         payload["import_changes"] = imports

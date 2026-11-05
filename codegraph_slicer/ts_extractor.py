@@ -97,6 +97,17 @@ _TS_BUILTINS = {
     "RegExp",
     "Buffer",
     "Uint8Array",
+    "Int32Array",
+    "Float64Array",
+    "ArrayBuffer",
+    "DataView",
+    "TextEncoder",
+    "TextDecoder",
+    "URL",
+    "URLSearchParams",
+    "AbortController",
+    "Intl",
+    "Reflect",
     "React",
     "FC",
     "ReactNode",
@@ -106,6 +117,130 @@ _TS_BUILTINS = {
     "JSON",
     "process",
     "globalThis",
+}
+_TS_GLOBAL_FUNCTIONS = {
+    "describe",
+    "it",
+    "test",
+    "beforeEach",
+    "afterEach",
+    "beforeAll",
+    "afterAll",
+    "expect",
+    "require",
+    "setTimeout",
+    "clearTimeout",
+    "setInterval",
+    "clearInterval",
+    "queueMicrotask",
+    "structuredClone",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "encodeURIComponent",
+    "decodeURIComponent",
+    "encodeURI",
+    "decodeURI",
+    "atob",
+    "btoa",
+    "fetch",
+}
+_TS_BUILTIN_PROTOTYPE_METHODS = {
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "slice",
+    "splice",
+    "map",
+    "filter",
+    "reduce",
+    "reduceRight",
+    "forEach",
+    "some",
+    "every",
+    "find",
+    "findIndex",
+    "includes",
+    "indexOf",
+    "lastIndexOf",
+    "join",
+    "split",
+    "sort",
+    "reverse",
+    "flat",
+    "flatMap",
+    "at",
+    "fill",
+    "concat",
+    "entries",
+    "keys",
+    "values",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "startsWith",
+    "endsWith",
+    "replace",
+    "replaceAll",
+    "toLowerCase",
+    "toUpperCase",
+    "padStart",
+    "padEnd",
+    "charAt",
+    "charCodeAt",
+    "codePointAt",
+    "substring",
+    "match",
+    "matchAll",
+    "search",
+    "localeCompare",
+    "normalize",
+    "repeat",
+    "toString",
+    "valueOf",
+    "toFixed",
+    "toISOString",
+    "getTime",
+    "getFullYear",
+    "getUTCFullYear",
+    "getMonth",
+    "getUTCMonth",
+    "getDate",
+    "getUTCDate",
+    "getDay",
+    "getUTCDay",
+    "getHours",
+    "getUTCHours",
+    "getMinutes",
+    "getUTCMinutes",
+    "getSeconds",
+    "getUTCSeconds",
+    "getMilliseconds",
+    "getUTCMilliseconds",
+    "set",
+    "get",
+    "has",
+    "delete",
+    "clear",
+    "add",
+    "test",
+    "exec",
+    "subarray",
+    "write",
+    "readUInt8",
+    "readUInt32BE",
+    "readUInt32LE",
+    "writeUInt32BE",
+    "writeUInt32LE",
+    "update",
+    "digest",
+    "format",
+    "formatToParts",
+    "then",
+    "catch",
+    "finally",
 }
 _STRIP_EXTS = (".tsx", ".mts", ".cts", ".jsx", ".mjs", ".cjs", ".ts", ".js")
 
@@ -468,6 +603,10 @@ def extract_typescript_file(
                     vident = child_of_type(decl, "identifier")
                     tann = child_of_type(decl, "type_annotation")
                     emit_type_uses(owner_sid, tann, tparams)
+                    fn_init = child_of_type(decl, "arrow_function", "function_expression")
+                    if vident is not None and fn_init is not None:
+                        local_types[node_text(data, vident)] = "__closure__"
+                        continue
                     base_t = _base_ts_type_name(data, tann)
                     new_expr = child_of_type(decl, "new_expression")
                     if base_t is None and new_expr is not None:
@@ -484,7 +623,7 @@ def extract_typescript_file(
                 )
                 if ctor is not None:
                     cname = node_text(data, ctor)
-                    if cname not in _TS_BUILTINS:
+                    if cname not in _TS_BUILTINS and cname.split(".", 1)[0] not in _TS_BUILTINS:
                         emit(owner_sid, resolve_ref(cname, local_types), "CALLS", start_line(desc))
                 targs = child_of_type(desc, "type_arguments")
                 emit_type_uses(owner_sid, targs, tparams)
@@ -530,7 +669,11 @@ def extract_typescript_file(
             return
         if callee.type == "identifier":
             fn_name = node_text(data, callee)
-            if fn_name in {"describe", "it", "test", "beforeEach", "afterEach", "beforeAll", "afterAll", "expect", "require", "setTimeout", "clearTimeout"}:
+            if (
+                fn_name in _TS_BUILTINS
+                or fn_name in _TS_GLOBAL_FUNCTIONS
+                or local_types.get(fn_name) == "__closure__"
+            ):
                 return
             emit(owner_sid, resolve_ref(fn_name, local_types), "CALLS", line)
             return
@@ -564,7 +707,8 @@ def extract_typescript_file(
                     if ftype and ftype not in _TS_BUILTINS:
                         emit(owner_sid, f"{resolve_ref(ftype)}.{mname}", "CALLS", line)
                         return
-                    emit(owner_sid, f"?this.{fname}.{mname}", "CALLS", line)
+                    if mname not in _TS_BUILTIN_PROTOTYPE_METHODS:
+                        emit(owner_sid, f"?this.{fname}.{mname}", "CALLS", line)
                     return
             if obj.type == "identifier":
                 rname = node_text(data, obj)
@@ -572,10 +716,13 @@ def extract_typescript_file(
                     return
                 if rname in local_types:
                     ltype = local_types[rname]
+                    if ltype == "__closure__":
+                        return
                     if ltype and ltype != "?" and ltype not in _TS_BUILTINS:
                         emit(owner_sid, f"{resolve_ref(ltype)}.{mname}", "CALLS", line)
                         return
-                    emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
+                    if mname not in _TS_BUILTIN_PROTOTYPE_METHODS and ltype not in _TS_BUILTINS:
+                        emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
                     return
                 if rname in bindings:
                     base = bindings[rname]
@@ -584,10 +731,16 @@ def extract_typescript_file(
                     else:
                         emit(owner_sid, f"{base}.{mname}", "CALLS", line)
                     return
-                emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
+                if mname not in _TS_BUILTIN_PROTOTYPE_METHODS:
+                    emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
                 return
             raw_obj = node_text(data, obj).strip()
-            if not raw_obj.startswith(("console.", "expect(")):
+            root_ident = re.split(r"[.(?\[]", raw_obj, maxsplit=1)[0].strip()
+            if (
+                not raw_obj.startswith(("console.", "expect("))
+                and root_ident not in _TS_BUILTINS
+                and mname not in _TS_BUILTIN_PROTOTYPE_METHODS
+            ):
                 emit(owner_sid, f"?{raw_obj}.{mname}", "CALLS", line)
 
     def _extract_params(params_node, owner_sid: str, tparams: set[str], field_types: dict[str, str] | None = None) -> dict[str, str]:

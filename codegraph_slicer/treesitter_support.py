@@ -16,6 +16,21 @@ def parser_for(grammar: str):
     return get_parser(grammar)
 
 
+def _has_non_jsx_syntax_error(root) -> bool:
+    for node in descendants(root):
+        if node.type == "ERROR" or node.is_missing:
+            curr = node.parent
+            in_jsx = False
+            while curr is not None:
+                if curr.type.startswith("jsx_"):
+                    in_jsx = True
+                    break
+                curr = curr.parent
+            if not in_jsx:
+                return True
+    return False
+
+
 def parse_tree(source: bytes, path: str, grammar: str):
     from .ast_extractor import CodeGraphParseError
 
@@ -27,7 +42,9 @@ def parse_tree(source: bytes, path: str, grammar: str):
         raise CodeGraphParseError(f"cannot parse {path}: {exc}") from exc
     data = text.encode("utf-8")
     tree = parser_for(grammar).parse(data)
-    if tree.root_node.has_error:
+    if tree.root_node.has_error and (
+        grammar != "tsx" or _has_non_jsx_syntax_error(tree.root_node)
+    ):
         raise CodeGraphParseError(f"cannot parse {path}: syntax error")
     return text, data, tree.root_node
 

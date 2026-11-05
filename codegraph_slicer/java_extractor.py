@@ -96,6 +96,44 @@ _JAVA_BUILTINS = {
     "Arrays",
     "Objects",
 }
+_JAVA_BUILTIN_METHODS = {
+    "size",
+    "length",
+    "isEmpty",
+    "get",
+    "put",
+    "add",
+    "addAll",
+    "remove",
+    "contains",
+    "containsKey",
+    "equals",
+    "hashCode",
+    "toString",
+    "trim",
+    "strip",
+    "split",
+    "substring",
+    "startsWith",
+    "endsWith",
+    "replace",
+    "replaceAll",
+    "toLowerCase",
+    "toUpperCase",
+    "format",
+    "valueOf",
+    "stream",
+    "map",
+    "filter",
+    "collect",
+    "toList",
+    "orElse",
+    "orElseGet",
+    "orElseThrow",
+    "isPresent",
+    "isEmpty",
+    "append",
+}
 _TEST_ANNOTATIONS = {"Test", "ParameterizedTest", "RepeatedTest", "TestFactory"}
 
 
@@ -572,13 +610,16 @@ def extract_java_file(
                     if resolved:
                         emit(sid, f"{resolved}.{mname}", "CALLS", line, in_test)
                         return
-                emit(sid, f"?{rname}.{mname}", "CALLS", line, in_test)
+                if mname not in _JAVA_BUILTIN_METHODS and ltype not in _JAVA_BUILTINS:
+                    emit(sid, f"?{rname}.{mname}", "CALLS", line, in_test)
                 return
             if rname in field_types:
                 ftype = field_types[rname]
                 resolved = resolve_type_ref(ftype, enclosing_types)
                 if resolved:
                     emit(sid, f"{resolved}.{mname}", "CALLS", line, in_test)
+                    return
+                if ftype in _JAVA_BUILTINS:
                     return
             if rname in _JAVA_BUILTINS or rname.startswith("System."):
                 return
@@ -587,7 +628,7 @@ def extract_java_file(
                 emit(sid, f"{resolved_static}.{mname}", "CALLS", line, in_test)
                 return
         raw_recv = node_text(data, receiver).strip()
-        if not raw_recv.startswith("System."):
+        if not raw_recv.startswith("System.") and mname not in _JAVA_BUILTIN_METHODS:
             emit(sid, f"?{raw_recv}.{mname}", "CALLS", line, in_test)
 
     for child in root.children:

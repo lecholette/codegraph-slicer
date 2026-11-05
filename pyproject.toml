@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codegraph-slicer"
-version = "0.1.2"
-description = "Stdlib-only static Python code graph: repo maps, symbol slices, local flow slices and base-vs-head deltas"
+version = "0.2.0"
+description = "Static Python, Java, and TypeScript/TSX code graph: repo maps, symbol slices, local flow slices and base-vs-head deltas"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "tree-sitter>=0.24",
+    "tree-sitter-language-pack>=0.7",
+]
 authors = [{name = "Chris Cholette"}]
 license-files = ["LICENSE", "NOTICE"]
 classifiers = [
