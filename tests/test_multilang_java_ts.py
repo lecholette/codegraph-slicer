@@ -592,7 +592,7 @@ export function main(): string[] {
 
 
 def test_revision_3_1_hidden_scratch_exclusion_and_bounded_delta_summary(
-    tmp_path: Path,
+    tmp_path,
 ) -> None:
     """Verify R3.1 hidden scratch-dir exclusion, stale cleanup, and bounded delta summary."""
     from codegraph_slicer.delta import summarize_delta

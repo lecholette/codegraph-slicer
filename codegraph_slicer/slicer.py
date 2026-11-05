@@ -496,16 +496,17 @@ def _target_item_with_preamble(store, row, chosen, max_tokens: int):
         )
         if class_rows:
             c_start = class_rows[0]["start_line"]
+            class_short = class_qual.rsplit(".", 1)[-1]
             first_m_rows = store.rows(
-                "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ?",
-                (row["file_path"], c_start),
+                "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ? AND qualname NOT GLOB ?",
+                (row["file_path"], c_start, f"*.{class_short}"),
             )
             first_m = (
                 first_m_rows[0]["first_m"]
                 if first_m_rows and first_m_rows[0]["first_m"] is not None
                 else row["start_line"]
             )
-            c_end = min(first_m - 1, row["start_line"] - 1, c_start + 15)
+            c_end = min(first_m - 1, row["start_line"] - 1, c_start + 20)
             for ln in range(c_start, c_end + 1):
                 if 1 <= ln <= len(file_lines):
                     line_txt = file_lines[ln - 1]
@@ -782,6 +783,11 @@ def slice_context(
     caller_lines = {}
     callees = {}
     referenced_names = set()
+    chosen_enclosing_classes = {
+        f"{r['module']}:{r['qualname'].rpartition('.')[0]}"
+        for r in chosen.values()
+        if r["kind"] == "method" and "." in r["qualname"]
+    }
     for sid, row in sorted(chosen.items()):
         sections["target_implementations"].append(
             _target_item_with_preamble(store, row, chosen, max_tokens)
@@ -806,7 +812,7 @@ def slice_context(
             ):
                 if (
                     related["symbol_id"] not in chosen
-                    and related["symbol_id"] != enclosing_class_sid
+                    and related["symbol_id"] not in chosen_enclosing_classes
                 ):
                     types[related["symbol_id"]] = related
         for related in store.rows(
@@ -827,11 +833,6 @@ def slice_context(
         ):
             if related["symbol_id"] not in chosen and related["symbol_id"] not in types:
                 callees[related["symbol_id"]] = related
-    chosen_enclosing_classes = {
-        f"{r['module']}:{r['qualname'].rpartition('.')[0]}"
-        for r in chosen.values()
-        if r["kind"] == "method" and "." in r["qualname"]
-    }
     callees = {
         sid: row
         for sid, row in callees.items()
@@ -901,7 +902,7 @@ def slice_context(
             max_tokens >= 2000
             and cand_row["file_path"].endswith((".java", ".ts", ".tsx"))
             and cand_row["kind"] in {"method", "function", "async_function", "class"}
-            and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 30
+            and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 40
             and any(
                 c["file_path"] == cand_row["file_path"]
                 for c in chosen.values()
