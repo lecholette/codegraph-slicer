@@ -81,6 +81,54 @@ def plain_target(target: str) -> str:
     return ".".join(part for part in (module, rest.lstrip(".")) if part) if end else target
 
 
+def _c3_pick_head(seqs: list[list[str]]) -> str:
+    for s in seqs:
+        head = s[0]
+        if all(head not in other[1:] for other in seqs):
+            return head
+    return seqs[0][0]
+
+
+def _c3_merge(cls_sid: str, seqs: list[list[str]]) -> tuple[str, ...]:
+    res = [cls_sid]
+    active = [s for s in seqs if s]
+    while active:
+        cand = _c3_pick_head(active)
+        res.append(cand)
+        active = [[x for x in s if x != cand] for s in active]
+        active = [s for s in active if s]
+    return tuple(dict.fromkeys(res))
+
+
+def compute_c3_mro(
+    cls_sid: str, bases_map: dict[str, tuple[str, ...] | list[str]]
+) -> tuple[str, ...]:
+    """Compute Python C3 method resolution order over a class->bases mapping."""
+    memo: dict[str, tuple[str, ...]] = {}
+    stack: list[tuple[str, bool]] = [(cls_sid, False)]
+    visiting: set[str] = set()
+    while stack:
+        curr, processed = stack.pop()
+        if curr in memo:
+            continue
+        direct = [b for b in dict.fromkeys(bases_map.get(curr, ())) if b and b != curr]
+        if not direct:
+            memo[curr] = (curr,)
+            visiting.discard(curr)
+            continue
+        if processed:
+            seqs = [list(memo.get(b, (b,))) for b in direct] + [direct]
+            memo[curr] = _c3_merge(curr, seqs)
+            visiting.discard(curr)
+            continue
+        visiting.add(curr)
+        stack.append((curr, True))
+        for b in reversed(direct):
+            if b not in memo and b not in visiting:
+                stack.append((b, False))
+    return memo.get(cls_sid, (cls_sid,))
+
+
 def valid_path(path: str) -> str:
     p = PurePosixPath(path)
     if (
@@ -183,16 +231,24 @@ def extract_file(
     frame_globals: list[set[str]] = []
     frame_nonlocals: list[set[str]] = []
     frame_local_types: list[dict[str, tuple[str, ...]]] = []
+    frame_local_elem_types: list[dict[str, tuple[str, ...]]] = []
+    frame_local_deferred_ret: list[dict[str, tuple[str, ...]]] = []
     frame_local_callables: list[dict[str, tuple[str, ...]]] = []
     type_aliases: dict[str, tuple[str, ...]] = {}
+    elem_type_aliases: dict[str, tuple[str, ...]] = {}
     class_bases: dict[str, tuple[str, ...]] = {}
+    structural_protocols_of: dict[str, tuple[str, ...]] = {}
     class_methods: dict[str, set[str]] = {}
+    method_arity: dict[tuple[str, str], tuple[int, int | None]] = {}
     class_fields: dict[str, dict[str, tuple[str, ...]]] = {}
+    class_elem_fields: dict[str, dict[str, tuple[str, ...]]] = {}
     func_returns: dict[str, tuple[str, ...]] = {}
+    func_elem_returns: dict[str, tuple[str, ...]] = {}
     container_callables: dict[str, tuple[str, ...]] = {}
     local_function_sids: set[str] = set()
     local_class_sids: set[str] = set()
     protocol_classes: set[str] = set()
+    abc_classes: set[str] = set()
     is_test = is_test_path(path)
 
     def owner() -> str:
@@ -395,7 +451,7 @@ def extract_file(
 
     def emit(target: str, kind: str, line: int):
         edges.append(Edge(owner(), target, kind, line))
-        if is_test and kind in {"CALLS", "IMPORTS"}:
+        if is_test and kind == "CALLS":
             edges.append(Edge(owner(), target, "TESTS", line))
 
     def annotation(node, origin_line=None):
@@ -416,6 +472,11 @@ def extract_file(
             for child in ast.iter_child_nodes(node):
                 annotation(child, origin_line)
 
+    _CONTAINER_HEADS = {
+        "list", "List", "set", "Set", "frozenset", "FrozenSet",
+        "tuple", "Tuple", "Sequence", "Iterable", "Iterator",
+    }
+
     def _type_targets(node, seen_aliases: frozenset[str] = frozenset()) -> tuple[str, ...]:
         if node is None:
             return ()
@@ -434,11 +495,7 @@ def extract_file(
                 if isinstance(node.value, ast.Name)
                 else (node.value.attr if isinstance(node.value, ast.Attribute) else "")
             )
-            if head in {
-                "Optional", "Union", "list", "List", "set", "Set",
-                "frozenset", "FrozenSet", "tuple", "Tuple", "Sequence",
-                "Iterable", "Iterator",
-            }:
+            if head in {"Optional", "Union"}:
                 elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
                 out: list[str] = []
                 for elt in elts:
@@ -451,6 +508,8 @@ def extract_file(
                     else node.slice
                 )
                 return _type_targets(first, seen_aliases)
+            if head in _CONTAINER_HEADS:
+                return ()
             return _type_targets(node.value, seen_aliases)
         if isinstance(node, (ast.Name, ast.Attribute)):
             if isinstance(node, ast.Name) and node.id in {
@@ -465,6 +524,42 @@ def extract_file(
             if ref in type_aliases and ref not in seen_aliases:
                 return type_aliases[ref]
             return (ref,)
+        return ()
+
+    def _iter_element_types(node, seen_aliases: frozenset[str] = frozenset()) -> tuple[str, ...]:
+        if node is None:
+            return ()
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            try:
+                return _iter_element_types(ast.parse(node.value, mode="eval").body, seen_aliases)
+            except SyntaxError:
+                return ()
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            left = _iter_element_types(node.left, seen_aliases)
+            right = _iter_element_types(node.right, seen_aliases)
+            return tuple(dict.fromkeys([*left, *right]))
+        if isinstance(node, ast.Subscript):
+            head = (
+                node.value.id
+                if isinstance(node.value, ast.Name)
+                else (node.value.attr if isinstance(node.value, ast.Attribute) else "")
+            )
+            if head in {"Optional", "Union", "Annotated", "ClassVar", "Final"}:
+                elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                out_u: list[str] = []
+                for elt in elts:
+                    out_u.extend(_iter_element_types(elt, seen_aliases))
+                return tuple(dict.fromkeys(out_u))
+            if head in _CONTAINER_HEADS:
+                elts = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+                out_c: list[str] = []
+                for elt in elts:
+                    out_c.extend(_type_targets(elt, seen_aliases))
+                return tuple(dict.fromkeys(out_c))
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            ref = reference(node)
+            if ref in elem_type_aliases and ref not in seen_aliases:
+                return elem_type_aliases[ref]
         return ()
 
     def _extract_callable_elements(node) -> tuple[str, ...]:
@@ -505,19 +600,40 @@ def extract_file(
             return container_callables.get(container_node.id, ())
         return ()
 
-    def _resolve_class_method(cls_target: str, method_name: str, visited: frozenset[str] = frozenset()) -> str:
-        if cls_target in visited:
-            return f"{cls_target}.{method_name}"
-        if cls_target in class_methods:
-            if method_name in class_methods[cls_target]:
-                return f"{cls_target}.{method_name}"
-            for base in class_bases.get(cls_target, ()):
-                if base in class_methods or base in class_bases:
-                    resolved = _resolve_class_method(base, method_name, visited | {cls_target})
-                    base_cls = resolved.rpartition(".")[0]
-                    if base_cls in class_methods and method_name in class_methods[base_cls]:
-                        return resolved
+    def _resolve_class_method(cls_target: str, method_name: str) -> str:
+        if cls_target in class_methods or cls_target in class_bases:
+            for base in compute_c3_mro(cls_target, class_bases):
+                if method_name in class_methods.get(base, ()):
+                    return f"{base}.{method_name}"
         return f"{cls_target}.{method_name}"
+
+    def _expr_elem_types(node) -> tuple[str, ...]:
+        if isinstance(node, ast.Name):
+            for index in range(len(frame_local_elem_types) - 1, -1, -1):
+                if frame_kinds[index] == "class" and frame_kinds[-1] != "class":
+                    continue
+                if node.id in frame_local_elem_types[index]:
+                    return frame_local_elem_types[index][node.id]
+            ref = reference(node)
+            if not ref.startswith("?"):
+                return elem_type_aliases.get(ref, ())
+            return ()
+        if isinstance(node, ast.Attribute):
+            owner_types = _expr_types(node.value)
+            out_e: list[str] = []
+            for ot in owner_types:
+                for cls_cand in compute_c3_mro(ot, class_bases):
+                    ftypes = class_elem_fields.get(cls_cand, {}).get(node.attr, ())
+                    for ft in ftypes:
+                        out_e.extend(type_aliases.get(ft, (ft,)))
+            return tuple(dict.fromkeys(out_e))
+        if isinstance(node, ast.Call):
+            out_ce: list[str] = []
+            for cref in _call_targets(node.func):
+                if cref in func_elem_returns:
+                    out_ce.extend(func_elem_returns[cref])
+            return tuple(dict.fromkeys(out_ce))
+        return ()
 
     def _expr_types(node) -> tuple[str, ...]:
         if isinstance(node, ast.Name):
@@ -534,13 +650,13 @@ def extract_file(
             owner_types = _expr_types(node.value)
             out: list[str] = []
             for ot in owner_types:
-                for cls_cand in (ot, *class_bases.get(ot, ())):
+                for cls_cand in compute_c3_mro(ot, class_bases):
                     ftypes = class_fields.get(cls_cand, {}).get(node.attr, ())
                     for ft in ftypes:
                         out.extend(type_aliases.get(ft, (ft,)))
             return tuple(dict.fromkeys(out))
         if isinstance(node, ast.Subscript):
-            return _expr_types(node.value)
+            return _expr_elem_types(node.value)
         if isinstance(node, ast.Call):
             out_call: list[str] = []
             for cref in _call_targets(node.func):
@@ -561,7 +677,11 @@ def extract_file(
                 cls_part, _, m_part = primary.rpartition(".")
                 if cls_part in class_methods:
                     return (_resolve_class_method(cls_part, m_part),)
-            return (primary,)
+            if not (
+                isinstance(func_node, ast.Attribute)
+                and isinstance(func_node.value, (ast.Attribute, ast.Call, ast.Subscript))
+            ):
+                return (primary,)
         if isinstance(func_node, ast.Name):
             for index in range(len(frame_local_callables) - 1, -1, -1):
                 if frame_kinds[index] == "class" and frame_kinds[-1] != "class":
@@ -579,8 +699,8 @@ def extract_file(
                 resolved: list[str] = []
                 for rt in recv_types:
                     resolved.append(_resolve_class_method(rt, func_node.attr))
-                    for base in class_bases.get(rt, ()):
-                        if base in protocol_classes and func_node.attr in class_methods.get(base, ()):
+                    for base in (*compute_c3_mro(rt, class_bases), *structural_protocols_of.get(rt, ())):
+                        if base in (protocol_classes | abc_classes) and func_node.attr in class_methods.get(base, ()):
                             resolved.append(f"{base}.{func_node.attr}")
                 return tuple(dict.fromkeys(resolved))
         return (primary,)
@@ -690,6 +810,8 @@ def extract_file(
             scope_kinds.append(kind)
             local = bindings(node.body)
             local_types: dict[str, tuple[str, ...]] = {}
+            local_elem_types: dict[str, tuple[str, ...]] = {}
+            local_deferred_ret: dict[str, tuple[str, ...]] = {}
             local_callables: dict[str, tuple[str, ...]] = {}
             if not is_class:
                 args = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
@@ -710,6 +832,9 @@ def extract_file(
                         tt = _type_targets(arg.annotation)
                         if tt:
                             local_types[arg.arg] = tt
+                        et = _iter_element_types(arg.annotation)
+                        if et:
+                            local_elem_types[arg.arg] = et
                 annotation(node.returns)
                 for default in [*node.args.defaults, *node.args.kw_defaults]:
                     if default is not None:
@@ -723,6 +848,8 @@ def extract_file(
             frame_globals.append(global_names)
             frame_nonlocals.append(nonlocal_names)
             frame_local_types.append(local_types)
+            frame_local_elem_types.append(local_elem_types)
+            frame_local_deferred_ret.append(local_deferred_ret)
             frame_local_callables.append(local_callables)
             if not is_class:
                 for stmt in branches(node):
@@ -731,45 +858,65 @@ def extract_file(
                         tt = _type_targets(stmt.annotation)
                         if tt:
                             local_types[vname] = tt
+                        et = _iter_element_types(stmt.annotation)
+                        if et:
+                            local_elem_types[vname] = et
                         if stmt.value is not None:
                             ct = _extract_callable_elements(stmt.value) or _container_lookup_targets(stmt.value)
                             if ct:
                                 local_callables[vname] = ct
                     elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                         target_node = stmt.targets[0]
+                        is_unpack = isinstance(target_node, (ast.Tuple, ast.List))
                         target_names = (
                             [target_node.id]
                             if isinstance(target_node, ast.Name)
                             else (
                                 [e.id for e in target_node.elts if isinstance(e, ast.Name)]
-                                if isinstance(target_node, (ast.Tuple, ast.List))
+                                if is_unpack
                                 else []
                             )
                         )
-                        if len(target_names) == 1:
+                        if len(target_names) == 1 and not is_unpack:
                             ct = _extract_callable_elements(stmt.value) or _container_lookup_targets(stmt.value)
                             if ct:
                                 local_callables[target_names[0]] = ct
                         if target_names and isinstance(stmt.value, ast.Call):
-                            ret_types: list[str] = []
-                            for cref in _call_targets(stmt.value.func):
-                                if cref in func_returns:
-                                    ret_types.extend(func_returns[cref])
-                                elif not cref.startswith("?") and (
-                                    cref in local_class_sids
-                                    or cref.rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("|", 1)[-1][:1].isupper()
-                                ):
-                                    ret_types.append(cref)
-                            if ret_types:
-                                dedup_rt = tuple(dict.fromkeys(ret_types))
-                                for vname in target_names:
-                                    local_types[vname] = dedup_rt
+                            if is_unpack:
+                                unpack_types = _expr_elem_types(stmt.value)
+                                if unpack_types:
+                                    for vname in target_names:
+                                        local_types[vname] = unpack_types
+                            else:
+                                ret_types: list[str] = []
+                                ret_elem_types: list[str] = []
+                                deferred_refs: list[str] = []
+                                for cref in _call_targets(stmt.value.func):
+                                    if cref in func_returns:
+                                        ret_types.extend(func_returns[cref])
+                                    elif not cref.startswith("?") and (
+                                        cref in local_class_sids
+                                        or cref.rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("|", 1)[-1][:1].isupper()
+                                    ):
+                                        ret_types.append(cref)
+                                    elif not cref.startswith("?") and cref not in local_function_sids:
+                                        deferred_refs.append(cref)
+                                    if cref in func_elem_returns:
+                                        ret_elem_types.extend(func_elem_returns[cref])
+                                if ret_types:
+                                    dedup_rt = tuple(dict.fromkeys(ret_types))
+                                    for vname in target_names:
+                                        local_types[vname] = dedup_rt
+                                elif deferred_refs:
+                                    dedup_dr = tuple(dict.fromkeys(deferred_refs))
+                                    for vname in target_names:
+                                        local_deferred_ret[vname] = dedup_dr
+                                if ret_elem_types:
+                                    dedup_re = tuple(dict.fromkeys(ret_elem_types))
+                                    for vname in target_names:
+                                        local_elem_types[vname] = dedup_re
                     elif isinstance(stmt, (ast.For, ast.AsyncFor)):
-                        iter_types = list(_expr_types(stmt.iter))
-                        if not iter_types and isinstance(stmt.iter, ast.Call):
-                            for cref in _call_targets(stmt.iter.func):
-                                if cref in func_returns:
-                                    iter_types.extend(func_returns[cref])
+                        iter_types = list(_expr_elem_types(stmt.iter))
                         if iter_types:
                             dedup_it = tuple(dict.fromkeys(iter_types))
                             target_names = (
@@ -786,6 +933,8 @@ def extract_file(
             for statement in node.body:
                 self.visit(statement)
             frame_local_callables.pop()
+            frame_local_deferred_ret.pop()
+            frame_local_elem_types.pop()
             frame_local_types.pop()
             frames.pop()
             frame_kinds.pop()
@@ -814,9 +963,13 @@ def extract_file(
             frame_globals.append(set())
             frame_nonlocals.append(set())
             frame_local_types.append({})
+            frame_local_elem_types.append({})
+            frame_local_deferred_ret.append({})
             frame_local_callables.append({})
             self.visit(node.body)
             frame_local_callables.pop()
+            frame_local_deferred_ret.pop()
+            frame_local_elem_types.pop()
             frame_local_types.pop()
             frames.pop()
             frame_kinds.pop()
@@ -830,6 +983,8 @@ def extract_file(
             frame_globals.append(set())
             frame_nonlocals.append(set())
             frame_local_types.append({})
+            frame_local_elem_types.append({})
+            frame_local_deferred_ret.append({})
             frame_local_callables.append({})
 
             def bind_target(target):
@@ -845,11 +1000,7 @@ def extract_file(
                 if index:
                     self.visit(generator.iter)
                 bind_target(generator.target)
-                iter_types = list(_expr_types(generator.iter))
-                if not iter_types and isinstance(generator.iter, ast.Call):
-                    for cref in _call_targets(generator.iter.func):
-                        if cref in func_returns:
-                            iter_types.extend(func_returns[cref])
+                iter_types = list(_expr_elem_types(generator.iter))
                 if iter_types:
                     dedup_it = tuple(dict.fromkeys(iter_types))
                     target_names = (
@@ -870,6 +1021,8 @@ def extract_file(
                     self.visit(value)
 
             frame_local_callables.pop()
+            frame_local_deferred_ret.pop()
+            frame_local_elem_types.pop()
             frame_local_types.pop()
             frames.pop()
             frame_kinds.pop()
@@ -903,8 +1056,30 @@ def extract_file(
                 self.visit(node.value)
 
         def visit_Call(self, node):
-            for target in _call_targets(node.func):
-                emit(target, "CALLS", node.lineno)
+            targets = _call_targets(node.func)
+            deferred_emitted = False
+            if isinstance(node.func, ast.Attribute):
+                recv = node.func.value
+                if len(targets) == 1 and targets[0].startswith("?") and isinstance(recv, ast.Name):
+                    for index in range(len(frame_local_deferred_ret) - 1, -1, -1):
+                        if frame_kinds[index] == "class" and frame_kinds[-1] != "class":
+                            continue
+                        if recv.id in frame_local_deferred_ret[index]:
+                            for dref in frame_local_deferred_ret[index][recv.id]:
+                                edges.append(Edge(owner(), f"RET\t{dref}\t{node.func.attr}\t{targets[0]}", "DEFERRED_CALL", node.lineno))
+                                deferred_emitted = True
+                            break
+                elif isinstance(recv, ast.Attribute) and not _expr_types(recv):
+                    if isinstance(recv.value, ast.Name) and any(
+                        recv.value.id in flt for flt in frame_local_types
+                    ):
+                        for ot in _expr_types(recv.value):
+                            if not ot.startswith("?"):
+                                edges.append(Edge(owner(), f"FLD\t{ot}\t{recv.attr}\t{node.func.attr}\t{targets[0]}", "DEFERRED_CALL", node.lineno))
+                                deferred_emitted = True
+            if not deferred_emitted:
+                for target in targets:
+                    emit(target, "CALLS", node.lineno)
             for arg in [*node.args, *(kw.value for kw in node.keywords if kw.value is not None)]:
                 if isinstance(arg, (ast.Name, ast.Attribute)):
                     arg_ref = reference(arg)
@@ -933,7 +1108,29 @@ def extract_file(
     frame_globals.append(set())
     frame_nonlocals.append(set())
     frame_local_types.append({})
+    frame_local_elem_types.append({})
+    frame_local_deferred_ret.append({})
     frame_local_callables.append({})
+
+    def _calc_arity(fn_node: ast.FunctionDef | ast.AsyncFunctionDef, is_method: bool) -> tuple[int, int | None]:
+        pos = [*fn_node.args.posonlyargs, *fn_node.args.args]
+        if is_method and pos and pos[0].arg in {"self", "cls"}:
+            pos = pos[1:]
+        total_pos = len(pos)
+        min_pos = max(0, total_pos - len(fn_node.args.defaults))
+        req_kw = sum(1 for d in fn_node.args.kw_defaults if d is None)
+        min_total = min_pos + req_kw
+        max_total = None if (fn_node.args.vararg or fn_node.args.kwarg) else (total_pos + len(fn_node.args.kwonlyargs))
+        return (min_total, max_total)
+
+    def _arity_compatible(p_arity: tuple[int, int | None], c_arity: tuple[int, int | None]) -> bool:
+        p_min, p_max = p_arity
+        c_min, c_max = c_arity
+        if c_min > p_min and (p_max is None or c_min > p_max):
+            return False
+        if c_max is not None and c_max < p_min:
+            return False
+        return True
 
     # Pre-scan top-level classes, methods, type aliases, fields, and dispatch tables
     for stmt in tree.body:
@@ -950,32 +1147,82 @@ def extract_file(
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     mset.add(member.name)
                     local_function_sids.add(f"{csid}.{member.name}")
+                    marity = _calc_arity(member, True)
+                    method_arity[(csid, member.name)] = marity
+                    edges.append(
+                        Edge(
+                            f"{csid}.{member.name}",
+                            f"{marity[0]}\t{'' if marity[1] is None else marity[1]}",
+                            "METHOD_ARITY",
+                            0,
+                        )
+                    )
             class_methods[csid] = mset
             if any(
-                (isinstance(b, ast.Name) and b.id in {"Protocol", "ABC"})
-                or (isinstance(b, ast.Attribute) and b.attr in {"Protocol", "ABC"})
+                (isinstance(b, ast.Name) and b.id == "Protocol")
+                or (isinstance(b, ast.Attribute) and b.attr == "Protocol")
                 for b in stmt.bases
             ):
                 protocol_classes.add(csid)
+            elif any(
+                (isinstance(b, ast.Name) and b.id in {"ABC", "ABCMeta"})
+                or (isinstance(b, ast.Attribute) and b.attr in {"ABC", "ABCMeta"})
+                for b in stmt.bases
+            ):
+                abc_classes.add(csid)
+    for asid in sorted(abc_classes):
+        for m in sorted(class_methods.get(asid, ())):
+            if not m.startswith("_"):
+                edges.append(Edge(asid, m, "ABC_METHOD", 0))
+        impls = sorted(
+            csid
+            for csid in (local_class_sids - abc_classes - protocol_classes)
+            if asid in compute_c3_mro(csid, class_bases)
+        )
+        if impls:
+            type_aliases[asid] = (asid, *impls)
     for psid in sorted(protocol_classes):
-        req_methods = {m for m in class_methods.get(psid, ()) if not m.startswith("__")}
+        req_methods = {m for m in class_methods.get(psid, ()) if not m.startswith("_")}
         if req_methods:
+            for m in sorted(req_methods):
+                p_min, p_max = method_arity.get((psid, m), (0, None))
+                edges.append(
+                    Edge(
+                        psid,
+                        f"{m}\t{p_min}\t{'' if p_max is None else p_max}",
+                        "PROTOCOL_METHOD",
+                        0,
+                    )
+                )
             impls = sorted(
                 csid
-                for csid in (local_class_sids - protocol_classes)
-                if req_methods <= class_methods.get(csid, set()) or psid in class_bases.get(csid, ())
+                for csid in (local_class_sids - protocol_classes - abc_classes)
+                if psid in compute_c3_mro(csid, class_bases)
+                or (
+                    req_methods <= class_methods.get(csid, set())
+                    and all(
+                        _arity_compatible(
+                            method_arity.get((psid, m), (0, None)),
+                            method_arity.get((csid, m), (0, None)),
+                        )
+                        for m in req_methods
+                    )
+                )
             )
             if impls:
                 type_aliases[psid] = (psid, *impls)
                 for impl_sid in impls:
-                    if psid not in class_bases.get(impl_sid, ()):
-                        class_bases[impl_sid] = (*class_bases.get(impl_sid, ()), psid)
+                    if psid not in structural_protocols_of.get(impl_sid, ()):
+                        structural_protocols_of[impl_sid] = (*structural_protocols_of.get(impl_sid, ()), psid)
     for stmt in tree.body:
         if isinstance(stmt, ast.TypeAlias):
             tsid = f"{module}:{stmt.name.id}"
             tt = _type_targets(stmt.value, frozenset({tsid}))
             if tt:
                 type_aliases[tsid] = tt
+            et = _iter_element_types(stmt.value, frozenset({tsid}))
+            if et:
+                elem_type_aliases[tsid] = et
         elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
             tname = stmt.targets[0].id
             tsid = f"{module}:{tname}"
@@ -984,6 +1231,9 @@ def extract_file(
                 if tt:
                     type_aliases[tsid] = tt
                     frames[0][tname] = tsid
+                et = _iter_element_types(stmt.value, frozenset({tsid}))
+                if et:
+                    elem_type_aliases[tsid] = et
             ct = _extract_callable_elements(stmt.value)
             if ct:
                 container_callables[tname] = ct
@@ -993,30 +1243,50 @@ def extract_file(
                 container_callables[stmt.target.id] = ct
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.returns is not None:
+            fsid = f"{module}:{stmt.name}"
             rt = _type_targets(stmt.returns)
             if rt:
-                func_returns[f"{module}:{stmt.name}"] = rt
+                func_returns[fsid] = rt
+                for r in rt:
+                    edges.append(Edge(fsid, r, "RETURN_TYPE", 0))
+            ert = _iter_element_types(stmt.returns)
+            if ert:
+                func_elem_returns[fsid] = ert
         elif isinstance(stmt, ast.ClassDef):
             csid = f"{module}:{stmt.name}"
             fmap: dict[str, tuple[str, ...]] = {}
+            efmap: dict[str, tuple[str, ...]] = {}
             for member in stmt.body:
                 if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.returns is not None:
+                    msid = f"{csid}.{member.name}"
                     mrt = _type_targets(member.returns)
                     if mrt:
-                        func_returns[f"{csid}.{member.name}"] = mrt
+                        func_returns[msid] = mrt
+                        for r in mrt:
+                            edges.append(Edge(msid, r, "RETURN_TYPE", 0))
+                    mert = _iter_element_types(member.returns)
+                    if mert:
+                        func_elem_returns[msid] = mert
                 if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name):
                     tt = _type_targets(member.annotation)
                     if tt:
                         fmap[member.target.id] = tt
+                    et = _iter_element_types(member.annotation)
+                    if et:
+                        efmap[member.target.id] = et
                 elif isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == "__init__":
                     init_args = [*member.args.posonlyargs, *member.args.args, *member.args.kwonlyargs]
                     self_name = init_args[0].arg if init_args else "self"
                     param_types: dict[str, tuple[str, ...]] = {}
+                    param_elem_types: dict[str, tuple[str, ...]] = {}
                     for a in init_args[1:]:
                         if a.annotation is not None:
                             att = _type_targets(a.annotation)
                             if att:
                                 param_types[a.arg] = att
+                            aet = _iter_element_types(a.annotation)
+                            if aet:
+                                param_elem_types[a.arg] = aet
                     for istmt in member.body:
                         if (
                             isinstance(istmt, ast.AnnAssign)
@@ -1027,6 +1297,9 @@ def extract_file(
                             att = _type_targets(istmt.annotation)
                             if att:
                                 fmap[istmt.target.attr] = att
+                            aet = _iter_element_types(istmt.annotation)
+                            if aet:
+                                efmap[istmt.target.attr] = aet
                         elif (
                             isinstance(istmt, ast.Assign)
                             and len(istmt.targets) == 1
@@ -1035,8 +1308,11 @@ def extract_file(
                             and istmt.targets[0].value.id == self_name
                         ):
                             fname = istmt.targets[0].attr
-                            if isinstance(istmt.value, ast.Name) and istmt.value.id in param_types:
-                                fmap[fname] = param_types[istmt.value.id]
+                            if isinstance(istmt.value, ast.Name):
+                                if istmt.value.id in param_types:
+                                    fmap[fname] = param_types[istmt.value.id]
+                                if istmt.value.id in param_elem_types:
+                                    efmap[fname] = param_elem_types[istmt.value.id]
                             elif isinstance(istmt.value, ast.Call) and isinstance(
                                 istmt.value.func, (ast.Name, ast.Attribute)
                             ):
@@ -1044,6 +1320,10 @@ def extract_file(
                                 if not cref.startswith("?"):
                                     fmap[fname] = (cref,)
             class_fields[csid] = fmap
+            class_elem_fields[csid] = efmap
+            for fname, fts in fmap.items():
+                for ft in fts:
+                    edges.append(Edge(f"{csid}.{fname}", ft, "FIELD_TYPE", 0))
 
     Visitor().visit(tree)
     skeleton = ast.unparse(_Strip().visit(copy.deepcopy(tree))) + "\n"

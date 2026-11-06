@@ -13,10 +13,10 @@ Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecho
 Indexes Python (`.py`), Java (`.java`), and TypeScript (`.ts`, `.tsx`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
-## Routing Threshold (`>= 25` Source Files & Task-Local File Size)
+## Routing Threshold (Target File Size & Cross-Package Coupling Density)
 
-- **Start with `codegraph-slicer slice`** on repositories or modules with **`>= 25` relevant source files** (`.py`, `.java`, `.ts`, `.tsx`) when the target symbols span large files (`>= 200` lines) or callers/callees are dispersed across the codebase. Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading source files.
-- **Skip codegraph (or use direct `Read`)** for small repositories (**`< 25` relevant source files**), single-file edits, when all target files are already known and small (`< 200` lines each), or unsupported languages. On small files that you will immediately edit with `Edit`, reading the target file directly avoids loading both the slice and the full file into context.
+- **Start with `codegraph-slicer slice` or `impact`** when the target symbols live inside large files (**`>= 300` lines** or `>= 15` definitions) or when callers, callees, and interface implementations are unknown and dispersed across multiple packages. Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading large source files.
+- **Skip `slice` and use direct `Read` (or `impact` for caller discovery)** when the target files are already known and compact (**`< 300` lines each**), for single-file edits, or for small repositories (`< 25` relevant source files). On compact Java/TypeScript one-class-per-file modules (`< 300` lines) that you will immediately edit, reading the target file directly avoids paying the double token tax of loading both the XML slice and the full file into context.
 - **Incremental head sync (`delta`):** When running `delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite`, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
 
 ## Index first

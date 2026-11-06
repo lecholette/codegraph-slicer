@@ -19,9 +19,11 @@ from .ast_extractor import (
     Edge,
     FileAnalysis,
     Symbol,
+    compute_c3_mro,
     detect_layout,
     extract_file,
     is_supported_source_path,
+    is_test_path,
     module_name,
     plain_target,
     valid_path,
@@ -36,6 +38,7 @@ _SKIP_DIRS = {
     "venv",
     "__pycache__",
     "node_modules",
+    "build",
     ".gradle",
     ".next",
 }
@@ -160,6 +163,24 @@ def git_env() -> dict[str, str]:
         GIT_CONFIG_GLOBAL=os.devnull,
     )
     return env
+
+
+def _arity_ok(req: tuple[int, int | None], cand: tuple[int, int | None]) -> bool:
+    r_min, _ = req
+    c_min, c_max = cand
+    return c_min <= r_min and (c_max is None or c_max >= r_min)
+
+
+def _satisfies_protocol(
+    csid: str,
+    reqs: dict[str, tuple[int, int | None]],
+    method_arities: dict[str, tuple[int, int | None]],
+) -> bool:
+    return all(
+        f"{csid}.{m}" in method_arities
+        and _arity_ok(req_a, method_arities[f"{csid}.{m}"])
+        for m, req_a in reqs.items()
+    )
 
 
 class GraphStore:
@@ -732,28 +753,31 @@ class GraphStore:
                 else:
                     return direct(target, module_parts)
 
+        _META_KINDS = (
+            "ALIAS",
+            "WILDCARD_EXPORT",
+            "WILDCARD_IMPORT",
+            "RETURN_TYPE",
+            "FIELD_TYPE",
+            "PROTOCOL_METHOD",
+            "METHOD_ARITY",
+            "ABC_METHOD",
+            "DEFERRED_CALL",
+        )
         self.db.execute("DELETE FROM edges")
         self.db.execute("DELETE FROM diagnostics")
+        unresolved_rows = []
         for row in self.db.execute(
-            "SELECT * FROM raw_edges WHERE kind NOT IN ('ALIAS','WILDCARD_EXPORT','WILDCARD_IMPORT') "
-            "ORDER BY source_file,source_id,target_id,kind,line"
+            f"SELECT * FROM raw_edges WHERE kind NOT IN ({','.join('?' for _ in _META_KINDS)}) "
+            "ORDER BY source_file,source_id,target_id,kind,line",
+            _META_KINDS,
         ).fetchall():
             raw_target = _rewrite_lang_target(
                 row["target_id"], file_lang.get(row["source_file"], "py")
             )
             target = resolve(raw_target)
             if target is None:
-                self.db.execute(
-                    "INSERT INTO diagnostics VALUES(?,?,?,?,?,?)",
-                    (
-                        row["source_file"],
-                        row["source_id"],
-                        plain_target(raw_target),
-                        row["kind"],
-                        row["line"],
-                        "external, dynamic, shadowed, or unobserved reference",
-                    ),
-                )
+                unresolved_rows.append((row, raw_target))
             else:
                 self.db.execute(
                     "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
@@ -765,6 +789,9 @@ class GraphStore:
                         row["line"],
                     ),
                 )
+        self._resolve_cross_file_calls(
+            symbols, file_lang, _rewrite_lang_target, resolve, unresolved_rows
+        )
         for row in self.db.execute(
             "SELECT symbol_id,file_path,module,qualname FROM symbols WHERE kind!='module'"
         ).fetchall():
@@ -775,23 +802,213 @@ class GraphStore:
                 (row["file_path"], parent, row["symbol_id"], "DEFINES", 0),
             )
 
+    def _load_type_facts(self, file_lang, rewrite_target, resolve):
+        class_bases_list: dict[str, list[str]] = defaultdict(list)
+        for r in self.db.execute(
+            "SELECT source_id,target_id FROM edges WHERE kind='INHERITS' ORDER BY line"
+        ):
+            if r["target_id"] not in class_bases_list[r["source_id"]]:
+                class_bases_list[r["source_id"]].append(r["target_id"])
+        class_bases = {k: tuple(v) for k, v in class_bases_list.items()}
+
+        return_types: dict[str, list[str]] = defaultdict(list)
+        for r in self.db.execute(
+            "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='RETURN_TYPE'"
+        ):
+            rt = resolve(rewrite_target(r["target_id"], file_lang.get(r["source_file"], "py")))
+            if rt and rt not in return_types[r["source_id"]]:
+                return_types[r["source_id"]].append(rt)
+
+        field_types: dict[tuple[str, str], list[str]] = defaultdict(list)
+        for r in self.db.execute(
+            "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='FIELD_TYPE'"
+        ):
+            cls_sid, _, fname = r["source_id"].rpartition(".")
+            ft = resolve(rewrite_target(r["target_id"], file_lang.get(r["source_file"], "py")))
+            if cls_sid and fname and ft and ft not in field_types[(cls_sid, fname)]:
+                field_types[(cls_sid, fname)].append(ft)
+        return class_bases, return_types, field_types
+
+    def _emit_resolved_call(self, src_file: str, src_id: str, tgt: str, line: int):
+        self.db.execute(
+            "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+            (src_file, src_id, tgt, "CALLS", line),
+        )
+        if is_test_path(src_file):
+            self.db.execute(
+                "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+                (src_file, src_id, tgt, "TESTS", line),
+            )
+
+    def _emit_diagnostic(self, src_file: str, src_id: str, tgt: str, kind: str, line: int):
+        self.db.execute(
+            "INSERT INTO diagnostics VALUES(?,?,?,?,?,?)",
+            (
+                src_file,
+                src_id,
+                tgt,
+                kind,
+                line,
+                "external, dynamic, shadowed, or unobserved reference",
+            ),
+        )
+
+    def _resolve_unresolved_call(
+        self, row, raw_target: str, symbols, return_types, resolve, mro_method
+    ) -> bool:
+        if row["kind"] != "CALLS" or "." not in raw_target or raw_target.startswith("?"):
+            return False
+        prefix, _, mname = raw_target.rpartition(".")
+        owner_sid = resolve(prefix)
+        candidates = (
+            [owner_sid]
+            if owner_sid in symbols and symbols[owner_sid] in ("class", "interface")
+            else return_types.get(owner_sid or "", [])
+        )
+        resolved = [mt for c in candidates if (mt := mro_method(c, mname))]
+        for mt in resolved:
+            self._emit_resolved_call(row["source_file"], row["source_id"], mt, row["line"])
+        return bool(resolved)
+
+    def _resolve_deferred_targets(
+        self, parts: list[str], lg: str, class_bases, return_types, field_types, rewrite_target, resolve, mro_method
+    ) -> list[str]:
+        if parts[0] == "RET" and len(parts) >= 3:
+            fn_sid = resolve(rewrite_target(parts[1], lg))
+            return [mt for rt in return_types.get(fn_sid or "", ()) if (mt := mro_method(rt, parts[2]))]
+        if parts[0] == "FLD" and len(parts) >= 4:
+            cls_sid = resolve(rewrite_target(parts[1], lg))
+            if not cls_sid:
+                return []
+            fname, mname = parts[2], parts[3]
+            out = []
+            for base in compute_c3_mro(cls_sid, class_bases):
+                for ft_sid in field_types.get((base, fname), ()):
+                    for cand_cls in return_types.get(ft_sid, [ft_sid]):
+                        if mt := mro_method(cand_cls, mname):
+                            out.append(mt)
+            return out
+        return []
+
+    def _resolve_cross_file_calls(
+        self, symbols, file_lang, rewrite_target, resolve, unresolved_rows
+    ):
+        class_bases, return_types, field_types = self._load_type_facts(
+            file_lang, rewrite_target, resolve
+        )
+
+        def mro_method(cls_sid: str, mname: str) -> str | None:
+            return next(
+                (f"{b}.{mname}" for b in compute_c3_mro(cls_sid, class_bases) if f"{b}.{mname}" in symbols),
+                None,
+            )
+
+        for row, raw_target in unresolved_rows:
+            if not self._resolve_unresolved_call(
+                row, raw_target, symbols, return_types, resolve, mro_method
+            ):
+                self._emit_diagnostic(
+                    row["source_file"], row["source_id"], plain_target(raw_target), row["kind"], row["line"]
+                )
+
+        for row in self.db.execute(
+            "SELECT * FROM raw_edges WHERE kind='DEFERRED_CALL' ORDER BY source_file,source_id,line"
+        ).fetchall():
+            lg = file_lang.get(row["source_file"], "py")
+            parts = row["target_id"].split("\t")
+            targets = self._resolve_deferred_targets(
+                parts, lg, class_bases, return_types, field_types, rewrite_target, resolve, mro_method
+            )
+            for mt in targets:
+                self._emit_resolved_call(row["source_file"], row["source_id"], mt, row["line"])
+            if not targets and len(parts) >= 4 and parts[-1].startswith("?"):
+                self._emit_diagnostic(row["source_file"], row["source_id"], parts[-1], "CALLS", row["line"])
+
+        self._fanout_subtype_calls(symbols, class_bases, mro_method)
+
+    def _read_protocol_and_abc_contracts(self, symbols):
+        method_arities = {
+            r["source_id"]: (int(p[0]), int(p[1]) if p[1] else None)
+            for r in self.db.execute("SELECT source_id,target_id FROM raw_edges WHERE kind='METHOD_ARITY'")
+            if len(p := r["target_id"].split("\t")) == 2
+        }
+        protocol_reqs: dict[str, dict[str, tuple[int, int | None]]] = defaultdict(dict)
+        for r in self.db.execute("SELECT source_id,target_id FROM raw_edges WHERE kind='PROTOCOL_METHOD'"):
+            p = r["target_id"].split("\t")
+            protocol_reqs[r["source_id"]][p[0]] = (
+                (int(p[1]), int(p[2]) if p[2] else None) if len(p) == 3 else (0, None)
+            )
+        abc_sids = {
+            r["source_id"] for r in self.db.execute("SELECT source_id FROM raw_edges WHERE kind='ABC_METHOD'")
+        } | {sid for sid, k in symbols.items() if k == "interface"}
+        return method_arities, protocol_reqs, abc_sids
+
+    def _load_subtype_impls(self, symbols, class_bases) -> dict[str, list[str]]:
+        method_arities, protocol_reqs, abc_sids = self._read_protocol_and_abc_contracts(symbols)
+        if not abc_sids and not protocol_reqs:
+            return {}
+        sym_lang = {
+            r["symbol_id"]: _lang_group(r["file_path"])
+            for r in self.db.execute("SELECT symbol_id,file_path FROM symbols WHERE kind IN ('class','interface')")
+        }
+        concrete = sorted(
+            sid for sid, k in symbols.items() if k == "class" and sid not in abc_sids and sid not in protocol_reqs
+        )
+        mro_cache = {csid: set(compute_c3_mro(csid, class_bases)) for csid in concrete}
+        impls_of = {
+            isid: [c for c in concrete if sym_lang.get(c) == sym_lang.get(isid, "py") and isid in mro_cache[c]]
+            for isid in abc_sids
+        }
+        for psid, reqs in protocol_reqs.items():
+            lg = sym_lang.get(psid, "py")
+            impls_of[psid] = [
+                c
+                for c in concrete
+                if sym_lang.get(c) == lg
+                and (psid in mro_cache[c] or _satisfies_protocol(c, reqs, method_arities))
+            ]
+        return impls_of
+
+    def _fanout_subtype_calls(self, symbols, class_bases, mro_method):
+        impls_of = self._load_subtype_impls(symbols, class_bases)
+        if not impls_of:
+            return
+        for row in self.db.execute(
+            "SELECT source_file,source_id,target_id,line FROM edges WHERE kind='CALLS'"
+        ).fetchall():
+            cls_part, _, mname = row["target_id"].rpartition(".")
+            resolved = [
+                mt
+                for csid in impls_of.get(cls_part, ())
+                if (mt := mro_method(csid, mname)) is not None and mt != row["target_id"]
+            ]
+            if 1 <= len(resolved) <= 4:
+                for mt in resolved:
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+                        (row["source_file"], row["source_id"], mt, "CALLS", row["line"]),
+                    )
+
     def rows(self, sql, args=()):
         return [dict(row) for row in self.db.execute(sql, args)]
 
-    def upstream(self, symbol_id):
-        """Reverse static reachability, excluding module-level DEFINES and self-module entrypoint hub climbing."""
-        return [
-            row["node"]
-            for row in self.db.execute(
-                """
+    def _upstream_with_imports(self, symbol_id: str, import_cond: str) -> list[str]:
+        sql = f"""
             WITH RECURSIVE upstream(node) AS (
                 SELECT ?
                 UNION SELECT e.source_id FROM edges e JOIN upstream u ON e.target_id=u.node
-                    WHERE e.kind IN ('IMPORTS','TESTS')
+                    WHERE e.kind='TESTS'
+                       OR (e.kind='IMPORTS' AND {import_cond})
                        OR (e.kind='CALLS' AND NOT (e.source_id LIKE '%:' AND u.node LIKE e.source_id || '%'))
                        OR (e.kind='DEFINES' AND e.source_id NOT LIKE '%:')
             ) SELECT node FROM upstream ORDER BY node
-        """,
-                (symbol_id,),
-            )
-        ]
+        """
+        return [row["node"] for row in self.db.execute(sql, (symbol_id,))]
+
+    def upstream(self, symbol_id):
+        """Reverse static reachability, excluding module-level DEFINES and self-module entrypoint hub climbing."""
+        return self._upstream_with_imports(symbol_id, "1=1")
+
+    def test_upstream(self, symbol_id):
+        """Reverse call/test reachability for test coverage, excluding import-only edges to non-module symbols."""
+        return self._upstream_with_imports(symbol_id, "u.node LIKE '%:'")

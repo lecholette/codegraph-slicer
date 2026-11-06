@@ -10,7 +10,16 @@ class UnknownSeedError(CodeGraphError):
     pass
 
 
-def rank(store, seeds=(), alpha=0.85, iterations=40, *, seed_paths=(), seed_modules=()):
+def rank(
+    store,
+    seeds=(),
+    alpha=0.85,
+    iterations=40,
+    *,
+    seed_paths=(),
+    seed_modules=(),
+    seed_symbols=(),
+):
     nodes = sorted(
         row["symbol_id"] for row in store.rows("SELECT symbol_id FROM symbols")
     )
@@ -20,9 +29,10 @@ def rank(store, seeds=(), alpha=0.85, iterations=40, *, seed_paths=(), seed_modu
         if edge["source_id"] in graph and edge["target_id"] in graph:
             graph[edge["source_id"]].add(edge["target_id"])
     seed_nodes = set()
-    for seed in (*seeds, *seed_paths, *seed_modules):
+    for seed in (*seeds, *seed_paths, *seed_modules, *seed_symbols):
         found = store.rows(
-            "SELECT symbol_id FROM symbols WHERE module=? OR file_path=?", (seed, seed)
+            "SELECT symbol_id FROM symbols WHERE module=? OR file_path=? OR symbol_id=?",
+            (seed, seed, seed),
         )
         if not found:
             raise UnknownSeedError(seed)

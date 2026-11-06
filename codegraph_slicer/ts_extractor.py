@@ -381,13 +381,15 @@ def _base_ts_type_name(data: bytes, node) -> str | None:
         ident = child_of_type(node, "type_identifier", "nested_type_identifier", "identifier")
         if ident is not None:
             name = node_text(data, ident)
-            if name in {"Promise", "Array", "ReadonlyArray", "Partial", "Required", "Readonly"}:
+            if name in {"Promise", "Partial", "Required", "Readonly", "NonNullable", "Awaited"}:
                 targs = child_of_type(node, "type_arguments")
                 if targs is not None:
                     for arg in targs.children:
                         if arg.type not in {"<", ">", ","}:
                             return _base_ts_type_name(data, arg)
             return name
+    if node.type == "array_type":
+        return "Array"
     if node.type in {"type_identifier", "nested_type_identifier", "identifier"}:
         return node_text(data, node)
     return None
@@ -425,6 +427,7 @@ def extract_typescript_file(
     edges: list[Edge] = []
     block_nodes: list = []
     bindings: dict[str, str] = {}
+    func_return_types: dict[str, str] = {}
     deferred_local_exports: list[tuple[str, str]] = []
 
     def add_or_merge_symbol(sym: Symbol, prefer_new_sig: bool = True):
@@ -450,7 +453,7 @@ def extract_typescript_file(
 
     def emit(owner_sid: str, target: str, kind: str, line: int):
         edges.append(Edge(owner_sid, target, kind, line))
-        if file_is_test and kind in {"CALLS", "IMPORTS"}:
+        if file_is_test and kind == "CALLS":
             edges.append(Edge(owner_sid, target, "TESTS", line))
 
     def resolve_ref(name: str, local_types: dict[str, str] | None = None) -> str:
@@ -593,6 +596,10 @@ def extract_typescript_file(
                 bindings[name] = sid
                 if is_default_export:
                     bindings["default"] = sid
+                if node.type in {"function_declaration", "function_signature"}:
+                    rt = _base_ts_type_name(data, child_of_type(node, "type_annotation"))
+                    if rt and rt not in _TS_BUILTINS:
+                        func_return_types[name] = rt
             elif is_default_export:
                 bindings["default"] = f"{module}:default"
         elif node.type in {"arrow_function", "function_expression"} and is_default_export:
@@ -608,6 +615,9 @@ def extract_typescript_file(
                         bindings[name] = sid
                         if is_default_export:
                             bindings["default"] = sid
+                        rt = _base_ts_type_name(data, child_of_type(val, "type_annotation"))
+                        if rt and rt not in _TS_BUILTINS:
+                            func_return_types[name] = rt
         elif node.type == "identifier" and is_default_export:
             name = node_text(data, node)
             deferred_local_exports.append((name, "default"))
@@ -668,6 +678,18 @@ def extract_typescript_file(
                         )
                         if ctor is not None:
                             base_t = node_text(data, ctor)
+                    if base_t is None:
+                        call_expr = child_of_type(decl, "call_expression")
+                        if call_expr is None:
+                            aw = child_of_type(decl, "await_expression")
+                            if aw is not None:
+                                call_expr = child_of_type(aw, "call_expression")
+                        if call_expr is not None:
+                            cident = child_of_type(call_expr, "identifier")
+                            if cident is not None:
+                                cname = node_text(data, cident)
+                                if cname in func_return_types:
+                                    base_t = func_return_types[cname]
                     if vident is not None:
                         local_types[node_text(data, vident)] = base_t or "?"
             elif desc.type == "new_expression":
@@ -774,6 +796,10 @@ def extract_typescript_file(
                     if ltype and ltype != "?" and ltype not in _TS_BUILTINS:
                         emit(owner_sid, f"{resolve_ref(ltype)}.{mname}", "CALLS", line)
                         return
+                    if ltype in {"?", "any", "unknown", "object", "Object"}:
+                        if mname not in {"toString", "valueOf"}:
+                            emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
+                        return
                     if mname not in _TS_BUILTIN_PROTOTYPE_METHODS and ltype not in _TS_BUILTINS:
                         emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
                     return
@@ -843,6 +869,8 @@ def extract_typescript_file(
                 1,
             )
         )
+        if node.type in {"interface_declaration", "abstract_class_declaration"}:
+            edges.append(Edge(sid, "*", "ABC_METHOD", 0))
         tparams = _type_params_set(node)
         superclass_target: str | None = None
 

@@ -694,24 +694,45 @@ def _recover_chained_callers(store, row, chosen, all_target_in_test, callers, ca
                 caller_lines.setdefault(csid, set()).add(related["call_line"])
 
 
-def _first_docstring_line(body: str):
-    try:
-        parsed = ast.parse(textwrap.dedent(body))
-        doc = ast.get_docstring(parsed.body[0]) if parsed.body else None
-    except (SyntaxError, IndexError):
-        doc = None
-    if doc:
-        return doc.splitlines()[0]
-    lines = body.splitlines()
-    comment_lines = []
-    for line in lines[1:10]:
+def _format_comment_line(s: str) -> str | None:
+    if s.startswith("//"):
+        return f"    {s}"
+    if s.startswith(("/*", "*")) and not s.startswith("*/"):
+        cleaned = s.lstrip("/* ").rstrip("*/ ").strip()
+        if cleaned:
+            return f"    // {cleaned}"
+    return None
+
+
+def _extract_preceding_comments(preceding_lines: list[str]) -> list[str]:
+    idx = len(preceding_lines) - 1
+    while idx >= 0 and not preceding_lines[idx].strip():
+        idx -= 1
+    block: list[str] = []
+    while idx >= 0 and preceding_lines[idx].strip().startswith(("//", "/*", "*", "*/")):
+        s = preceding_lines[idx].strip()
+        block.append(s)
+        idx -= 1
+        if s.startswith("/*"):
+            break
+    return [fmt for s in reversed(block) if (fmt := _format_comment_line(s))]
+
+
+def _first_docstring_line(body: str, preceding_lines: list[str] | None = None):
+    if body:
+        try:
+            parsed = ast.parse(textwrap.dedent(body))
+            doc = ast.get_docstring(parsed.body[0]) if parsed.body else None
+        except (SyntaxError, IndexError):
+            doc = None
+        if doc:
+            return doc.splitlines()[0]
+    comment_lines = _extract_preceding_comments(preceding_lines) if preceding_lines else []
+    for line in body.splitlines()[1:10]:
         s = line.strip()
-        if s.startswith("//"):
-            comment_lines.append(f"    {s}")
-        elif s.startswith(("/*", "*")) and not s.startswith("*/"):
-            cleaned = s.lstrip("/* ").rstrip("*/ ").strip()
-            if cleaned:
-                comment_lines.append(f"    // {cleaned}")
+        fmt = _format_comment_line(s)
+        if fmt:
+            comment_lines.append(fmt)
         elif comment_lines or (s and not s.startswith("*/")):
             break
     return "\n".join(comment_lines) if comment_lines else None
@@ -735,7 +756,15 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
                 (row["file_path"], f"{row['qualname']}.*"),
             )
             methods = [m for m in methods if m["qualname"].rpartition(".")[0] == row["qualname"]]
-        doc_line = _first_docstring_line(row["body"])
+        mod_rows = store.rows(
+            "SELECT body FROM symbols WHERE symbol_id=?", (f"{row['module']}:",)
+        )
+        preceding = (
+            mod_rows[0]["body"].splitlines()[: max(0, row["start_line"] - 1)]
+            if mod_rows
+            else None
+        )
+        doc_line = _first_docstring_line(row["body"], preceding)
         lines = [row["signature"]]
         if doc_line:
             lines.append(doc_line)
@@ -756,6 +785,16 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
+        if row["file_path"].endswith((".java", ".ts", ".tsx")):
+            first_m_offset = (
+                (methods[0]["start_line"] - row["start_line"])
+                if methods
+                else len(row["body"].splitlines())
+            )
+            for fline in row["body"].splitlines()[1:max(1, first_m_offset)]:
+                sf = fline.strip()
+                if sf.endswith(";") and "(" not in sf and not sf.startswith(("//", "/*", "*")):
+                    compact_lines.append(f"    {sf}")
         if row["file_path"].endswith(".java"):
             nested_classes = store.rows(
                 """SELECT * FROM symbols WHERE file_path=? AND kind='class'
@@ -961,8 +1000,25 @@ def slice_context(
             and f"{row['module']}:{row['qualname'].rpartition('.')[0]}" in (set(chosen) | set(types))
         )
     }
+    def _type_item_with_doc(row):
+        entry = item(row, True)
+        if row["file_path"].endswith((".java", ".ts", ".tsx")):
+            mod_rows = store.rows(
+                "SELECT body FROM symbols WHERE symbol_id=?", (f"{row['module']}:",)
+            )
+            preceding = (
+                mod_rows[0]["body"].splitlines()[: max(0, row["start_line"] - 1)]
+                if mod_rows
+                else None
+            )
+            doc_line = _first_docstring_line("", preceding)
+            if doc_line and doc_line.strip() not in entry["text"]:
+                header, sep, rest = entry["text"].partition("\n")
+                entry["text"] = f"{header}{sep}{doc_line}\n{rest}"
+        return entry
+
     sections["types_and_schemas"] = [
-        item(row, True) for _, row in sorted(types.items())
+        _type_item_with_doc(row) for _, row in sorted(types.items())
     ]
     class_types = [(sid, row) for sid, row in sorted(types.items()) if row["kind"] == "class"]
     summaries, compact_summaries, auto_summarize_ids = _build_type_summaries(
@@ -1012,7 +1068,7 @@ def slice_context(
 
     from .pagerank import rank
 
-    scores = rank(store)
+    scores = rank(store, seed_symbols=tuple(chosen))
     for sid in auto_summarize_ids:
         sections["types_and_schemas"] = [
             compact_summaries[sid] if entry["symbol"] == sid else entry
@@ -1026,10 +1082,6 @@ def slice_context(
             and cand_row["file_path"].endswith((".java", ".ts", ".tsx"))
             and cand_row["kind"] in {"method", "function", "async_function", "class"}
             and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 20
-            and any(
-                c["file_path"] == cand_row["file_path"]
-                for c in chosen.values()
-            )
         ):
             return True
         return False

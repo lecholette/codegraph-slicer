@@ -164,7 +164,13 @@ def compute_delta(
     for sid in sorted(modified):
         upstream = set(head_store.upstream(sid)) | set(base_store.upstream(sid))
         reachable_tests = upstream & tests
-        evidence = reachable_tests & (updated_tests | selected)
+        if sid.endswith(":"):
+            evidence = reachable_tests & (updated_tests | selected)
+        else:
+            call_upstream = set(head_store.test_upstream(sid)) | set(base_store.test_upstream(sid))
+            call_tests = call_upstream & tests
+            call_test_mods = {mod + sep for mod, sep, _ in (t.partition(":") for t in call_tests)}
+            evidence = (call_tests | (reachable_tests & call_test_mods)) & (updated_tests | selected)
         current = head.get(sid, base.get(sid))
         if current is None:
             continue

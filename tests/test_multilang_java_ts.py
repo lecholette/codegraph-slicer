@@ -142,10 +142,10 @@ public class OrderServiceTest {
             "com.acme.repo.OrderRepository:OrderRepository.save",
             "com.acme.model.Order:Order.isValid",
         ) in calls
-        # Method overload link: OrderRepository.find -> OrderRepository.find#2
+        # Method overloads indexed as distinct symbols without synthetic self-call
         assert (
-            "com.acme.repo.OrderRepository:OrderRepository.find",
             "com.acme.repo.OrderRepository:OrderRepository.find#2",
+            "com.acme.model.Order:Order",
         ) in calls
 
         # INHERITS and USES_TYPE on generic interface Repository<Order>

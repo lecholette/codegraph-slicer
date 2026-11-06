@@ -291,7 +291,7 @@ def extract_java_file(
 
     def emit(owner_sid: str, target: str, kind: str, line: int, in_test: bool = False):
         edges.append(Edge(owner_sid, target, kind, line))
-        if (file_is_test or in_test) and kind in {"CALLS", "IMPORTS"}:
+        if (file_is_test or in_test) and kind == "CALLS":
             edges.append(Edge(owner_sid, target, "TESTS", line))
 
     def emit_type_uses(owner_sid: str, node, enclosing_types: list[str], in_test: bool = False):
@@ -327,6 +327,8 @@ def extract_java_file(
         )
         if scope:
             edges.append(Edge(f"{module}.{qualname}", sid, "ALIAS", 0))
+        if node.type == "interface_declaration":
+            edges.append(Edge(sid, "*", "ABC_METHOD", 0))
 
         superclass_target: str | None = None
         super_node = child_of_type(node, "superclass")
@@ -387,11 +389,28 @@ def extract_java_file(
                 member_nodes.append(member)
 
         own_methods: set[str] = set()
+        overload_arities: dict[str, dict[int, str]] = {}
+        pre_counts: dict[str, int] = {}
         for member in member_nodes:
             if member.type == "method_declaration":
                 m_ident = child_of_type(member, "identifier")
                 if m_ident is not None:
-                    own_methods.add(node_text(data, m_ident))
+                    m_name = node_text(data, m_ident)
+                    own_methods.add(m_name)
+                    cnt = pre_counts.get(m_name, 0) + 1
+                    pre_counts[m_name] = cnt
+                    m_sid = f"{sid}.{m_name}" if cnt == 1 else f"{sid}.{m_name}#{cnt}"
+                    m_params = child_of_type(member, "formal_parameters")
+                    arity = (
+                        sum(
+                            1
+                            for c in m_params.children
+                            if c.type in {"formal_parameter", "spread_parameter"}
+                        )
+                        if m_params is not None
+                        else 0
+                    )
+                    overload_arities.setdefault(m_name, {}).setdefault(arity, m_sid)
             elif member.type == "field_declaration":
                 ftype_node = child_of_type(
                     member,
@@ -419,6 +438,7 @@ def extract_java_file(
                     qual_parts,
                     field_types,
                     own_methods,
+                    overload_arities,
                     superclass_target,
                     method_counts,
                 )
@@ -430,6 +450,7 @@ def extract_java_file(
                     qual_parts,
                     field_types,
                     own_methods,
+                    overload_arities,
                     {},
                     superclass_target,
                     False,
@@ -442,6 +463,7 @@ def extract_java_file(
         enclosing_types: list[str],
         field_types: dict[str, str],
         own_methods: set[str],
+        overload_arities: dict[str, dict[int, str]],
         local_types: dict[str, str],
         superclass_target: str | None,
         in_test: bool,
@@ -491,6 +513,7 @@ def extract_java_file(
                     enclosing_types,
                     field_types,
                     own_methods,
+                    overload_arities,
                     local_types,
                     superclass_target,
                     in_test,
@@ -502,6 +525,7 @@ def extract_java_file(
         enclosing_types: list[str],
         field_types: dict[str, str],
         own_methods: set[str],
+        overload_arities: dict[str, dict[int, str]],
         superclass_target: str | None,
         method_counts: dict[str, int],
     ):
@@ -520,8 +544,6 @@ def extract_java_file(
 
         s_line = start_line(node)
         e_line = end_line(node)
-        if count > 1:
-            edges.append(Edge(primary_sid, sid, "CALLS", s_line))
 
         sig = signature_before_body(data, node, body_block)
         cx = (
@@ -582,6 +604,7 @@ def extract_java_file(
             enclosing_types,
             field_types,
             own_methods,
+            overload_arities,
             local_types,
             superclass_target,
             in_test,
@@ -594,11 +617,18 @@ def extract_java_file(
         enclosing_types: list[str],
         field_types: dict[str, str],
         own_methods: set[str],
+        overload_arities: dict[str, dict[int, str]],
         local_types: dict[str, str],
         superclass_target: str | None,
         in_test: bool,
     ):
         line = start_line(call_node)
+        arg_list = child_of_type(call_node, "argument_list")
+        arg_count = (
+            sum(1 for c in arg_list.children if c.type not in {"(", ")", ","})
+            if arg_list is not None
+            else 0
+        )
         non_arg_children = [
             c
             for c in call_node.children
@@ -610,12 +640,13 @@ def extract_java_file(
         if callee_ident.type != "identifier":
             return
         mname = node_text(data, callee_ident)
+        own_target = overload_arities.get(mname, {}).get(arg_count, f"{class_sid}.{mname}")
 
         if len(non_arg_children) == 1:
             if mname in imports:
                 emit(sid, imports[mname], "CALLS", line, in_test)
             elif mname in own_methods:
-                emit(sid, f"{class_sid}.{mname}", "CALLS", line, in_test)
+                emit(sid, own_target, "CALLS", line, in_test)
             elif superclass_target:
                 emit(sid, f"{superclass_target}.{mname}", "CALLS", line, in_test)
             else:
@@ -624,7 +655,7 @@ def extract_java_file(
 
         receiver = non_arg_children[0]
         if receiver.type == "this":
-            emit(sid, f"{class_sid}.{mname}", "CALLS", line, in_test)
+            emit(sid, own_target, "CALLS", line, in_test)
             return
         if receiver.type == "super":
             if superclass_target:
