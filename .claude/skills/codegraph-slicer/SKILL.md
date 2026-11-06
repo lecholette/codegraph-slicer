@@ -1,27 +1,23 @@
 ---
 name: codegraph-slicer
 description: >-
-  Static Python, Java, and TypeScript code graph: map, slice, flow, delta. Use for structural questions
-  about Python (.py), Java (.java), or TypeScript (.ts, .tsx) code: who calls X, where a value comes from,
-  what a change touches, import cycles, forbidden imports, blast radius, or base-vs-head graph changes.
-  Not for runtime behaviour or running tests.
+  Static Python, Java, TypeScript, and JavaScript code graph: map, slice, flow, delta. Use for structural questions
+  about Python (.py), Java (.java), TypeScript (.ts, .tsx), or JavaScript (.js, .jsx, .mjs, .cjs) code: who calls X,
+  where a value comes from, what a change touches, import cycles, forbidden imports, blast radius, or base-vs-head
+  graph changes. Not for runtime behaviour or running tests.
 ---
 
 # codegraph-slicer
 
 Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecholette/codegraph-slicer`) and Python 3.12+.
-Indexes Python (`.py`), Java (`.java`), and TypeScript (`.ts`, `.tsx`) source trees.
+Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
 ## Routing Threshold (Target File Size & Cross-Package Coupling Density)
 
 - **Start with `codegraph-slicer slice` or `impact`** when the target symbols live inside large files (**`>= 300` lines** or `>= 15` definitions) or when callers, callees, and interface implementations are unknown and dispersed across multiple packages. Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading large source files.
-- **Skip `slice` and use direct `Read` (or `impact` for caller discovery)** when the target files are already known and compact (**`< 300` lines each**), for single-file edits, or for small repositories (`< 25` relevant source files). On compact Java/TypeScript one-class-per-file modules (`< 300` lines) that you will immediately edit, reading the target file directly avoids paying the double token tax of loading both the XML slice and the full file into context.
+- **Skip `slice` and use direct `Read` (or `impact` for caller discovery)** when the target files are already known and compact (**`< 300` lines each**), for single-file edits, or for small repositories (`< 25` relevant source files). On compact Java/TypeScript/JavaScript one-class-per-file modules (`< 300` lines) that you will immediately edit, reading the target file directly avoids paying the double token tax of loading both the XML slice and the full file into context.
 - **Incremental head sync (`delta`):** When running `delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite`, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
-- **State Coupling, Derived `@property` State & Route Dispatch (`v0.3.1`):**
-  - When a specification changes default lifecycle state (e.g., *active-on-create* $\to$ *draft-only + merge required*), slice the state-mutating method to inspect the enclosing class's `self.<attr>` fields, `@property` methods, and state-coupled sibling methods in `<types_and_schemas>`, and update all readers and writers of that state together (including promoting drafts to active on `:merge` and updating prior test setup helpers).
-  - Model non-terminal state (such as quorum `open` / `approved` / `rejected` with veto clearance and vote replacement) as a pure `@property` or function over stored facts keyed by uniqueness invariant (`reviews_by_actor: dict[actor, review]`) rather than mutating a stored status string on each event.
-  - For HTTP/URI route dispatchers with custom `:action` suffixes (e.g., `/v1/configs/{name}/proposals:list` vs `/v1/configs/{name}/{version}:propose`), split `/` path segments first and parse `:action` only on the terminal segment (`segments[-1].partition(":")`) before dispatching.
 
 ## Index first
 
@@ -40,7 +36,7 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 ## Commands
 
 - **Do not browse or read entire large module files** when sliced anchors are known on repos with `>= 25` source files. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
-- **Skip codegraph** for small repos (`< 25` files), single-file edits, or languages outside Python/Java/TypeScript. Reading the file directly is cheaper.
+- **Skip codegraph** for small repos (`< 25` files), single-file edits, or languages outside Python/Java/TypeScript/JavaScript. Reading the file directly is cheaper.
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
 - One function/method with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
 - Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call deduplicates enclosing classes, shared types, and callers across anchors.
@@ -60,7 +56,7 @@ Errors go to stderr with exit 2. An empty result is exit 0.
   Default `delta` JSON bounds each summary list to at most 5 items (`omitted` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
   Add `--forbid-import SRC_PREFIX TGT_PREFIX` for layer rules.
 
-Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`, `path/File.java:Class.method`, `path/file.ts:Class.method`, or `path/file:LINE`.
+Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`, `path/File.java:Class.method`, `path/file.ts:Class.method`, `path/file.js:Class.method`, or `path/file:LINE`.
 `flow` takes only Python (`.py`) function or method anchors.
 
 ## Limits (state them when you cite output)
