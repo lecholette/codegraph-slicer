@@ -643,6 +643,7 @@ class GraphStore:
         file_rows = self.db.execute("SELECT path,module FROM files").fetchall()
         modules = {row["module"] for row in file_rows}
         file_lang = {row["path"]: _lang_group(row["path"]) for row in file_rows}
+        ts_modules = {row["module"] for row in file_rows if file_lang.get(row["path"]) == "ts"}
         lang_mod_map: dict[tuple[str, str], str] = {}
         for row in file_rows:
             raw_mod = _raw_stem_module(row["path"], source_root)
@@ -682,6 +683,13 @@ class GraphStore:
             )
         }
         wildcard_exports = defaultdict(list)
+        module_exports: dict[str, set[str]] = {}
+        for row in self.db.execute(
+            "SELECT source_id,target_id FROM raw_edges WHERE kind='MODULE_EXPORTS'"
+        ):
+            module_exports[row["source_id"]] = (
+                set(row["target_id"].split(",")) if row["target_id"] else set()
+            )
         for row in self.db.execute(
             "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='WILDCARD_EXPORT'"
         ):
@@ -702,6 +710,8 @@ class GraphStore:
                                 exported = key[len(prefix) :]
                                 if "." not in exported and f"{src_mod}.{exported}" not in aliases:
                                     aliases[f"{src_mod}.{exported}"] = val
+                                    if src_mod in module_exports:
+                                        module_exports[src_mod].add(exported)
                                     changed_wc = True
         wildcard_imports = defaultdict(list)
         for row in self.db.execute(
@@ -739,7 +749,11 @@ class GraphStore:
             parts = target.split(".")
             # An import's module path names a module, never a package attribute.
             for index in range(len(parts) - 1, max(module_parts, 1) - 1, -1):
-                candidate = ".".join(parts[:index]) + ":" + ".".join(parts[index:])
+                mod_name = ".".join(parts[:index])
+                qual = ".".join(parts[index:])
+                if mod_name in module_exports and qual.split(".", 1)[0] not in module_exports[mod_name]:
+                    continue
+                candidate = f"{mod_name}:{qual}"
                 if candidate in symbols:
                     return candidate
             return None
@@ -768,19 +782,18 @@ class GraphStore:
                     found = direct(target, module_parts)
                     if found is not None:
                         return found
-                    if module_parts >= 1 and len(parts) > module_parts:
-                        def_key = ".".join([*parts[:module_parts], "default"])
-                        def_bound = aliases.get(def_key)
-                        if def_bound and def_key not in applied:
-                            applied.add(def_key)
-                            target = ".".join([def_bound, *parts[module_parts:]])
-                            continue
+                    if module_parts >= 1 and len(parts) > module_parts and parts[module_parts].startswith("__cjs__"):
+                        mod_prefix = ".".join(parts[:module_parts])
+                        rest = [parts[module_parts][len("__cjs__") :], *parts[module_parts + 1 :]]
+                        target = ".".join([mod_prefix, *rest])
+                        continue
                     return None
 
         _META_KINDS = (
             "ALIAS",
             "WILDCARD_EXPORT",
             "WILDCARD_IMPORT",
+            "MODULE_EXPORTS",
             "RETURN_TYPE",
             "FIELD_TYPE",
             "PROTOCOL_METHOD",
@@ -932,7 +945,11 @@ class GraphStore:
                 row, raw_target, symbols, return_types, resolve, mro_method
             ):
                 self._emit_diagnostic(
-                    row["source_file"], row["source_id"], plain_target(raw_target), row["kind"], row["line"]
+                    row["source_file"],
+                    row["source_id"],
+                    plain_target(raw_target).replace(".__cjs__", "."),
+                    row["kind"],
+                    row["line"],
                 )
 
         for row in self.db.execute(

@@ -570,7 +570,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     mapping.add_argument("--db", required=True, help="existing indexed SQLite database")
-    mapping.add_argument("--snapshot", nargs="?", const=True, default=False, help="explicitly query cached historical bytes without checking source freshness")
+    mapping.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     mapping.add_argument("--seed", action="append", default=[], help="module or source path to rank from; repeatable (default: whole repository)")
     mapping.add_argument("--max-tokens", type=int, default=2000, help="estimated context budget (default: 2000)")
     mapping.add_argument("--outline", action="store_true", help="emit versioned per-entity JSON outline")

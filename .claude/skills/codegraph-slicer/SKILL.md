@@ -15,8 +15,8 @@ Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`
 
 ## Routing Precedence (When to Slice vs. Read Directly)
 
-1. **Use `codegraph-slicer` (`map`, `slice`, or `impact`)** whenever target symbols live inside large files (**`>= 300` lines** or `>= 15` definitions) **or** when callers, callees, and interface implementations are unknown across multiple modules/packages. Pass target `path/file.ext:Class.method` anchors in a single batched `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading large source files.
-2. **Use direct `Read` (skipping `slice`)** only when the target files are already known **and** every target file is compact (**`< 300` lines each**), or for tiny repositories (`< 500` total LOC). On compact one-class-per-file modules (`< 300` lines) that you will immediately edit, reading the file directly avoids loading both the XML slice and the full file into context.
+1. **Use direct `Read` (skipping `codegraph-slicer`)** when the repository is tiny (`< 500` total LOC), when the language is outside Python/Java/TypeScript/JavaScript, or when all target files are already known **and** every target file is compact (**`< 300` lines and `< 15` definitions each**). On compact one-class-per-file modules (`< 300` lines and `< 15` definitions) that you will immediately edit, reading the file directly avoids loading both the XML slice and the full file into context.
+2. **Otherwise (repositories `>= 500` total LOC in Python/Java/TypeScript/JavaScript), use `codegraph-slicer` (`map`, `slice`, or `impact`)** whenever target symbols live inside large files (**`>= 300` lines** or **`>= 15` definitions**) **or** when callers, callees, and interface implementations are unknown across multiple modules/packages. Pass target `path/file.ext:Class.method` anchors in a single batched `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading large source files.
 3. **Incremental head sync (`delta`):** When running `delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite`, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
 
 ## Contract & Verification Discipline
@@ -41,8 +41,8 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 
 ## Commands
 
-- **Do not browse or read entire large module files (`>= 300` lines)** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
-- **Skip codegraph** when all target files are already known and `< 300` lines each, for single-file edits, or for languages outside Python/Java/TypeScript/JavaScript.
+- **In repositories `>= 500` total LOC, do not browse or read entire large module files (`>= 300` lines or `>= 15` definitions)** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
+- **Skip codegraph** when all target files are already known and `< 300` lines and `< 15` definitions each, for tiny repositories (`< 500` total LOC), or for languages outside Python/Java/TypeScript/JavaScript.
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
 - One function/method with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
 - Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call deduplicates enclosing classes, shared types, and callers across anchors.

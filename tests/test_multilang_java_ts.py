@@ -1218,9 +1218,3 @@ export class GnuTarPackHelper {
         )
         type_symbols = {e["symbol"] for e in sliced_js["sections"]["types_and_schemas"]}
         assert "archive.tar_helper:ExistingPackSnapshot" in type_symbols
-
-
-
-
-
-

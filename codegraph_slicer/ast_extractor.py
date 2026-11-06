@@ -9,6 +9,8 @@ import tokenize
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+EXTRACTOR_VERSION = "0.3.3"
+
 _PY_BUILTINS = frozenset(dir(builtins)) - {
     "__import__",
     "eval",
@@ -450,7 +452,11 @@ def extract_file(
             for index in range(len(frames) - 1, -1, -1):
                 frame, frame_kind = frames[index], frame_kinds[index]
                 if node.id in frame_globals[index]:
-                    return frames[0].get(node.id, "?" + node.id)
+                    if node.id in frames[0]:
+                        return frames[0][node.id]
+                    if node.id in _PY_BUILTINS:
+                        return "__builtin__:" + node.id
+                    return "?" + node.id
                 if node.id in frame_nonlocals[index]:
                     for outer in range(index - 1, 0, -1):
                         if frame_kinds[outer] in {"function", "method"} and node.id in frames[outer]:
@@ -460,13 +466,15 @@ def extract_file(
                     continue
                 if node.id in frame:
                     return frame[node.id]
+            if node.id in _PY_BUILTINS:
+                return "__builtin__:" + node.id
             return "?" + node.id
         if isinstance(node, ast.Attribute):
             return reference(node.value) + "." + node.attr
         return "?" + ast.unparse(node)
 
     def emit(target: str, kind: str, line: int):
-        if target.startswith("?") and target[1:] in _PY_BUILTINS:
+        if target.startswith("__builtin__:"):
             return
         edges.append(Edge(owner(), target, kind, line))
         if is_test and kind == "CALLS":

@@ -410,33 +410,55 @@ def _all_ts_type_identifiers(data: bytes, node) -> list[tuple[str, int]]:
     return found
 
 
+def _extract_require_call_spec(data: bytes, node) -> str | None:
+    if node is None or node.type != "call_expression":
+        return None
+    callee = child_of_type(node, "identifier")
+    args = child_of_type(node, "arguments")
+    if callee is None or args is None or node_text(data, callee) != "require":
+        return None
+    return _string_literal_value(data, args) or None
+
+
 def _extract_require_spec(data: bytes, node) -> tuple[str, str | None] | None:
     if node is None:
         return None
-    if node.type == "call_expression":
-        callee = child_of_type(node, "identifier")
-        args = child_of_type(node, "arguments")
-        if (
-            callee is not None
-            and node_text(data, callee) == "require"
-            and args is not None
-        ):
-            spec = _string_literal_value(data, args)
-            if spec:
-                return (spec, None)
-        return None
+    spec = _extract_require_call_spec(data, node)
+    if spec is not None:
+        return (spec, None)
     if node.type == "member_expression":
-        obj = node.children[0] if node.children else None
         prop = child_of_type(node, "property_identifier")
-        if obj is not None and prop is not None:
-            inner = _extract_require_spec(data, obj)
-            if inner is not None and inner[1] is None:
-                return (inner[0], node_text(data, prop))
+        inner_spec = _extract_require_call_spec(data, node.children[0])
+        if inner_spec is not None:
+            return (inner_spec, node_text(data, prop))
+    return None
+
+
+def _collect_pattern_identifiers(data: bytes, pat) -> list[str]:
+    if pat is None:
+        return []
+    if pat.type in {"identifier", "shorthand_property_identifier_pattern", "shorthand_property_identifier"}:
+        return [node_text(data, pat)]
+    if pat.type in {"assignment_pattern", "object_assignment_pattern", "variable_declarator"}:
+        return _collect_pattern_identifiers(data, pat.children[0])
+    if pat.type == "pair_pattern":
+        return _collect_pattern_identifiers(data, pat.children[-1])
+    if pat.type in {"object_pattern", "array_pattern", "rest_pattern", "required_parameter", "optional_parameter"}:
+        return [name for c in pat.children for name in _collect_pattern_identifiers(data, c)]
+    return []
+
+
+def _extract_pair_pattern(data: bytes, child) -> tuple[str, str] | None:
+    key = child_of_type(child, "property_identifier", "identifier")
+    asgn = child_of_type(child, "assignment_pattern")
+    val_ident = child_of_type(asgn or child, "identifier")
+    if key is not None and val_ident is not None:
+        return (node_text(data, key), node_text(data, val_ident))
     return None
 
 
 def _extract_object_pattern_pairs(data: bytes, pat_node) -> list[tuple[str, str]]:
-    if pat_node is None or pat_node.type != "object_pattern":
+    if pat_node is None:
         return []
     pairs: list[tuple[str, str]] = []
     for child in pat_node.children:
@@ -444,73 +466,65 @@ def _extract_object_pattern_pairs(data: bytes, pat_node) -> list[tuple[str, str]
             name = node_text(data, child)
             pairs.append((name, name))
         elif child.type == "object_assignment_pattern":
-            ident = child_of_type(
-                child, "shorthand_property_identifier_pattern", "identifier"
-            )
-            if ident is not None:
-                name = node_text(data, ident)
-                pairs.append((name, name))
+            ident = child_of_type(child, "shorthand_property_identifier_pattern", "identifier")
+            name = node_text(data, ident)
+            pairs.append((name, name))
         elif child.type == "pair_pattern":
-            key = child_of_type(child, "property_identifier", "identifier")
-            val_ident = child_of_type(child, "identifier")
-            if val_ident is None:
-                asgn = child_of_type(child, "assignment_pattern")
-                if asgn is not None:
-                    val_ident = child_of_type(asgn, "identifier")
-            if key is not None and val_ident is not None:
-                pairs.append((node_text(data, key), node_text(data, val_ident)))
+            pair = _extract_pair_pattern(data, child)
+            if pair is not None:
+                pairs.append(pair)
     return pairs
 
 
-def _unwrap_cjs_assignment(data: bytes, node):
-    target = (
-        child_of_type(node, "assignment_expression")
-        if node.type == "expression_statement"
-        else node
-    )
-    if target is None:
-        call = (
-            child_of_type(node, "call_expression")
-            if node.type == "expression_statement"
-            else None
-        )
-        if call is not None:
-            callee = child_of_type(call, "member_expression")
-            args = child_of_type(call, "arguments")
-            if (
-                callee is not None
-                and node_text(data, callee).strip() == "Object.assign"
-                and args is not None
-            ):
-                arg_children = [
-                    c for c in args.children if c.type not in {"(", ")", ","}
-                ]
-                if (
-                    len(arg_children) >= 2
-                    and node_text(data, arg_children[0]).strip()
-                    in {"exports", "module.exports"}
-                ):
-                    return ("assign", None, arg_children[1:])
+def _unwrap_cjs_object_assign(data: bytes, node):
+    call = child_of_type(node, "call_expression")
+    if call is None:
         return None
-    while (
-        target.type == "assignment_expression"
-        and len(target.children) >= 3
-        and target.children[-1].type == "assignment_expression"
+    callee = child_of_type(call, "member_expression")
+    args = child_of_type(call, "arguments")
+    if callee is None or node_text(data, callee).strip() != "Object.assign":
+        return None
+    arg_children = [c for c in args.children if c.type not in {"(", ")", ","}]
+    if len(arg_children) >= 2 and node_text(data, arg_children[0]).strip() in {"exports", "module.exports"}:
+        return ("assign", None, arg_children[1:])
+    return None
+
+
+def _unwrap_prototype_lhs(data: bytes, lhs):
+    lhs_obj = lhs.children[0]
+    if lhs_obj.type != "member_expression":
+        return None
+    lhs_prop = child_of_type(lhs, "property_identifier")
+    proto_prop = child_of_type(lhs_obj, "property_identifier")
+    if proto_prop is None or node_text(data, proto_prop).strip() != "prototype":
+        return None
+    return f"{node_text(data, lhs_obj.children[0]).strip()}.{node_text(data, lhs_prop).strip()}"
+
+
+def _unwrap_chained_exports(data: bytes, target):
+    if (
+        target.children[-1].type == "assignment_expression"
         and node_text(data, target.children[0]).strip() == "exports"
     ):
-        target = target.children[-1]
-    if target.type != "assignment_expression" or len(target.children) < 3:
-        return None
-    lhs = target.children[0]
-    rhs = target.children[-1]
+        return target.children[-1]
+    return target
+
+
+def _unwrap_cjs_assignment(data: bytes, node):
+    target = child_of_type(node, "assignment_expression")
+    if target is None:
+        return _unwrap_cjs_object_assign(data, node)
+    target = _unwrap_chained_exports(data, target)
+    lhs, rhs = target.children[0], target.children[-1]
     if lhs.type != "member_expression":
         return None
-    lhs_obj = lhs.children[0] if lhs.children else None
+    proto_target = _unwrap_prototype_lhs(data, lhs)
+    if proto_target is not None:
+        return ("proto", proto_target, rhs)
     lhs_prop = child_of_type(lhs, "property_identifier")
-    if lhs_obj is None or lhs_prop is None:
+    if lhs_prop is None:
         return None
-    obj_txt = node_text(data, lhs_obj).strip()
-    prop_txt = node_text(data, lhs_prop).strip()
+    obj_txt, prop_txt = node_text(data, lhs.children[0]).strip(), node_text(data, lhs_prop).strip()
     if obj_txt == "module" and prop_txt == "exports":
         return ("default", None, rhs)
     if obj_txt in {"exports", "module.exports"}:
@@ -520,12 +534,10 @@ def _unwrap_cjs_assignment(data: bytes, node):
 
 def _preceding_jsdoc(data: bytes, node, outer_node=None) -> tuple[str, int] | None:
     anchor = outer_node or node
-    if anchor is None:
-        return None
     prev = anchor.prev_sibling
     if prev is not None and prev.type == "comment":
         txt = node_text(data, prev)
-        if txt.startswith("/**") and prev.end_point[0] >= anchor.start_point[0] - 2:
+        if txt.startswith("/**") and start_line(anchor) - end_line(prev) <= 2:
             return (txt, start_line(prev))
     return None
 
@@ -561,6 +573,8 @@ def extract_typescript_file(
     edges: list[Edge] = []
     block_nodes: list = []
     bindings: dict[str, str] = {}
+    exported_names: set[str] = set()
+    has_explicit_exports = False
     func_return_types: dict[str, str] = {}
     deferred_local_exports: list[tuple[str, str]] = []
 
@@ -593,33 +607,33 @@ def extract_typescript_file(
     def resolve_ref(name: str, local_types: dict[str, str] | None = None) -> str:
         if local_types and name in local_types:
             ltype = local_types[name]
-            if ltype and ltype != "?":
+            if ltype and ltype not in {"?", "__unannotated__", "__closure__"}:
                 return resolve_ref(ltype)
             return f"?{name}"
-        if "." in name:
+        if "." in name and not name.startswith("__jsdoc_"):
             head, _, tail = name.partition(".")
             if local_types and head in local_types:
                 ltype = local_types[head]
-                if ltype and ltype != "?":
+                if ltype and ltype not in {"?", "__unannotated__", "__closure__"}:
                     return f"{resolve_ref(ltype)}.{tail}"
                 return f"?{name}"
             if head in bindings:
                 base = bindings[head]
+                if base.endswith(f"{MODULE_END}__cjs__"):
+                    return f"{base}{tail}"
                 if base.endswith(MODULE_END):
                     return f"{base}{tail}"
                 return f"{base}.{tail}"
             return f"?{name}"
         if name in bindings:
             base = bindings[name]
-            if base.endswith(MODULE_END):
-                return f"{base}default"
+            if base.endswith((MODULE_END, f"{MODULE_END}__cjs__")):
+                return f"{base[:-len('__cjs__')] if base.endswith('__cjs__') else base}default"
             return base
         return f"?{name}"
 
     def _clean_jsdoc_type(raw_expr: str, owner_sid: str, line: int) -> str | None:
-        expr = raw_expr.strip().lstrip("?!.")
-        if expr.endswith("="):
-            expr = expr[:-1].strip()
+        expr = raw_expr.strip().rstrip("=").strip().lstrip("?!.")
         parts = [
             p.strip().lstrip("?!")
             for p in expr.split("|")
@@ -627,12 +641,7 @@ def extract_typescript_file(
         ]
         if not parts:
             return None
-        expr = parts[0]
-        while True:
-            m_wrap = _JSDOC_WRAPPER_RE.match(expr)
-            if not m_wrap:
-                break
-            expr = m_wrap.group(1).strip()
+        expr = re.sub(r"^(?:Promise|Readonly|Partial|Required|NonNullable|Awaited)\s*<\s*(.+)\s*>$", r"\1", parts[0]).strip()
         m_imp = _JSDOC_IMPORT_RE.match(expr)
         if m_imp:
             spec, sym_name = m_imp.group(1), m_imp.group(2) or "default"
@@ -640,17 +649,14 @@ def extract_typescript_file(
             target = f"{mod_target}{MODULE_END}{sym_name}"
             emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
             emit(owner_sid, target, "USES_TYPE", line)
-            local_alias = sym_name if sym_name != "default" else f"__jsdoc_{mod_target.replace('.', '_')}"
-            bindings.setdefault(local_alias, target)
+            local_alias = f"__jsdoc_{mod_target}::{sym_name}"
+            bindings[local_alias] = target
             return local_alias
-        m_ident = re.match(r"^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)", expr)
-        if not m_ident:
+        tname = re.split(r"[^A-Za-z0-9_$.]", expr)[0]
+        if not tname:
             return None
-        tname = m_ident.group(1)
-        base = tname.split(".")[0]
-        if tname in _TS_BUILTINS or base in _TS_BUILTINS:
-            return tname
-        emit(owner_sid, resolve_ref(tname), "USES_TYPE", line)
+        if tname.split(".")[0] not in _TS_BUILTINS:
+            emit(owner_sid, resolve_ref(tname), "USES_TYPE", line)
         return tname
 
     def _parse_jsdoc(
@@ -662,19 +668,12 @@ def extract_typescript_file(
         txt, line = jdoc
         param_types: dict[str, str] = {}
         for m in _JSDOC_PARAM_RE.finditer(txt):
-            raw_t = m.group(1)
             pname = m.group(2) or m.group(3)
-            cleaned = _clean_jsdoc_type(raw_t, owner_sid, line)
-            if pname and cleaned:
+            cleaned = _clean_jsdoc_type(m.group(1), owner_sid, line)
+            if cleaned:
                 param_types[pname] = cleaned
-        ret_type: str | None = None
-        m_ret = _JSDOC_RETURN_RE.search(txt)
-        if m_ret:
-            ret_type = _clean_jsdoc_type(m_ret.group(1), owner_sid, line)
-        var_type: str | None = None
-        m_type = _JSDOC_TYPE_RE.search(txt)
-        if m_type:
-            var_type = _clean_jsdoc_type(m_type.group(1), owner_sid, line)
+        ret_type = next((_clean_jsdoc_type(raw, owner_sid, line) for raw in _JSDOC_RETURN_RE.findall(txt)), None)
+        var_type = next((_clean_jsdoc_type(raw, owner_sid, line) for raw in _JSDOC_TYPE_RE.findall(txt)), None)
         return param_types, ret_type, var_type
 
     def emit_type_uses(owner_sid: str, node, ignore_type_params: set[str] = frozenset()):
@@ -689,15 +688,15 @@ def extract_typescript_file(
                 continue
             emit(owner_sid, resolve_ref(tname), "USES_TYPE", line)
 
-    def _register_require_declarator(decl, line: int):
+    def _register_require_declarator(decl, line: int) -> None:
         val_node = None
         for child in reversed(decl.children):
             if child.type not in {";", "=", "identifier", "object_pattern", "type_annotation"}:
                 val_node = child
                 break
-        req = _extract_require_spec(data, val_node)
+        req = _extract_require_spec(data, val_node) if "require" not in bindings else None
         if req is None:
-            return False
+            return
         spec, sub_prop = req
         mod_target = _resolve_ts_import(spec, path, source_root, aliases_cfg)
         emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
@@ -710,49 +709,33 @@ def extract_typescript_file(
                 bindings[local_name] = target
                 emit(f"{module}:", target, "IMPORTS", line)
             else:
-                bindings[local_name] = f"{mod_target}{MODULE_END}"
+                bindings[local_name] = f"{mod_target}{MODULE_END}__cjs__"
                 emit(f"{module}:", f"{mod_target}{MODULE_END}default", "IMPORTS", line)
         elif obj_pat is not None:
             for orig, local in _extract_object_pattern_pairs(data, obj_pat):
                 target = f"{mod_target}{MODULE_END}{orig}"
                 bindings[local] = target
                 emit(f"{module}:", target, "IMPORTS", line)
-        return True
 
     def _infer_body_new_return_type(fn_node) -> str | None:
-        if fn_node is None:
-            return None
         fbody = child_of_type(fn_node, "statement_block")
-        if fbody is None and fn_node.type == "arrow_function":
-            new_expr = child_of_type(fn_node, "new_expression")
-            if new_expr is not None:
-                ctor = child_of_type(
-                    new_expr, "identifier", "type_identifier", "member_expression"
-                )
-                if ctor is not None:
-                    cname = node_text(data, ctor)
-                    if cname not in _TS_BUILTINS:
-                        return cname
-            return None
-        if fbody is None:
-            return None
+        targets = [fn_node] if fbody is None else [d for d in scoped_descendants(fbody, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}) if d.type == "return_statement"]
         found: set[str] = set()
-        for desc in scoped_descendants(
-            fbody, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}
-        ):
-            if desc.type == "return_statement":
-                new_expr = child_of_type(desc, "new_expression")
-                if new_expr is not None:
-                    ctor = child_of_type(
-                        new_expr, "identifier", "type_identifier", "member_expression"
-                    )
-                    if ctor is not None:
-                        cname = node_text(data, ctor)
-                        if cname not in _TS_BUILTINS:
-                            found.add(cname)
+        for tgt in targets:
+            new_expr = child_of_type(tgt, "new_expression")
+            ctor = (
+                child_of_type(new_expr, "identifier", "type_identifier", "member_expression")
+                if new_expr is not None
+                else None
+            )
+            if ctor is not None:
+                cname = node_text(data, ctor)
+                if cname not in _TS_BUILTINS:
+                    found.add(cname)
         return next(iter(found)) if len(found) == 1 else None
 
-    def _collect_top_level_bindings(node, is_default_export: bool = False):
+    def _collect_top_level_bindings(node, is_default_export: bool = False, is_exported: bool = False):
+        nonlocal has_explicit_exports
         if node.type == "import_statement":
             line = start_line(node)
             spec = _string_literal_value(data, node)
@@ -788,6 +771,7 @@ def extract_typescript_file(
                                 bindings[local] = target
                                 emit(f"{module}:", target, "IMPORTS", line)
         elif node.type == "export_statement":
+            has_explicit_exports = True
             line = start_line(node)
             spec = _string_literal_value(data, node)
             if spec is not None:
@@ -808,11 +792,14 @@ def extract_typescript_file(
                                 exported = node_text(data, idents[-1])
                                 target = f"{mod_target}{MODULE_END}{orig}"
                                 bindings[exported] = target
+                                exported_names.add(exported)
                                 emit(f"{module}:", target, "IMPORTS", line)
                 elif ns_export is not None:
                     ns_ident = child_of_type(ns_export, "identifier", "type_identifier")
                     if ns_ident is not None:
-                        bindings[node_text(data, ns_ident)] = f"{mod_target}{MODULE_END}"
+                        ns_name = node_text(data, ns_ident)
+                        bindings[ns_name] = f"{mod_target}{MODULE_END}"
+                        exported_names.add(ns_name)
                 elif any(c.type == "*" for c in node.children):
                     edges.append(Edge(module, mod_target, "WILDCARD_EXPORT", line))
                 return
@@ -829,6 +816,7 @@ def extract_typescript_file(
                             orig = node_text(data, idents[0])
                             exported = node_text(data, idents[-1])
                             deferred_local_exports.append((orig, exported))
+                            exported_names.add(exported)
                 return
             is_def = any(c.type == "default" for c in node.children)
             for child in node.children:
@@ -843,7 +831,7 @@ def extract_typescript_file(
                     "variable_declaration",
                     "identifier",
                 }:
-                    _collect_top_level_bindings(child, is_default_export=is_def)
+                    _collect_top_level_bindings(child, is_default_export=is_def, is_exported=True)
         elif node.type in {
             *_TS_TYPE_NODES,
             "type_alias_declaration",
@@ -855,8 +843,11 @@ def extract_typescript_file(
                 name = node_text(data, ident)
                 sid = f"{module}:{name}"
                 bindings[name] = sid
+                if is_exported and not is_default_export:
+                    exported_names.add(name)
                 if is_default_export:
                     bindings["default"] = sid
+                    exported_names.add("default")
                 if node.type in {"function_declaration", "function_signature"}:
                     rt = _base_ts_type_name(data, child_of_type(node, "type_annotation"))
                     if not rt:
@@ -871,22 +862,28 @@ def extract_typescript_file(
                         func_return_types[name] = rt
             elif is_default_export:
                 bindings["default"] = f"{module}:default"
+                exported_names.add("default")
         elif node.type in {"arrow_function", "function_expression"} and is_default_export:
             bindings["default"] = f"{module}:default"
+            exported_names.add("default")
         elif node.type in {"lexical_declaration", "variable_declaration"}:
             line = start_line(node)
             for decl in node.children:
                 if decl.type == "variable_declarator":
-                    if _register_require_declarator(decl, line):
-                        continue
+                    _register_require_declarator(decl, line)
+                    if len(decl.children) > 1 and "require" in _collect_pattern_identifiers(data, decl):
+                        bindings.setdefault("require", f"{module}:require")
                     ident = child_of_type(decl, "identifier")
                     val = child_of_type(decl, "arrow_function", "function_expression", "class")
                     if ident is not None and val is not None:
                         name = node_text(data, ident)
                         sid = f"{module}:{name}"
                         bindings[name] = sid
+                        if is_exported:
+                            exported_names.add(name)
                         if is_default_export:
                             bindings["default"] = sid
+                            exported_names.add("default")
                         rt = _base_ts_type_name(data, child_of_type(val, "type_annotation"))
                         if not rt:
                             outer_exp = (
@@ -902,7 +899,7 @@ def extract_typescript_file(
             line = start_line(node)
             call = child_of_type(node, "call_expression")
             if call is not None:
-                req = _extract_require_spec(data, call)
+                req = _extract_require_spec(data, call) if "require" not in bindings else None
                 if req is not None:
                     mod_target = _resolve_ts_import(req[0], path, source_root, aliases_cfg)
                     emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
@@ -911,16 +908,27 @@ def extract_typescript_file(
             if cjs is None:
                 return
             kind_cjs, export_name, rhs = cjs
+            if kind_cjs == "proto":
+                if export_name and rhs.type in {"arrow_function", "function_expression", "function_declaration"}:
+                    rt = _base_ts_type_name(data, child_of_type(rhs, "type_annotation"))
+                    if not rt:
+                        _, jret, _ = _parse_jsdoc(node, None, f"{module}:{export_name}")
+                        rt = jret or _infer_body_new_return_type(rhs)
+                    if rt and rt not in _TS_BUILTINS:
+                        func_return_types[export_name] = rt
+                return
+            has_explicit_exports = True
             if kind_cjs == "assign":
                 for arg in rhs:
-                    req = _extract_require_spec(data, arg)
+                    req = _extract_require_spec(data, arg) if "require" not in bindings else None
                     if req is not None:
                         mod_target = _resolve_ts_import(req[0], path, source_root, aliases_cfg)
                         emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
                         edges.append(Edge(module, mod_target, "WILDCARD_EXPORT", line))
                 return
             if kind_cjs == "default":
-                req = _extract_require_spec(data, rhs)
+                exported_names.add("default")
+                req = _extract_require_spec(data, rhs) if "require" not in bindings else None
                 if req is not None:
                     mod_target = _resolve_ts_import(req[0], path, source_root, aliases_cfg)
                     emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
@@ -951,9 +959,10 @@ def extract_typescript_file(
                         if prop.type == "shorthand_property_identifier":
                             pname = node_text(data, prop)
                             deferred_local_exports.append((pname, pname))
+                            exported_names.add(pname)
                         elif prop.type == "spread_element":
                             for sub in prop.children:
-                                req_sp = _extract_require_spec(data, sub)
+                                req_sp = _extract_require_spec(data, sub) if "require" not in bindings else None
                                 if req_sp is not None:
                                     mod_target = _resolve_ts_import(
                                         req_sp[0], path, source_root, aliases_cfg
@@ -979,6 +988,7 @@ def extract_typescript_file(
                             if mident is not None:
                                 mname = node_text(data, mident)
                                 bindings[mname] = f"{module}:{mname}"
+                                exported_names.add(mname)
                         elif prop.type == "pair":
                             knode = child_of_type(
                                 prop, "property_identifier", "identifier", "string"
@@ -992,10 +1002,22 @@ def extract_typescript_file(
                                 )
                                 if not kname:
                                     continue
+                                req_pair = _extract_require_spec(data, vnode) if "require" not in bindings else None
+                                if req_pair is not None:
+                                    mod_target = _resolve_ts_import(req_pair[0], path, source_root, aliases_cfg)
+                                    emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", start_line(prop))
+                                    bindings[kname] = (
+                                        f"{mod_target}{MODULE_END}{req_pair[1]}"
+                                        if req_pair[1]
+                                        else f"{mod_target}{MODULE_END}"
+                                    )
+                                    exported_names.add(kname)
+                                    continue
                                 if vnode.type == "identifier":
                                     deferred_local_exports.append(
                                         (node_text(data, vnode), kname)
                                     )
+                                    exported_names.add(kname)
                                 elif vnode.type in {
                                     "arrow_function",
                                     "function_expression",
@@ -1003,13 +1025,18 @@ def extract_typescript_file(
                                     "class_declaration",
                                 }:
                                     bindings[kname] = f"{module}:{kname}"
+                                    exported_names.add(kname)
             elif kind_cjs == "named" and export_name:
-                req = _extract_require_spec(data, rhs)
+                exported_names.add(export_name)
+                req = _extract_require_spec(data, rhs) if "require" not in bindings else None
                 if req is not None:
                     mod_target = _resolve_ts_import(req[0], path, source_root, aliases_cfg)
                     emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
-                    sub = req[1] or "default"
-                    bindings[export_name] = f"{mod_target}{MODULE_END}{sub}"
+                    bindings[export_name] = (
+                        f"{mod_target}{MODULE_END}{req[1]}"
+                        if req[1]
+                        else f"{mod_target}{MODULE_END}"
+                    )
                     return
                 if rhs.type == "identifier":
                     deferred_local_exports.append((node_text(data, rhs), export_name))
@@ -1031,7 +1058,14 @@ def extract_typescript_file(
         elif node.type == "identifier" and is_default_export:
             name = node_text(data, node)
             deferred_local_exports.append((name, "default"))
+            exported_names.add("default")
 
+    for child in root.children:
+        if child.type == "function_declaration":
+            fident = child_of_type(child, "identifier")
+            if fident is not None:
+                fname = node_text(data, fident)
+                bindings[fname] = f"{module}:{fname}"
     for child in root.children:
         _collect_top_level_bindings(child)
 
@@ -1057,7 +1091,7 @@ def extract_typescript_file(
             if child.type not in {";", "=", "identifier", "object_pattern", "type_annotation"}:
                 val_node = child
                 break
-        req = _extract_require_spec(data, val_node)
+        req = _extract_require_spec(data, val_node) if "require" not in local_types and "require" not in bindings else None
         if req is None:
             return False
         spec, sub_prop = req
@@ -1073,7 +1107,7 @@ def extract_typescript_file(
                 bindings[syn] = target
                 emit(owner_sid, target, "IMPORTS", line)
             else:
-                bindings[syn] = f"{mod_target}{MODULE_END}"
+                bindings[syn] = f"{mod_target}{MODULE_END}__cjs__"
                 emit(owner_sid, f"{mod_target}{MODULE_END}default", "IMPORTS", line)
             local_types[local_name] = syn
         elif obj_pat is not None:
@@ -1084,6 +1118,20 @@ def extract_typescript_file(
                 local_types[local] = syn
                 emit(owner_sid, target, "IMPORTS", line)
         return True
+
+    def _collect_scope_bindings(body_node, target_map: dict[str, str]) -> None:
+        for desc in scoped_descendants(
+            body_node,
+            {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES},
+            {"function_declaration"},
+        ):
+            if desc.type == "function_declaration":
+                fident = child_of_type(desc, "identifier")
+                if fident is not None:
+                    target_map.setdefault(node_text(data, fident), "?")
+            elif desc.type == "variable_declarator":
+                for bname in _collect_pattern_identifiers(data, desc):
+                    target_map.setdefault(bname, "?")
 
     def _scan_body_expressions(
         body_node,
@@ -1096,6 +1144,7 @@ def extract_typescript_file(
     ):
         if body_node is None:
             return
+        _collect_scope_bindings(body_node, local_types)
         for desc in scoped_descendants(
             body_node,
             {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES},
@@ -1178,7 +1227,7 @@ def extract_typescript_file(
                         emit(owner_sid, resolve_ref(tname, local_types), "CALLS", start_line(desc))
             elif desc.type == "call_expression":
                 req = _extract_require_spec(data, desc)
-                if req is not None:
+                if req is not None and "require" not in local_types and "require" not in bindings:
                     mod_target = _resolve_ts_import(req[0], path, source_root, aliases_cfg)
                     emit(owner_sid, f"{mod_target}{MODULE_END}", "IMPORTS", start_line(desc))
                     continue
@@ -1286,7 +1335,7 @@ def extract_typescript_file(
                         return
                     if ltype and ltype != "?" and ltype not in _TS_BUILTINS:
                         bound_base = bindings.get(ltype, "")
-                        if bound_base.endswith(MODULE_END):
+                        if bound_base.endswith((MODULE_END, f"{MODULE_END}__cjs__")) and ltype.startswith("__req_"):
                             emit(owner_sid, f"{bound_base}{mname}", "CALLS", line)
                         else:
                             emit(owner_sid, f"{resolve_ref(ltype)}.{mname}", "CALLS", line)
@@ -1300,7 +1349,7 @@ def extract_typescript_file(
                     return
                 if rname in bindings:
                     base = bindings[rname]
-                    if base.endswith(MODULE_END):
+                    if base.endswith((MODULE_END, f"{MODULE_END}__cjs__")):
                         emit(owner_sid, f"{base}{mname}", "CALLS", line)
                     else:
                         emit(owner_sid, f"{base}.{mname}", "CALLS", line)
@@ -1352,28 +1401,28 @@ def extract_typescript_file(
                     )
                     if is_prop and field_types is not None and eff_t is not None:
                         field_types[pname] = eff_t
+                for bname in _collect_pattern_identifiers(data, param):
+                    local_types.setdefault(bname, "__unannotated__")
         return local_types
 
     def _infer_ctor_this_fields(ctor_body, ctor_local_types: dict[str, str], field_types: dict[str, str]):
         if ctor_body is None:
             return
+        local_scope = dict(ctor_local_types)
+        _collect_scope_bindings(ctor_body, local_scope)
         for desc in scoped_descendants(
             ctor_body, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}
         ):
-            if desc.type != "assignment_expression" or len(desc.children) < 3:
+            if desc.type != "assignment_expression":
                 continue
-            lhs = desc.children[0]
-            rhs = desc.children[-1]
-            if lhs.type != "member_expression":
+            lhs, rhs = desc.children[0], desc.children[-1]
+            if lhs.type != "member_expression" or lhs.children[0].type != "this":
                 continue
-            lobj = lhs.children[0] if lhs.children else None
             lprop = child_of_type(lhs, "property_identifier", "private_property_identifier")
-            if lobj is None or lobj.type != "this" or lprop is None:
-                continue
             fname = node_text(data, lprop)
             if fname in field_types:
                 continue
-            _, _, jsdoc_ft = _parse_jsdoc(desc.parent if desc.parent and desc.parent.type == "expression_statement" else desc, None, f"{module}:")
+            _, _, jsdoc_ft = _parse_jsdoc(desc.parent, None, f"{module}:")
             if jsdoc_ft:
                 field_types[fname] = jsdoc_ft
                 continue
@@ -1382,22 +1431,30 @@ def extract_typescript_file(
                     rhs, "identifier", "type_identifier", "member_expression"
                 )
                 if ctor_ident is not None:
-                    field_types[fname] = node_text(data, ctor_ident)
+                    cname = node_text(data, ctor_ident)
+                    cname_head = cname.split(".")[0]
+                    if cname_head in local_scope:
+                        ptype = local_scope[cname_head]
+                        if ptype not in {"?", "__unannotated__", "__closure__"}:
+                            field_types[fname] = ptype
+                    else:
+                        field_types[fname] = cname
             elif rhs.type == "identifier":
-                rname = node_text(data, rhs)
-                ptype = ctor_local_types.get(rname)
-                if ptype and ptype not in {"?", "__unannotated__", "__closure__"}:
+                ptype = local_scope.get(node_text(data, rhs), "?")
+                if ptype not in {"?", "__unannotated__", "__closure__"}:
                     field_types[fname] = ptype
             elif rhs.type in {"call_expression", "await_expression"}:
-                call = rhs if rhs.type == "call_expression" else child_of_type(rhs, "call_expression")
-                if call is not None:
-                    cident = child_of_type(call, "identifier")
-                    if cident is not None:
-                        cname = node_text(data, cident)
+                call = child_of_type(rhs, "call_expression") or rhs
+                cident = child_of_type(call, "identifier")
+                if cident is not None:
+                    cname = node_text(data, cident)
+                    if cname not in local_scope:
                         if cname in func_return_types:
                             field_types[fname] = func_return_types[cname]
-                        elif cname in bindings and not bindings[cname].startswith(f"{module}:"):
-                            field_types[fname] = f"__ret__{bindings[cname]}"
+                        else:
+                            btarget = bindings.get(cname, f"{module}:")
+                            if not btarget.startswith(f"{module}:"):
+                                field_types[fname] = f"__ret__{btarget}"
 
     def visit_class_or_interface(node, outer_node=None, explicit_name: str | None = None):
         ident = child_of_type(node, "type_identifier", "identifier")
@@ -1494,6 +1551,9 @@ def extract_typescript_file(
                     continue
                 mname = node_text(data, mident)
                 msid = f"{sid}.{mname}"
+                if sid == bindings.get("default") and child_of_type(member, "static") is not None:
+                    bindings[f"__cjs__{mname}"] = msid
+                    exported_names.add(f"__cjs__{mname}")
                 mbody = child_of_type(member, "statement_block")
                 if mbody is not None:
                     block_nodes.append(mbody)
@@ -1582,7 +1642,13 @@ def extract_typescript_file(
                         member, sid, sid, field_types, {}, superclass_target, tparams
                     )
 
-    def visit_function(node, outer_node=None, explicit_name: str | None = None):
+    def visit_function(
+        node,
+        outer_node=None,
+        explicit_name: str | None = None,
+        sym_kind: str = "function",
+        enclosing_class_sid: str | None = None,
+    ):
         ident = (
             child_of_type(node, "identifier", "property_identifier")
             if node.type != "arrow_function"
@@ -1608,7 +1674,7 @@ def extract_typescript_file(
         add_or_merge_symbol(
             Symbol(
                 sid,
-                "function",
+                sym_kind,
                 sig,
                 "\n".join(lines[s_line - 1 : e_line]),
                 s_line,
@@ -1629,7 +1695,7 @@ def extract_typescript_file(
         _scan_body_expressions(
             fbody or (node if node.type in {"arrow_function", "function_expression", "method_definition"} else None),
             sid,
-            None,
+            enclosing_class_sid,
             {},
             local_types,
             None,
@@ -1712,6 +1778,21 @@ def extract_typescript_file(
         kind_cjs, export_name, rhs = cjs
         if kind_cjs == "assign":
             return
+        if kind_cjs == "proto":
+            cls_part = export_name.split(".")[0]
+            if rhs.type in {"arrow_function", "function_expression", "function_declaration"}:
+                visit_function(
+                    rhs,
+                    top,
+                    explicit_name=export_name,
+                    sym_kind="method",
+                    enclosing_class_sid=f"{module}:{cls_part}",
+                )
+                return
+            _scan_body_expressions(
+                rhs, f"{module}:{export_name}", f"{module}:{cls_part}", {}, module_local_types, None, set()
+            )
+            return
         if kind_cjs == "default":
             if rhs.type in _TS_TYPE_NODES:
                 ident = child_of_type(rhs, "type_identifier", "identifier")
@@ -1719,11 +1800,7 @@ def extract_typescript_file(
                 visit_class_or_interface(rhs, top, explicit_name=cname)
                 return
             if rhs.type in {"function_declaration", "function_expression", "arrow_function"}:
-                ident = (
-                    child_of_type(rhs, "identifier")
-                    if rhs.type != "arrow_function"
-                    else None
-                )
+                ident = child_of_type(rhs, "identifier")
                 fname = node_text(data, ident) if ident is not None else "default"
                 visit_function(rhs, top, explicit_name=fname)
                 return
@@ -1737,15 +1814,9 @@ def extract_typescript_file(
                         knode = child_of_type(
                             prop, "property_identifier", "identifier", "string"
                         )
-                        vnode = prop.children[-1] if prop.children else None
-                        if knode is not None and vnode is not None:
-                            kname = (
-                                _string_literal_value(data, prop)
-                                if knode.type == "string"
-                                else node_text(data, knode)
-                            )
-                            if not kname:
-                                continue
+                        vnode = prop.children[-1]
+                        if knode is not None:
+                            kname = node_text(data, knode).strip("\"'")
                             if vnode.type in {"arrow_function", "function_expression"}:
                                 visit_function(vnode, prop, explicit_name=kname)
                             elif vnode.type in _TS_TYPE_NODES:
@@ -1755,7 +1826,7 @@ def extract_typescript_file(
                                     vnode, f"{module}:", None, {}, module_local_types, None, set()
                                 )
                 return
-        elif kind_cjs == "named" and export_name:
+        elif kind_cjs == "named":
             if rhs.type in _TS_TYPE_NODES:
                 visit_class_or_interface(rhs, top, explicit_name=export_name)
                 return
@@ -1802,9 +1873,15 @@ def extract_typescript_file(
         elif target_node.type == "expression_statement":
             visit_cjs_expression(target_node)
 
+    enforce_exports = has_explicit_exports or path.endswith((".js", ".jsx", ".mjs", ".cjs"))
     for name, target in bindings.items():
-        if not name.startswith("__req_"):
-            edges.append(Edge(f"{module}.{name}", target, "ALIAS", 0))
+        if name.startswith(("__req_", "__jsdoc_")):
+            continue
+        if enforce_exports and name not in exported_names:
+            continue
+        edges.append(Edge(f"{module}.{name}", target, "ALIAS", 0))
+    if enforce_exports:
+        edges.append(Edge(module, ",".join(sorted(exported_names)), "MODULE_EXPORTS", 0))
     for fname, rt in func_return_types.items():
         edges.append(Edge(f"{module}:{fname}", resolve_ref(rt), "RETURN_TYPE", 0))
 

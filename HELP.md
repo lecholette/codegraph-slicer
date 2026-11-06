@@ -1,8 +1,9 @@
 # codegraph-slicer help
 
-`codegraph-slicer` indexes Python source into a SQLite snapshot, then builds a
+`codegraph-slicer` indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`),
+and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source into a SQLite snapshot, then builds a
 ranked repository map, extracts bounded context around symbols, reports bounded
-transitive callers, compares two snapshots, or builds bounded local
+transitive callers, compares two snapshots, or builds bounded local Python
 control/data-flow slices. It is static syntax analysis: it does not import or
 execute indexed code, execute tests, or infer runtime behavior.
 

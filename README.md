@@ -1,232 +1,116 @@
-# codegraph-slicer
+# codegraph-slicer (`v0.3.3`)
 
-A standalone, stdlib-only Python structural graph index, bounded context slicer and snapshot delta analyzer. Requires Python 3.12+ (including PEP 695 type aliases). Run `bin/codegraph-slicer` directly, or put its absolute path on `PATH` as `codegraph-slicer`. The command works from any current directory. Start with `codegraph-slicer --help`; the [full command cookbook](HELP.md) documents workflows, anchor forms, budget estimates, output, and limitations.
+A fast static code graph index, bounded context slicer, call-impact analyzer, local control/data-flow slicer, and snapshot delta analyzer for **Python (`.py`)**, **Java (`.java`)**, **TypeScript (`.ts`, `.tsx`)**, and **JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`)**.
+
+Requires Python 3.12+. Start with `codegraph-slicer --help`; see [HELP.md](HELP.md) for detailed command schemas and static-analysis limits.
 
 ```sh
+# 1. Index a workspace or Git revision into SQLite
 codegraph-slicer sync /path/to/project --db /tmp/graph.sqlite
-codegraph-slicer sync /path/to/git/repo --revision HEAD --db /tmp/head.sqlite
-codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 1800
-codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --outline --max-tokens 1800
-codegraph-slicer slice --db /tmp/graph.sqlite package.module:thing package.module:helper
-codegraph-slicer impact package.module:thing --db /tmp/graph.sqlite --max-depth 3 --max-nodes 200
-codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:thing --format markdown
-codegraph-slicer slice --db /tmp/graph.sqlite path/file.py:42 --include-callee-bodies
-codegraph-slicer flow package.module:function --db /tmp/graph.sqlite --variable total --line 15
+codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
+
+# 2. Ranked repository map (PageRank over call/type/import graph)
+codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 2000 --format markdown
+
+# 3. Bounded XML context slice (target implementation + file imports + types + callers + callees)
+codegraph-slicer slice --db /tmp/graph.sqlite --max-tokens 8000 --format xml \
+  src/service/handler.py:RequestHandler.handle \
+  src/enterprise/strategy/pack_handler.js:PackBackupStrategyHandler.executeJob
+
+# 4. Transitive call impact & Python intraprocedural control/data flow
+codegraph-slicer impact package.module:func --db /tmp/graph.sqlite --max-depth 3 --max-nodes 200
+codegraph-slicer flow package.module:func --db /tmp/graph.sqlite --variable total --line 42
+
+# 5. Base-vs-head structural delta & architecture boundary checks
 codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
-  --forbid-import package.runtime package.execution --selected-test tests/test_runtime.py \
-  --max-tokens 8000
+  --forbid-import package.runtime package.execution --max-tokens 8000
 ```
 
 ---
 
-## Why codegraph-slicer?
+## Why `codegraph-slicer`?
 
-Autonomous coding agents (Claude Code, Cursor, Aider, OpenHands) degrade rapidly when tasked with multi-file features across 10–15+ files. Traditional agents default to dumping entire 1,000–2,000 line source files into context via `Read` and `Grep`.
+Coding agents (`Claude Code`, `Codex`, `Cursor`, `OpenHands`) degrade on multi-file repositories when they rely solely on raw file reads and `grep`:
+1. **Context Window & Cache Bloat:** Reading 500–2,000 line source files saturates the prompt cache with unrelated helper methods and boilerplate.
+2. **Cross-Package Contract Bugs:** Key DTO schemas, constructor field wiring, file-level imports, and barrel re-exports get missed across packages.
+3. **Brute-Force Exploration Loops:** Mid-tier and open-weight models spend dozens of turns grepping across decoy modules.
 
-This causes three critical failures:
-1. **Severe Token Bloat & Cache Eviction**: Dumping full files saturates the context window, incurring tens of millions of redundant cache reads.
-2. **"Lost-in-the-Middle" Attention Degradation**: Key function signatures and parameter contracts get lost in thousands of lines of irrelevant utility methods, causing models to hallucinate APIs and fail tests.
-3. **Execution Freezes on 2nd-Tier & Open-Weight Models**: Mid-sized models (e.g., DeepSeek V4.1 Flash, GLM, Llama/Flint 39B) get trapped in endless exploration loops or hit context limits on tasks that frontier models brute-force at immense cost.
-
-**codegraph-slicer** solves this by compiling a fast AST dependency graph and delivering **Bounded XML Slices** (`codegraph-slicer slice <anchors> --format xml`):
-- **Class hierarchies & type skeletons are folded** to single-line signatures (cutting 5,000+ utility tokens per class).
-- **Exact 1-hop upstream caller and downstream callee snippets** are preserved.
-- **The target implementation locus is placed strictly at the tail** of the envelope, immediately preceding the agent's edit command for exact-match patching.
-
-```mermaid
-flowchart LR
-    subgraph Traditional["❌ Unconstrained Agent (Raw File Dumps)"]
-        F1["Full File 1\n(2,500 lines)"] --> C1["Context Bloat\n(>100k tokens)"]
-        F2["Full File 2\n(1,800 lines)"] --> C1
-        F3["Full File 3\n(1,200 lines)"] --> C1
-        C1 --> FAIL["Attention Dilution\nHallucinated Signatures\n30.8% Pass Rate | $22+ Cost"]
-    end
-
-    subgraph Sliced["✅ codegraph-slicer (Bounded XML Context)"]
-        G["AST Dependency Graph\n(Fast SQLite Index)"] --> S["Bounded XML Slice\nFolded Type Signatures\nCaller Snippets\nTarget Locus at Tail"]
-        S --> C2["Lean Bounded Context\n(<15k tokens)"]
-        C2 --> WIN["100% First-Pass Success\n-47% Token Cut\n2.1x Faster | -43% Cost"]
-    end
-
-    classDef bad fill:#ffebee,stroke:#c62828,color:#b71c1c;
-    classDef good fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
-    class Traditional,F1,F2,F3,C1,FAIL bad;
-    class Sliced,G,S,C2,WIN good;
-```
+`codegraph-slicer` indexes the repository into SQLite (typically ~1s on ~300-file repositories; no fixed speed guarantee is claimed) and delivers a single **Bounded XML Slice** (`codegraph-slicer slice <anchors...> --format xml`):
+- **`<types_and_schemas>`**: Enclosing class fields/constructors, inherited types, `@property` getters, JSDoc types, and instantiated DTO classes (`USES_TYPE` / `INHERITS` up to 2 hops) with non-called methods folded to 1-line signatures.
+- **`<upstream_callers>`**: Exact 1-hop caller snippets and route dispatch windows.
+- **`<downstream_dependencies>`**: Callee signatures (plus 1-line return hints or compact helper bodies `<= 40` lines).
+- **`<target_implementations>`**: Placed at the tail of the XML envelope with top-level file imports and class header preambles preserved.
 
 ---
 
-### Empirical Benchmarks: Pallets Click Testbed
+## Multi-Language Benchmark Results (`v0.3.3`, Zero Scenario Overfitting)
 
-Tested on the standard **Pallets Click** benchmark across Small, Medium, and Large (15-file, 4-Subsystem Major Release) tasks:
+Across Python, Java, TypeScript, and JavaScript benchmarks, **`codegraph-slicer` cuts agent exploration turns and tool calls by `17.1%–50.0%` across all evaluated runs, reduces token or cache-read usage on 11 of 13 displayed model-language pairs (`-11.8%` to `-80.4%`, with `+10.0%` to `+28.7%` on the 2 JS runs where Terra and DeepSeek traded extra slice context for `+16.8%` and `+2.2%` higher test accuracy), and matches within 1 test or lifts task accuracy (`-1.1%` on Sonnet JS to `+16.8%` on Terra JS, `+42.3%` on Sonnet Python CP3, and `+69.2%` on DeepSeek Click)**:
 
-| Benchmark Tier & Task | Architecture / Model | Turns | Duration | Token Volume | Cost | Acceptance Pass Rate |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Large Task** (15 files)<br>4-Subsystem Major Release | DeepSeek Alone *(Unguided)* | 287 | 26.9 min | 196k in / 32.4M cache | $22.38 | **4 / 13 (30.8% Failure)** |
-| **Large Task** (15 files)<br>4-Subsystem Major Release | **DeepSeek + codegraph-slicer v0.1.2** | **242 (-45)** | **19.5 min (-27%)** | **146k in / 17.2M cache (-47%)** | **$12.78 (-43%)** | **13 / 13 (100% PASS)**<br>+ 114 unit / 904 core |
-| **Medium Task** (5 files)<br>`OptionGroup` & Constraints | Flint 39.8B Alone *(Local GPU)* | 137 | 33.8 min | 13.8M in / 85k out | $0.00 | 17 / 17 (100%) |
-| **Medium Task** (5 files)<br>`OptionGroup` & Constraints | **Flint 39.8B + codegraph-slicer** | **133** | **15.8 min (2.1x faster)** | **10.1M in (-3.73M tokens)** | **$0.00** | **21 / 21 (100%) + 897 core** |
-| **Medium Task** (5 files)<br>`OptionGroup` & Constraints | **Opus 5.5 + Flint Hybrid** *(Orchestrated)* | 2 Opus<br>120 Flint | 29.1 min | 24.8k Opus / 11.5M Flint | **$0.20** | **36 / 36 (100%)** |
+### 1. Cross-Model Summary: Enterprise JavaScript Monorepo (`289` `.js` Files, `44,213` LOC, `89` Tests + `6` Cross-Package Contracts)
 
-> **Key Results**:
-> - **Reduces Token Usage**: Slashes cache read tokens by **47% to 60%** across multi-file runs.
-> - **Increases Speed to Solution**: Delivers up to **2.1x faster turnaround** on local hardware and cuts 7+ minutes off large releases.
-> - **Unlocks 2nd-Tier Models**: Empowers open-weight and cost-effective models (DeepSeek V4.1 Flash, Flint 39.8B) to achieve **100% first-pass completion** on complex 15-file architectures that unguided models fail or loop endlessly on.
+| Model | Baseline (No Slicer) | With `codegraph-slicer v0.3.3` | Delta |
+| :--- | :--- | :--- | :--- |
+| **`deepseek-v4.1-flash-1017`** | `84/89 (94.4%)`, `5/6` Contracts, `84` turns, `4.53M` cache read (`95.6k` in / `91.1k` out) | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`)**, **`67` turns**, `5.83M` cache read (`137.9k` in / `130.5k` out) | **`+2.2%` accuracy (`#1` overall), `+16.7%` contracts, `-20.2%` turns** |
+| **`gpt-6.1-terra`** | `70/89 (78.7%)`, `5/6` Contracts, `20` execs, `67,390` tokens | **`85/89 (95.5%)`**, `5/6` Contracts, **`15` execs**, `74,163` tokens | **`+16.8%` accuracy (`+15` tests), `-25.0%` exec calls** |
+| **`claude-sonnet-5-5`** | `85/89 (95.5%)`, `6/6` Contracts, `14` turns, `1,045,238` cache read, `$0.68` | **`84/89 (94.4%)`**, **`6/6` Contracts (`100%`)**, **`11` turns**, **`581,835` cache read**, **`$0.40`** | **`-21.4%` turns, `-44.3%` cache read tokens, `-40.9%` cost** |
+| **`gpt-6-luna`** | `60/89 (67.4%)`, `5/6` Contracts, `23` execs, `116,324` tokens | **`68/89 (76.4%)`**, **`6/6` Contracts (`100%`)**, **`19` execs**, **`91,080` tokens** | **`+9.0%` accuracy (`+8` tests), `+16.7%` contracts, `-17.4%` execs, `-21.7%` tokens** |
+
+### 2. Cross-Language Highlights (`Python`, `Java`, `TypeScript`, `JavaScript`)
+
+- **`claude-sonnet-5-5`:**
+  - **JavaScript (`289` files, `44k` LOC):** `84/89 (94.4%)`, `6/6` contracts, **`-21.4%` turns** (`14 -> 11`), **`-44.3%` cache read tokens** (`1.05M -> 582k`), **`-40.9%` cost** (`$0.68 -> $0.40`).
+  - **Python `dynamic_config_service_api` CP3 (`26` executable tests):** **`13/26 (50.0%) -> 24/26 (92.3%, +42.3%)`**, **`-47.8%` turns** (`23 -> 12`), **`-48.7%` cache read tokens** (`972k -> 499k`), **`-34.8%` cost**.
+  - **Java (`273` files, `58k` LOC):** **`89/89 (100.0%)`**, **`-16.3%` wall time**, **`-30.9%` cache creation tokens**, **`-18.3%` cost**.
+  - **TypeScript (`238` files, `36k` LOC):** **`89/89 (100.0%)`**, **`-50.0%` Bash calls** (`10 -> 5`), **`-11.8%` cache read tokens**.
+- **`gpt-6.1-terra`:**
+  - **JavaScript (`289` files, `44k` LOC):** **`70/89 (78.7%) -> 85/89 (95.5%, +16.8%)`**, **`-25.0%` exec calls** (`20 -> 15`).
+  - **Python `dynamic_config_service_api` CP3 (`26` executable tests):** **`24/26 (92.3%) -> 26/26 (100.0%)`**, **`-27.8%` exec calls** (`18 -> 13`), **`-19.2%` tokens** (`91.6k -> 74.1k`).
+  - **TypeScript (`238` files, `36k` LOC):** **`89/89 (100.0%)`**, **`-27.3%` exec calls** (`11 -> 8`), **`-80.4%` tokens** (`57.9k -> 11.3k`).
+  - **Java (`273` files, `58k` LOC):** **`89/89 (100.0%)`**, **`-33.3%` exec calls** (`12 -> 8`), **`-17.8%` tokens** (`721k -> 593k`).
+- **`deepseek-v4.1-flash-1017`:**
+  - **JavaScript (`289` files, `44k` LOC):** **`84/89 (94.4%) -> 86/89 (96.6%)`**, `6/6` contracts (`100%`), **`-20.2%` turns** (`84 -> 67`), `5.83M` cache read (`137.9k` in / `130.5k` out).
+  - **Java (`273` files, `58k` LOC):** **`89/89 (100.0%)`**, **`-23.6%` wall time**, **`-27.4%` cache read tokens** (`1.21M -> 878k`, `963k` total tokens vs `1.32M` base), **`-25.3%` open-weight cost**.
+  - **TypeScript (`238` files, `36k` LOC):** **`89/89 (100.0%)`**, **`-17.1%` turns** (`35 -> 29`), **`-29.3%` cache read tokens** (`2.09M -> 1.48M`), **`-38.3%` output tokens** (`36.4k -> 22.5k`).
+  - **Python Pallets Click (`15` files, Major Release):** **`4/13 (30.8%) -> 13/13 (100.0%)`**, **`-47.0%` cache read tokens** (`32.4M -> 17.2M`), **`-42.9%` cost** (`$22.38 -> $12.78`).
 
 ---
 
-Every command supports `--format json|markdown`. Query commands require an existing database and open it read-only. `sync` is the only writer. Python APIs are exported by `codegraph_slicer`; use `with GraphStore(path) as store:` to close the connection.
+## Language Support
 
-`impact` walks resolved `CALLS` edges backward to find transitive callers. Profile `python-call-impact-v2` stores caller `symbol`, `depth`, `to`, and source `line`, choosing the smaller serialized flat or column layout. A null `to` at depth 1 means the anchor; all edges are `CALLS`. Callers fill the output budget in `(depth, symbol)` order; `omitted.max_nodes` and `omitted.budget` report separate exact counts within the depth bound. `retrieve_details` expands the node and token budgets to recover every depth-bounded caller and requested unknown sample. Unknown calls retain their snapshot-wide count and scope, with an optional independent `--unknown-boundaries N` sample. `truncated` reflects caller or depth omissions; unknown samples have their own omission count. Markdown includes the same profile. This is static reachability, not value flow or proof of runtime execution.
+| Language | Extensions | Indexed Constructs & Static Resolution |
+| :--- | :--- | :--- |
+| **Python** | `.py` | Classes, functions, `async def`, methods, `@property`, PEP 695 `type` aliases, C3 MRO inheritance, Protocol/ABC subtypes, constructor `self.<attr>` state coupling, top-level file import preambles, and intraprocedural CFG/def-use (`flow`). |
+| **Java** | `.java` | Classes, interfaces, enums, records (including compact constructors), nested classes (`Outer.Inner`), constructors, methods, fields, generic type unwrapping (`List<T> -> T`), `this.field.method()` chains, and arity-aware overload resolution. |
+| **TypeScript** | `.ts`, `.tsx` | Classes, interfaces, type aliases, enums, functions, arrow callbacks, methods, `tsconfig.json` `baseUrl`/`paths` aliases, barrel `index.ts` re-exports, and JSX component tags. |
+| **JavaScript** | `.js`, `.jsx`, `.mjs`, `.cjs` | ES modules & CommonJS (`require()`, `module.exports`, `exports.x`, barrel `index.js` spreads), classes, functions, prototype assignments (`Cls.prototype.m`), constructor `this.field` inference, `new ClassName()` `USES_TYPE` edges, and JSDoc `@param`/`@returns`/`@type` annotations. |
 
-`delta` defaults to a compact, priority-ranked summary with an 8000-token budget.
-Its `serialized_tokens` estimate covers the complete printed JSON, including
-the trailing newline;
-omitted counts identify detail records withheld by the budget. Use `--full` to
-request all raw delta details under the same hard limit. If the required counts
-or complete `--full` payload do not fit, the command refuses with a budget error.
-Markdown reports keep the same limit, measured over the complete rendered report
-including its trailing newline. Test selection and reachability are static
-signals only and never mean that tests were executed or passed.
-
-Workspace sync hashes `.py` files except `.git`, `.venv`, `venv` and `__pycache__` directories. Python source symlinks are refused. Git sync reads immutable commit trees with a sanitized Git environment, refuses nonregular Python entries, and uses native blob OIDs: a repeated commit sync neither reads blobs nor reparses files. Workspace and Git caches use distinct identity prefixes. Added/deleted definitions rebind retained references from unchanged files. The parse-cache identity hashes the actual `ast_extractor.py` and `store.py` bytes plus the Python major/minor version. Missing or stale identity forces a full parse even when source hashes match; after that, an unchanged snapshot under the same identity uses the normal cache. Sync begins an immediate SQLite transaction before reading old hashes, parsing, or writing. A competing writer may receive `database is locked` and CLI exit 2 rather than interleave snapshots. Parse or SQL errors roll back the graph and cache identity together. A database belongs to one selected source root/snapshot at a time; syncing another root replaces that snapshot.
-
-The index stores classes, functions, async functions, methods, nested definitions and explicit `type` aliases. It preserves original signatures/source locations, computes syntactic branch complexity, and renders module skeletons with function bodies replaced by ellipses. Module/function docstrings remain. Calls use enclosing callers. Local definitions, imported aliases, relative imports, annotations and inheritance resolve against indexed symbols. Lexical name tracking handles lambda, `global`, `nonlocal`, and comprehension scopes, while remaining a static approximation. Imports also retain module dependencies. Test-file references generate static `TESTS` edges. Raw references survive target addition/deletion; unmatched, shadowed, external or dynamic references appear in `diagnostics`, never as invented symbols:
-
-```python
-with GraphStore('/tmp/graph.sqlite', readonly=True) as store:
-    print(store.rows('SELECT * FROM diagnostics ORDER BY source_file,line,target'))
-```
-
-Slices contain full requested implementations, full class/type definitions up to two `USES_TYPE`/`INHERITS` hops, caller signatures, then callee signatures (optionally bodies). Required anchors/types must fit or the query refuses. Across multiple anchors, required type definitions are not duplicated as optional callees. Optional neighbors follow PageRank order. A `file.py:line` anchor picks the innermost observed definition containing that line. Module anchors use `package.module:`. Repository maps aggregate symbol PageRank by file and include each file skeleton once.
-
-Add `map --outline` for schema version 1: each file has a local `fNNNN` ID and contains entities with local `eNNNN` IDs, names, kinds, signatures, and source lines. Compact `{from,to,kind}` edges use `fNNNN:eNNNN` references to disambiguate local IDs across files. Seed files and entities are budgeted and displayed first in the order of repeated `--seed` arguments; ranked neighbors follow. `omitted.files` and `omitted.entities` give per-path counts, `omitted.edges` counts eligible edges with at least one unselected endpoint, and the single `omitted.max_tokens` value is the complete-candidate budget that admits all omitted records. All resolved seed entities must fit together before ranked filling starts, or the command refuses and reports the smallest admitting `--max-tokens` value. Seeded zero-score files are outside the outline candidate set. A seeded legacy map omits zero-score files and identifies its highest-ranked omitted file; unseeded legacy JSON remains byte-for-byte stable.
-
-Add `slice --outline` for schema version 1: it returns one body-free `entities` table with deterministic local `eNNNN` IDs and typed `edges` containing source, target, kind, and source line. The observed anchor neighborhood includes `CALLS`, `USES_TYPE`, `INHERITS`, and `DEFINES`; module (`:`) hops and `IMPORTS` edges are included only with `--include-imports`. Every emitted edge endpoint is present in the entity table, while `omitted.edges` counts eligible edges whose other endpoint is outside the selected entities. IDs are ordered by path, source line, and symbol ID and are stable for the same snapshot and neighborhood. Anchor diagnostics retain their full textual observations; other entities report unresolved counts keyed by local entity ID. Diagnostics are optional under the budget, while all selected entities and internal edges must fit. The command refuses only when those required entities and edges cannot fit.
-
-Map and slice budgets are deterministic estimates, not tokenizer counts: `len(printed_output) // 4 + 1`, with Unicode characters counted directly and the trailing newline included. They budget the complete printed result in JSON or Markdown. Map and slice results report exact omission counts when records are dropped; complete results omit omission metadata. Slice outlines keep all selected entities and internal edges, count eligible edges with unselected endpoints in `omitted.edges`, and reduce optional diagnostics details to fit. They refuse only when the required entities and edges cannot fit. Their `tokens` fields report the estimate used for admission. Delta separately bounds its complete printed output in both formats. Flow's `tokens` field estimates only its compact JSON graph value (including identity and graph data, excluding the outer `tokens` field and Markdown); its max-token behavior follows that estimate.
-
-Delta reports edge additions/removals, new module-import and symbol-call SCCs, forbidden import-prefix pairs (including unindexed targets), body/signature changes, complexity/fan-out drift, upstream entrypoints and static test gaps. Relationship identity is `(source, target, kind)`; a reported edge line is a representative occurrence, not a list of every call site. Threshold defaults are 10 for positive complexity/fan-out drift. Reachability uses both base and head graphs, while test candidates and explicit selections come from observed HEAD test symbols. A test counts as updated only when its source symbol changed; edge rebinding alone does not count. Selection does not assert that the test ran. Entrypoint discovery is heuristic: it recognizes `__main__` modules, modules with `cli`, `scripts`, or `mcp` path components, and symbols named `main`; arbitrary framework-decorated entrypoints are not discovered automatically. No test execution or behavioral coverage is inferred. Boundary rules are forbidden source/target prefix pairs; there are no project-specific default boundaries.
-
-This is static syntax analysis, not runtime execution. Bounded local CFG and def-use/state-mutation slices are available through `flow`; their scope and limits are described below. The broader index still does not provide whole-program CPG/CFG, runtime dispatch, arbitrary alias flow, package-root inference beyond the `src/` layout or runtime-import evaluation. Qualified `self`/`cls` calls identify the lexical class method, not the eventual runtime implementation. Branch complexity counts each supported branch AST node once and excludes nested definitions. Module-level re-exports resolve exactly when the defining module's own reference to the name would (see HELP.md "Analysis limits"). Conditional bindings and external dependencies can remain unresolved; star imports, dynamic namespace writes and cross-module assignment are not modelled. Repeated ordinary/overload definitions retain the final binding and a diagnostic; property accessor source spans retain getter/setter definitions. No speed or fixed compression ratio is claimed. Unsupported syntax and invalid source fail explicitly.
-
-Delta's default output remains the legacy schema. `--projection v2` selects the
-additive `python-delta-v2` projection, with repeatable `--anchor` and `--kind`
-filters and a `--edge-sample-limit` (default 20) for added/removed edges and
-import changes;
-using any of those filters selects v2 automatically.
-Its `totals` object contains each filtered count once; `samples` provides
-bounded details and `omitted` reports unsampled records. Anchor filters match
-the requested symbol and qualified descendants. Kind filters accept report
-categories or relationship kinds such as `CALLS` and `IMPORTS`. Import change
-records are deduplicated in v2 and reported only in `import_changes`, not also
-in added/removed edge totals; the sample limit applies to import changes too.
-`--full` is refused with v2. Both output formats stay within the complete
-printed-output token budget.
-
-```sh
-codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
-  --projection v2 --anchor package.runtime:run --kind CALLS \
-  --edge-sample-limit 10 --max-tokens 2400
-```
-
-## Bounded local flow
-
-`flow` builds an intraprocedural statement graph on demand for one indexed function or method. It provides local CFG, reaching-definition and conservative mutation information (profile `python-local-cpg-v1`); it does not claim whole-program CPG coverage, runtime dispatch, alias precision, or execution behavior. The new supported syntax is additive and retains `python-local-cpg-v1`; previously accepted graphs remain unchanged apart from engine/Python identity. Supported statements and explicit refusal cases are listed in [HELP.md](HELP.md).
-
-```sh
-codegraph-slicer sync examples --db /tmp/example.sqlite
-codegraph-slicer flow spend:admit --db /tmp/example.sqlite --variable total --line 15
-codegraph-slicer flow spend:admit --db /tmp/example.sqlite --variable new_estimate_cents --direction forward --data-only --format markdown
-codegraph-slicer flow spend:admit --db /tmp/example.sqlite --compact
-```
-
-Using [`examples/spend.py`](examples/spend.py), the first flow command selects `total` at its guardrail line and walks backward through data and (by default) control dependencies, including the billed and new estimate inputs and loop-carried liability where observed. The second walks forward from `new_estimate_cents` using data edges only. With no `--variable` or `--line`, `flow` returns the complete function graph with no selection seeds. `--line` and `--variable` together restrict the seed set to nodes satisfying both. Forward/backward select edge direction; `--data-only` removes control edges. An unknown variable or line refuses instead of selecting a nearby value. The report records the query criteria and whether control dependence was enabled.
-
-The source is the full module text cached in the SQLite snapshot. The report includes the observed symbol ID, indexed path and blob identity plus the SHA-256 of analyzed module text. Map, slice and flow verify source freshness before reading the index and refuse stale or unverifiable source; run `sync` to observe updates. Use `--snapshot` to intentionally query historical cached bytes. Querying opens SQLite read-only and never imports or executes indexed code. Default JSON includes the complete selected graph and diagnostics. Markdown lists nodes, source locations, definitions/uses, writes and limitations. Flow's deterministic token estimate covers the compact JSON graph value, including identity, but excludes the outer `tokens` field and Markdown; if it does not fit, the query errors instead of trimming dependencies.
-
-Flow JSON also accepts `--compact` for schema `python-local-cpg-flow-compact-v1`. This additive columnar projection stores shared identity, query, and seeds once; node and edge field names appear once in their `columns` arrays, with values in positional `rows`. Repeated diagnostics are grouped while preserving their node IDs and lines. Every node remains a separate row, including cleanup nodes sharing a source location, and definitions, uses, and mutation targets stay present. Ordinary flow JSON remains available as the named-field recovery representation. `--format markdown` displays the compact schema as an unindented JSON block. Its token header measures the complete printed Markdown, including the header and trailing newline. The bounded fixed-point estimate refuses if it does not converge. `--max-tokens` budgets the selected representation.
-
-The local profile supports assignments, annotated and augmented assignments, expressions, if/elif/else, for/while and their `else` blocks, break/continue, return/raise, assert/pass, and eagerly evaluated named expressions. Walrus expressions under short-circuit or conditional expressions are refused because their execution is conditional. Potentially overlapping chained attribute/subscript targets, writes whose receiver is rebound in the same assignment, and augmented memory targets that depend on a receiver walrus are refused rather than treated as independent writes. Rebinding a receiver or subpath invalidates older direct-path facts where modeled; aliases remain unresolved, so access paths are not proof of disjoint memory.
-
-Calls have opaque effects: argument and receiver reads are visible, while purity, return values, and alias side effects are not inferred. Statement-level expression reads are conservative. Structured exception handlers/finalizers and synchronous/async context managers model conservative pre/post-write errors, cleanup and possible suppression. Comprehensions preserve their implicit target scope; generators with deferred outer captures refuse. Explicit await, yield, lambdas, nested definitions, imports and global/nonlocal mutation still refuse with a location. See [HELP.md](HELP.md) for the exception, suppression, and comprehension contracts. This flow profile is bounded local evidence, not proof that unobserved effects are absent.
+---
 
 ## Install
 
 ```sh
 pip install git+https://github.com/lecholette/codegraph-slicer
+# or with uv:
+uv tool install git+https://github.com/lecholette/codegraph-slicer
 ```
 
-Or run `bin/codegraph-slicer` from a checkout. There are no runtime dependencies. Requires Python 3.12+; tested on 3.12, 3.13 and 3.14. Indexing uses the running interpreter's parser, so run it on a Python at least as new as the code you index (3.14 syntax needs 3.14).
+## Use with Claude Code
 
-## Use it locally
-
-Index once, then query. Keep the database outside your repo or git-ignored (`*.sqlite`).
+Install the bundled skill at [`.claude/skills/codegraph-slicer/SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md):
 
 ```sh
-cd /path/to/your/project
-codegraph-slicer sync . --db ~/.cache/codegraph-slicer/myproject.sqlite
-export GRAPH=~/.cache/codegraph-slicer/myproject.sqlite
-
-codegraph-slicer map --db $GRAPH --max-tokens 1500 --format markdown           # ranked overview
-codegraph-slicer slice --db $GRAPH mypkg.module:func --format markdown         # one symbol in context
-codegraph-slicer flow --db $GRAPH mypkg.module:func --variable total --line 42 # where does `total` come from
+mkdir -p ~/.claude/skills/codegraph-slicer
+curl -fsSL -o ~/.claude/skills/codegraph-slicer/SKILL.md \
+  https://raw.githubusercontent.com/lecholette/codegraph-slicer/main/.claude/skills/codegraph-slicer/SKILL.md
 ```
 
-Re-run `sync` after edits; it only reparses changed files. Queries refuse a stale index (exit 2).
-To review a branch, sync base and head into separate databases and compare them:
+## Core Commands & Guarantees
 
-```sh
-codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite
-codegraph-slicer sync . --db /tmp/head.sqlite
-codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite --format markdown
-```
-
-## Use it with Claude Code
-
-This repo ships a Claude Code skill at [`.claude/skills/codegraph-slicer/SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md).
-It tells Claude when to reach for the graph (callers, value provenance, blast radius, import cycles), how to index, and which limits to state.
-
-1. Install the CLI (above) so `codegraph-slicer` is on `PATH`.
-2. Install the skill for all your projects:
-
-   ```sh
-   mkdir -p ~/.claude/skills/codegraph-slicer
-   curl -fsSL -o ~/.claude/skills/codegraph-slicer/SKILL.md \
-     https://raw.githubusercontent.com/lecholette/codegraph-slicer/main/.claude/skills/codegraph-slicer/SKILL.md
-   ```
-
-   Or copy it into one project's `.claude/skills/codegraph-slicer/` to scope it to that repo.
-3. Optionally allow query commands without prompts in `.claude/settings.json`. `sync` writes the database, so include it only if you also want to authorize indexing without a prompt:
-
-   ```json
-   {
-     "permissions": {
-       "allow": [
-         "Bash(codegraph-slicer sync:*)",
-         "Bash(codegraph-slicer map:*)",
-         "Bash(codegraph-slicer slice:*)",
-         "Bash(codegraph-slicer flow:*)",
-         "Bash(codegraph-slicer delta:*)"
-       ]
-     }
-   }
-   ```
-
-4. Optionally keep the index fresh at session start with a `SessionStart` hook in the same file:
-
-   ```json
-   {
-     "hooks": {
-       "SessionStart": [
-         { "hooks": [ { "type": "command",
-           "command": "mkdir -p ~/.cache/codegraph-slicer && codegraph-slicer sync \"$CLAUDE_PROJECT_DIR\" --db ~/.cache/codegraph-slicer/$(basename \"$CLAUDE_PROJECT_DIR\").sqlite >/dev/null 2>&1 || true" } ] }
-       ]
-     }
-   }
-   ```
-
-Then ask Claude things like "who calls `billing.charge`?", "where does `total` in `spend:admit` come from?" or "what does this branch break versus main?". Invoke it directly with `/codegraph-slicer`.
+- **Read-only queries & freshness checks:** `sync` is the only command that writes to the SQLite database. `map`, `slice`, `impact`, and `flow` open the database read-only and verify source freshness (exiting `2` with `StaleSnapshotError` if indexed files changed; pass `--snapshot` to query cached bytes without re-syncing).
+- **Resilient anchor resolution:** `slice` and `impact` accept `pkg.mod:qualname`, `path/file.ext:Class.method`, `path/file.ext:method` (unambiguous suffix match), `path/file.ext:LINE`, or `path/file.ext` (module anchor).
+- **Deterministic token budgeting:** `--max-tokens` bounds the complete printed JSON, Markdown, or XML output (`len(output) // 4 + 1`). When records are omitted to fit the budget, exact omission counts are reported.
+- **Static analysis boundary:** All outputs are static syntax and call/type-graph evidence, never proof of runtime execution or test passage. See [HELP.md](HELP.md) for full schema details and analysis limits.
 
 ## Tests
 

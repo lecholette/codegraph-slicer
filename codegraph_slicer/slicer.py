@@ -12,6 +12,8 @@ from .ast_extractor import (
     is_supported_source_path,
     is_test_path,
 )
+from .treesitter_support import node_text, parser_for, scoped_descendants
+from .ts_extractor import _TS_FUNCTION_NODES, _TS_TYPE_NODES
 
 _BRACE_LANG_EXTS = (".java", *TS_JS_EXTENSIONS)
 _BARREL_INDEX_NAMES = (
@@ -531,38 +533,56 @@ def _target_item_with_preamble(
     file_key = f"file:{row['file_path']}"
     emit_file_imports = emitted_headers is None or file_key not in emitted_headers
     if emit_file_imports:
-        in_multiline_import = False
-        in_docstring_delim = None
-        for idx in range(limit_idx):
-            raw = file_lines[idx]
-            stripped = raw.strip()
-            if in_docstring_delim is not None:
-                if in_docstring_delim in stripped:
-                    in_docstring_delim = None
-                continue
-            if stripped.startswith(('"""', "'''")):
-                delim = stripped[:3]
-                if stripped.count(delim) == 1:
-                    in_docstring_delim = delim
-                continue
-            if in_multiline_import:
-                header_lines.append(raw)
-                header_end_line = idx + 1
-                if ";" in stripped or ")" in stripped or stripped.endswith(('"', "'")):
-                    in_multiline_import = False
-                continue
-            if stripped.startswith(("import ", "from ", "package ")) or (
-                stripped.startswith(("const ", "let ", "var ")) and "require(" in stripped
-            ):
-                header_lines.append(raw)
-                header_end_line = idx + 1
-                if ("{" in stripped and "}" not in stripped) or (
-                    "(" in stripped and ")" not in stripped
+        if row["file_path"].endswith(".py"):
+            try:
+                tree = ast.parse(mod_rows[0]["body"])
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                for idx_stmt, stmt in enumerate(tree.body):
+                    if getattr(stmt, "lineno", 0) >= row["start_line"]:
+                        break
+                    if (
+                        idx_stmt == 0
+                        and isinstance(stmt, ast.Expr)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)
+                    ):
+                        continue
+                    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                        s_ln = stmt.lineno
+                        e_ln = getattr(stmt, "end_lineno", s_ln) or s_ln
+                        header_lines.extend(file_lines[s_ln - 1 : min(limit_idx, e_ln)])
+                        header_end_line = min(limit_idx, e_ln)
+                        continue
+                    break
+        else:
+            in_multiline_import = False
+            for idx in range(limit_idx):
+                raw = file_lines[idx]
+                stripped = raw.strip()
+                if in_multiline_import:
+                    header_lines.append(raw)
+                    header_end_line = idx + 1
+                    if not stripped.endswith("\\") and (
+                        ";" in stripped or ")" in stripped or stripped.endswith(('"', "'")) or "(" not in "".join(header_lines)
+                    ):
+                        in_multiline_import = False
+                    continue
+                if stripped.startswith(("import ", "from ", "package ")) or (
+                    stripped.startswith(("const ", "let ", "var ")) and "require(" in stripped
                 ):
-                    in_multiline_import = True
-                continue
-            if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/")):
-                break
+                    header_lines.append(raw)
+                    header_end_line = idx + 1
+                    if (
+                        stripped.endswith("\\")
+                        or ("{" in stripped and "}" not in stripped)
+                        or ("(" in stripped and ")" not in stripped)
+                    ):
+                        in_multiline_import = True
+                    continue
+                if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/")):
+                    break
         if emitted_headers is not None and header_lines:
             emitted_headers.add(file_key)
     if row["kind"] == "method" and "." in row["qualname"] and row["file_path"].endswith(_BRACE_LANG_EXTS):
@@ -991,6 +1011,17 @@ def _build_type_summaries(
     return summaries, compact_summaries, auto_summarize_ids
 
 
+def _format_condensed_method_body(body: str, comment_pfx: str) -> str:
+    m_lines = body.splitlines()
+    if len(m_lines) <= 45:
+        return body
+    return (
+        "\n".join(m_lines[:20])
+        + f"\n        {comment_pfx} ... ({len(m_lines) - 28} lines condensed)\n"
+        + "\n".join(m_lines[-8:])
+    )
+
+
 def _condense_class_public_methods(store, sid: str, row: dict, db_arg: str, max_tokens: int) -> str | None:
     if row["kind"] != "class":
         return None
@@ -999,10 +1030,7 @@ def _condense_class_public_methods(store, sid: str, row: dict, db_arg: str, max_
            AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
         (row["file_path"], row["start_line"], row["end_line"]),
     )
-    if len(methods) < 2:
-        return None
-    class_short = row["qualname"].rsplit(".", 1)[-1]
-    ctor_names = {"__init__", "__new__", "constructor", class_short}
+    ctor_names = {"__init__", "__new__", "constructor", row["qualname"]}
     pub_methods = [m for m in methods if not _is_internal_method(m, ctor_names)]
     int_methods = [m for m in methods if _is_internal_method(m, ctor_names)]
     if not pub_methods or not int_methods:
@@ -1012,20 +1040,13 @@ def _condense_class_public_methods(store, sid: str, row: dict, db_arg: str, max_
     kept_parts = ["\n".join(body_lines[: min(first_m_offset, 15)])]
     comment_pfx = _comment_prefix(row["file_path"])
     full_size = tokens_for_length(len(row["body"]))
+    expand_budget = max(max_tokens, full_size * 2)
     kept_parts.append(
         f"    {comment_pfx} ... ({len(int_methods)} internal helper methods condensed; fetch full class with: "
-        f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)})"
+        f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {expand_budget})"
     )
-    for m in pub_methods[:8]:
-        m_lines = m["body"].splitlines()
-        if len(m_lines) <= 45:
-            kept_parts.append(m["body"])
-        else:
-            kept_parts.append(
-                "\n".join(m_lines[:20])
-                + f"\n        {comment_pfx} ... ({len(m_lines) - 28} lines condensed)\n"
-                + "\n".join(m_lines[-8:])
-            )
+    for m in pub_methods:
+        kept_parts.append(_format_condensed_method_body(m["body"], comment_pfx))
     if row["file_path"].endswith(_BRACE_LANG_EXTS):
         kept_parts.append("}")
     return "\n".join(kept_parts)
@@ -1303,24 +1324,31 @@ def slice_context(
             return True
         return False
 
+    def _extract_outer_return_hint(body: str) -> str | None:
+        p = parser_for("tsx")
+        data = body.encode("utf-8")
+        root = p.parse(data).root_node
+        if root.has_error:
+            data = f"class _ {{\n{body}\n}}".encode("utf-8")
+            root = p.parse(data).root_node
+        fbody = next((d for d in scoped_descendants(root, set()) if d.type == "statement_block"), None)
+        if fbody is None:
+            return None
+        last_ret = None
+        for d in scoped_descendants(fbody, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}):
+            if d.type == "return_statement":
+                s_ln = node_text(data, d).splitlines()[0][6:].strip()
+                if s_ln not in {"", ";", "null;", "true;", "false;", "0;"}:
+                    last_ret = s_ln
+        return last_ret
+
     def _callee_item(cand_row, full: bool):
         base = item(cand_row, full)
-        if (
-            full
-            or max_tokens < 2000
-            or not cand_row["file_path"].endswith(_BRACE_LANG_EXTS)
-            or cand_row["kind"] not in {"method", "function", "async_function"}
-        ):
-            return base
-        ret_lines = []
-        for raw_ln in cand_row["body"].splitlines():
-            s_ln = raw_ln.strip()
-            if s_ln.startswith("return ") and s_ln not in {"return null;", "return true;", "return false;", "return 0;"}:
-                ret_lines.append(s_ln)
-        if ret_lines:
-            comment_pfx = _comment_prefix(cand_row["file_path"])
-            ret_expr = ret_lines[-1][7:].strip()
-            base["text"] = f"{base['text']}\n    {comment_pfx} returns: {ret_expr}"
+        if not full:
+            ret_expr = _extract_outer_return_hint(cand_row["body"])
+            if ret_expr:
+                comment_pfx = _comment_prefix(cand_row["file_path"])
+                base["text"] = f"{base['text']}\n    {comment_pfx} returns: {ret_expr}"
         return base
 
     for name, candidates in (
