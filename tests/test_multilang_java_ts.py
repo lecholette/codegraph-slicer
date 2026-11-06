@@ -1042,5 +1042,111 @@ def test_sched() -> None:
         assert "tests.test_helper:" not in up_full
 
 
+def test_resilient_anchors_public_condensation_and_return_hints(tmp_path):
+    repo = tmp_path / "resilient_js"
+    internal_methods = "\n".join(
+        f"  _helper{i}(v) {{\n    const x = v + {i};\n    return x * 2;\n  }}"
+        for i in range(1, 45)
+    )
+    _write(
+        repo,
+        {
+            "src/pkg/planner.js": """export class Cursor {
+  constructor(id, nowLocal) {
+    this.id = id;
+    this.nowLocal = nowLocal;
+  }
+}
+
+export class Planner {
+  computeDue(items) {
+    const out = [];
+    for (const it of items) {
+      if (!it) {
+        continue;
+      }
+      if (!it.id) {
+        continue;
+      }
+      if (it.skip) {
+        continue;
+      }
+      if (it.disabled) {
+        continue;
+      }
+      if (it.expired) {
+        continue;
+      }
+      out.push(it);
+    }
+    return out.map((it) => new Cursor(it.id, it.now_local));
+  }
+}
+""",
+            "src/pkg/validator.js": f"""import {{ Planner }} from "./planner.js";
+
+export class PolicyValidator {{
+  constructor() {{
+    this.planner = new Planner();
+  }}
+{internal_methods}
+  validateStrategyAndDestination(items) {{
+    return this.planner.computeDue(items);
+  }}
+}}
+""",
+            "src/pkg/other.js": f"""export class OtherCatalog {{
+  constructor() {{
+    this.ready = true;
+  }}
+{internal_methods}
+  partitionIntoPacks(files, limit) {{
+    return [files.slice(0, limit)];
+  }}
+}}
+""",
+        },
+    )
+
+    db = tmp_path / "graph.sqlite"
+    assert main(["sync", str(repo), "--db", str(db)]) == 0
+
+    with GraphStore(db) as store:
+        # 1. Bare file path without colon resolves to module symbol
+        xml_file = json.dumps(
+            slice_context(
+                store,
+                ["src/pkg/planner.js"],
+                max_tokens=4000,
+            )
+        )
+        assert "pkg.planner:" in xml_file
+
+        # 2. Unambiguous file:methodName without ClassName prefix resolves cleanly
+        xml_method = json.dumps(
+            slice_context(
+                store,
+                ["src/pkg/validator.js:validateStrategyAndDestination"],
+                max_tokens=4000,
+            )
+        )
+        assert "pkg.validator:PolicyValidator.validateStrategyAndDestination" in xml_method
+        # 3. Callee return expression hint is preserved on stubbed downstream dependency
+        assert "returns: out.map((it) => new Cursor(it.id, it.now_local));" in xml_method
+
+        # 4. Multi-anchor whole-class condensation preserves public methods at bottom of class
+        xml_multi = json.dumps(
+            slice_context(
+                store,
+                ["src/pkg/validator.js:PolicyValidator", "src/pkg/other.js:OtherCatalog"],
+                max_tokens=1000,
+            )
+        )
+        assert "validateStrategyAndDestination(items)" in xml_multi
+        assert "partitionIntoPacks(files, limit)" in xml_multi
+        assert "condensed" in xml_multi
+
+
+
 
 

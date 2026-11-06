@@ -95,6 +95,20 @@ def _anchor(store, anchor):
             )
         if len(rows) >= 1:
             return rows[0]
+        if line == 0 and target:
+            suffix_rows = store.rows(
+                "SELECT * FROM symbols WHERE file_path=? AND qualname GLOB ? ORDER BY end_line-start_line DESC, start_line ASC",
+                (path, f"*.{target}"),
+            )
+            if len(suffix_rows) == 1:
+                return suffix_rows[0]
+    if not separator and is_supported_source_path(anchor):
+        mod_rows = store.rows(
+            "SELECT * FROM symbols WHERE file_path=? AND qualname=''",
+            (anchor,),
+        )
+        if mod_rows:
+            return mod_rows[0]
     if separator and "." in path and target:
         java_cls = path.rsplit(".", 1)[-1]
         java_cand = f"{path}:{java_cls}.{target}"
@@ -826,6 +840,13 @@ def _is_priority_compact_method(
     )
 
 
+def _is_internal_method(m: dict, ctor_names: set[str]) -> bool:
+    m_short = m["qualname"].rpartition(".")[2]
+    if m_short in ctor_names:
+        return False
+    return m["signature"].lstrip().startswith("private ") or m_short.startswith("_")
+
+
 def _select_compact_methods(
     row: dict,
     methods: list[dict],
@@ -833,7 +854,7 @@ def _select_compact_methods(
     referenced_names: set[str],
     target_self_attrs: set[str],
 ) -> list[dict]:
-    public_methods = [m for m in methods if not m["signature"].lstrip().startswith("private ")]
+    public_methods = [m for m in methods if not _is_internal_method(m, ctor_names)]
     candidate_methods = public_methods or methods
     kept = [
         m for m in candidate_methods
@@ -961,12 +982,67 @@ def _build_type_summaries(
     return summaries, compact_summaries, auto_summarize_ids
 
 
-def _condense_multi_anchor_targets(chosen, sections, result_fn, database, max_tokens):
+def _condense_class_public_methods(store, sid: str, row: dict, db_arg: str, max_tokens: int) -> str | None:
+    if row["kind"] != "class":
+        return None
+    methods = store.rows(
+        """SELECT * FROM symbols WHERE file_path=? AND kind='method'
+           AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
+        (row["file_path"], row["start_line"], row["end_line"]),
+    )
+    if len(methods) < 2:
+        return None
+    class_short = row["qualname"].rsplit(".", 1)[-1]
+    ctor_names = {"__init__", "__new__", "constructor", class_short}
+    pub_methods = [m for m in methods if not _is_internal_method(m, ctor_names)]
+    int_methods = [m for m in methods if _is_internal_method(m, ctor_names)]
+    if not pub_methods or not int_methods:
+        return None
+    body_lines = row["body"].splitlines()
+    first_m_offset = max(1, methods[0]["start_line"] - row["start_line"])
+    kept_parts = ["\n".join(body_lines[: min(first_m_offset, 15)])]
+    comment_pfx = _comment_prefix(row["file_path"])
+    full_size = tokens_for_length(len(row["body"]))
+    kept_parts.append(
+        f"    {comment_pfx} ... ({len(int_methods)} internal helper methods condensed; fetch full class with: "
+        f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)})"
+    )
+    for m in pub_methods[:8]:
+        m_lines = m["body"].splitlines()
+        if len(m_lines) <= 45:
+            kept_parts.append(m["body"])
+        else:
+            kept_parts.append(
+                "\n".join(m_lines[:20])
+                + f"\n        {comment_pfx} ... ({len(m_lines) - 28} lines condensed)\n"
+                + "\n".join(m_lines[-8:])
+            )
+    if row["file_path"].endswith(_BRACE_LANG_EXTS):
+        kept_parts.append("}")
+    return "\n".join(kept_parts)
+
+
+def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database, max_tokens):
     required = result_fn()
     if required["tokens"] <= max_tokens or len(chosen) <= 1 or max_tokens < 1000:
         return required
     db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
-    for sid, row in sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"])):
+    sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
+    for sid, row in sorted_targets:
+        if required["tokens"] <= max_tokens:
+            break
+        pub_condensed = _condense_class_public_methods(store, sid, row, db_arg, max_tokens)
+        if pub_condensed is not None and len(pub_condensed) < len(row["body"]):
+            condensed_item = {
+                "symbol": sid,
+                "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{pub_condensed}",
+            }
+            sections["target_implementations"] = [
+                condensed_item if entry["symbol"] == sid else entry
+                for entry in sections["target_implementations"]
+            ]
+            required = result_fn()
+    for sid, row in sorted_targets:
         if required["tokens"] <= max_tokens:
             break
         body_lines = row["body"].splitlines()
@@ -1218,6 +1294,26 @@ def slice_context(
             return True
         return False
 
+    def _callee_item(cand_row, full: bool):
+        base = item(cand_row, full)
+        if (
+            full
+            or max_tokens < 2000
+            or not cand_row["file_path"].endswith(_BRACE_LANG_EXTS)
+            or cand_row["kind"] not in {"method", "function", "async_function"}
+        ):
+            return base
+        ret_lines = []
+        for raw_ln in cand_row["body"].splitlines():
+            s_ln = raw_ln.strip()
+            if s_ln.startswith("return ") and s_ln not in {"return null;", "return true;", "return false;", "return 0;"}:
+                ret_lines.append(s_ln)
+        if ret_lines:
+            comment_pfx = _comment_prefix(cand_row["file_path"])
+            ret_expr = ret_lines[-1][7:].strip()
+            base["text"] = f"{base['text']}\n    {comment_pfx} returns: {ret_expr}"
+        return base
+
     for name, candidates in (
         ("upstream_callers", callers),
         ("downstream_dependencies", callees),
@@ -1229,7 +1325,7 @@ def slice_context(
                 full = name == "downstream_dependencies" and _should_include_callee_body(
                     candidates[sid]
                 )
-                sections[name].append(item(candidates[sid], full))
+                sections[name].append(_callee_item(candidates[sid], full))
     complete = result()
     if complete["tokens"] <= max_tokens:
         return complete
@@ -1266,7 +1362,7 @@ def slice_context(
                 for entry in sections["types_and_schemas"]
             ]
         required = result()
-    required = _condense_multi_anchor_targets(chosen, sections, result, database, max_tokens)
+    required = _condense_multi_anchor_targets(store, chosen, sections, result, database, max_tokens)
     if required["tokens"] > max_tokens and any(
         totals[name] > len(sections[name])
         for name in ("upstream_callers", "downstream_dependencies")
@@ -1292,12 +1388,12 @@ def slice_context(
                 full = name == "downstream_dependencies" and _should_include_callee_body(
                     candidates[sid]
                 )
-                candidate = item(candidates[sid], full)
+                candidate = _callee_item(candidates[sid], full)
             sections[name].append(candidate)
             if result()["tokens"] > max_tokens:
                 sections[name].pop()
                 if full:
-                    sections[name].append(item(candidates[sid], False))
+                    sections[name].append(_callee_item(candidates[sid], False))
                     body_fallbacks[sid] = candidates[sid]
                     if result()["tokens"] > max_tokens:
                         sections[name].pop()

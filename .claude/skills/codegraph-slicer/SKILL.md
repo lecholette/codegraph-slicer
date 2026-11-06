@@ -13,11 +13,17 @@ Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecho
 Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
-## Routing Threshold (Target File Size & Cross-Package Coupling Density)
+## Routing Precedence (When to Slice vs. Read Directly)
 
-- **Start with `codegraph-slicer slice` or `impact`** when the target symbols live inside large files (**`>= 300` lines** or `>= 15` definitions) or when callers, callees, and interface implementations are unknown and dispersed across multiple packages. Pass all target anchors in a single `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading large source files.
-- **Skip `slice` and use direct `Read` (or `impact` for caller discovery)** when the target files are already known and compact (**`< 300` lines each**), for single-file edits, or for small repositories (`< 25` relevant source files). On compact Java/TypeScript/JavaScript one-class-per-file modules (`< 300` lines) that you will immediately edit, reading the target file directly avoids paying the double token tax of loading both the XML slice and the full file into context.
-- **Incremental head sync (`delta`):** When running `delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite`, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
+1. **Use `codegraph-slicer` (`map`, `slice`, or `impact`)** whenever target symbols live inside large files (**`>= 300` lines** or `>= 15` definitions) **or** when callers, callees, and interface implementations are unknown across multiple modules/packages. Pass target `path/file.ext:Class.method` anchors in a single batched `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call before reading large source files.
+2. **Use direct `Read` (skipping `slice`)** only when the target files are already known **and** every target file is compact (**`< 300` lines each**), or for tiny repositories (`< 500` total LOC). On compact one-class-per-file modules (`< 300` lines) that you will immediately edit, reading the file directly avoids loading both the XML slice and the full file into context.
+3. **Incremental head sync (`delta`):** When running `delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite`, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
+
+## Contract & Verification Discipline
+
+- **Check helper & scaffold contracts before reuse:** Inspect whether existing helpers preserve required return shapes, formatting, side effects, observable event/output ordering, and state transitions. Preserve existing early-return guards and state fields in `<target>` methods required by earlier callers.
+- **Expand stubbed or omitted context when needed:** When a signature-only callee stub in `<downstream_dependencies>` or an omitted symbol affects formatting, ordering, or state transitions, fetch its body (`slice --include-callee-bodies` or targeted `slice`/`Read`) rather than guessing its implementation.
+- **Requirement-driven verification:** Run available tests. Where acceptance tests are external or legacy tests reflect superseded contracts, run focused checks derived independently from the specification (covering boundary transitions, exact output/event sequences, and error/rejection cases) before completing.
 
 ## Index first
 
@@ -30,13 +36,13 @@ codegraph-slicer sync . --db "$GRAPH"
 
 Sync is incremental: unchanged files are not reparsed, so re-run it whenever source changed.
 `map`, `slice`, `impact` and `flow` exit 2 with `StaleSnapshotError` when files changed since the sync.
-Re-sync for symbols you edited. For symbols you did not edit, `--snapshot` reads the indexed bytes without a re-sync.
+Re-sync for symbols you edited. For symbols you did not edit, `--snapshot` (a boolean flag taking no argument) reads the indexed bytes without a re-sync.
 Errors go to stderr with exit 2. An empty result is exit 0.
 
 ## Commands
 
-- **Do not browse or read entire large module files** when sliced anchors are known on repos with `>= 25` source files. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
-- **Skip codegraph** for small repos (`< 25` files), single-file edits, or languages outside Python/Java/TypeScript/JavaScript. Reading the file directly is cheaper.
+- **Do not browse or read entire large module files (`>= 300` lines)** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
+- **Skip codegraph** when all target files are already known and `< 300` lines each, for single-file edits, or for languages outside Python/Java/TypeScript/JavaScript.
 - Orient: `codegraph-slicer map --db "$GRAPH" --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
 - One function/method with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
 - Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call deduplicates enclosing classes, shared types, and callers across anchors.
