@@ -6,7 +6,22 @@ import difflib
 import re
 import shlex
 import textwrap
-from .ast_extractor import CodeGraphError, is_supported_source_path, is_test_path
+from .ast_extractor import (
+    TS_JS_EXTENSIONS,
+    CodeGraphError,
+    is_supported_source_path,
+    is_test_path,
+)
+
+_BRACE_LANG_EXTS = (".java", *TS_JS_EXTENSIONS)
+_BARREL_INDEX_NAMES = (
+    "index.ts",
+    "index.tsx",
+    "index.js",
+    "index.jsx",
+    "index.mjs",
+    "index.cjs",
+)
 
 
 class AnchorNotFoundError(CodeGraphError):
@@ -486,7 +501,7 @@ def _target_item_with_preamble(
     base = _slice_item(row, True)
     if (
         max_tokens < 2000
-        or not row["file_path"].endswith((".java", ".ts", ".tsx"))
+        or not row["file_path"].endswith(_BRACE_LANG_EXTS)
         or row["kind"] not in {"method", "function", "async_function", "class", "type_alias"}
     ):
         return base
@@ -513,7 +528,9 @@ def _target_item_with_preamble(
                 if ";" in stripped or ")" in stripped or stripped.endswith(('"', "'")):
                     in_multiline_import = False
                 continue
-            if stripped.startswith(("import ", "from ", "package ")):
+            if stripped.startswith(("import ", "from ", "package ")) or (
+                stripped.startswith(("const ", "let ", "var ")) and "require(" in stripped
+            ):
                 header_lines.append(raw)
                 header_end_line = idx + 1
                 if ("{" in stripped and "}" not in stripped) or (
@@ -560,13 +577,13 @@ def _target_item_with_preamble(
                 if emitted_headers is not None and added_class:
                     emitted_headers.add(class_key)
     comment_pfx = _comment_prefix(row["file_path"])
-    if emit_file_imports and row["file_path"].endswith((".ts", ".tsx")) and "." in row["module"]:
+    if emit_file_imports and row["file_path"].endswith(TS_JS_EXTENSIONS) and "." in row["module"]:
         parent_mod_sid = f"{row['module'].rpartition('.')[0]}:"
         barrel_rows = store.rows(
             "SELECT file_path, body FROM symbols WHERE symbol_id=?",
             (parent_mod_sid,),
         )
-        if barrel_rows and barrel_rows[0]["file_path"].endswith(("index.ts", "index.tsx")):
+        if barrel_rows and barrel_rows[0]["file_path"].endswith(_BARREL_INDEX_NAMES):
             b_lines = [ln.strip() for ln in barrel_rows[0]["body"].splitlines() if ln.strip()]
             if 1 <= len(b_lines) <= 8:
                 header_lines.append(
@@ -601,7 +618,7 @@ def _is_test_symbol(row):
 
 
 def _comment_prefix(path: str) -> str:
-    return "//" if path.endswith((".java", ".ts", ".tsx")) else "#"
+    return "//" if path.endswith(_BRACE_LANG_EXTS) else "#"
 
 
 def _first_code_line_offset(body: str) -> int:
@@ -885,7 +902,7 @@ def _build_type_summaries(
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
-        if row["file_path"].endswith((".java", ".ts", ".tsx")):
+        if row["file_path"].endswith(_BRACE_LANG_EXTS):
             first_m_offset = (
                 (methods[0]["start_line"] - row["start_line"])
                 if methods
@@ -927,7 +944,7 @@ def _build_type_summaries(
             m for m in methods if m["qualname"].rsplit(".", 1)[-1] not in ctor_names
         ]
         if len(methods) >= 2 or (
-            row["file_path"].endswith((".java", ".ts", ".tsx"))
+            row["file_path"].endswith(_BRACE_LANG_EXTS)
             and len(non_ctor_methods) >= 1
         ):
             compact_summaries[sid] = compact_rec
@@ -935,7 +952,7 @@ def _build_type_summaries(
             (len(methods) >= 5 and full_size >= 500)
             or (sid in py_enclosing and len(methods) >= 5)
             or (
-                row["file_path"].endswith((".java", ".ts", ".tsx"))
+                row["file_path"].endswith(_BRACE_LANG_EXTS)
                 and len(non_ctor_methods) >= 1
                 and full_size >= 200
             )
@@ -1008,7 +1025,7 @@ def slice_context(
         f"{r['module']}:{r['qualname'].rpartition('.')[0]}"
         for r in chosen.values()
         if max_tokens >= 2000
-        and r["file_path"].endswith((".java", ".ts", ".tsx"))
+        and r["file_path"].endswith(_BRACE_LANG_EXTS)
         and r["kind"] == "method"
         and "." in r["qualname"]
     }
@@ -1041,7 +1058,7 @@ def slice_context(
                 if enc_rows:
                     types[enclosing_class_sid] = enc_rows[0]
                     enclosing_py_classes.add(enclosing_class_sid)
-        elif row["kind"] == "class" and row["file_path"].endswith((".java", ".ts", ".tsx")):
+        elif row["kind"] == "class" and row["file_path"].endswith(_BRACE_LANG_EXTS):
             for mrow in store.rows(
                 "SELECT target_id FROM edges WHERE source_id=? AND kind='DEFINES'",
                 (sid,),
@@ -1111,7 +1128,7 @@ def slice_context(
     }
     def _type_item_with_doc(row):
         entry = item(row, True)
-        if row["file_path"].endswith((".java", ".ts", ".tsx")):
+        if row["file_path"].endswith(_BRACE_LANG_EXTS):
             mod_rows = store.rows(
                 "SELECT body FROM symbols WHERE symbol_id=?", (f"{row['module']}:",)
             )
@@ -1194,7 +1211,7 @@ def slice_context(
             return True
         if (
             max_tokens >= 2000
-            and cand_row["file_path"].endswith((".java", ".ts", ".tsx"))
+            and cand_row["file_path"].endswith(_BRACE_LANG_EXTS)
             and cand_row["kind"] in {"method", "function", "async_function", "class"}
             and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 20
         ):

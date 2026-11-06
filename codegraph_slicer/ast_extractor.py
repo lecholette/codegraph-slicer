@@ -49,11 +49,16 @@ class FileAnalysis:
 # Ends the module path of an import target: `from pkg.sub import x` is "pkg.sub|x".
 # The import system, not attribute lookup on `pkg`, finds the part before it.
 MODULE_END = "|"
-SUPPORTED_EXTENSIONS = (".py", ".java", ".ts", ".tsx")
+TS_JS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+SUPPORTED_EXTENSIONS = (".py", ".java", *TS_JS_EXTENSIONS)
+_EXCLUDED_SUFFIXES = (".d.ts", ".min.js", ".bundle.js")
+_TS_JS_TEST_SUFFIXES = tuple(
+    f"{tag}{ext}" for tag in (".test", ".spec") for ext in TS_JS_EXTENSIONS
+)
 
 
 def is_supported_source_path(path: str) -> bool:
-    return path.endswith(SUPPORTED_EXTENSIONS) and not path.endswith(".d.ts")
+    return path.endswith(SUPPORTED_EXTENSIONS) and not path.endswith(_EXCLUDED_SUFFIXES)
 
 
 def is_test_path(path: str) -> bool:
@@ -67,10 +72,10 @@ def is_test_path(path: str) -> bool:
             or name.endswith(("Test.java", "Tests.java", "IT.java"))
             or name.startswith("Test")
         )
-    if path.endswith((".ts", ".tsx")):
+    if path.endswith(TS_JS_EXTENSIONS):
         return (
             any(part in {"test", "tests", "__tests__", "spec", "specs"} for part in parts[:-1])
-            or name.endswith((".test.ts", ".spec.ts", ".test.tsx", ".spec.tsx"))
+            or name.endswith(_TS_JS_TEST_SUFFIXES)
         )
     return False
 
@@ -207,7 +212,7 @@ def extract_file(
         from .java_extractor import extract_java_file
 
         return extract_java_file(path, source, source_root)
-    if path.endswith((".ts", ".tsx")):
+    if path.endswith(TS_JS_EXTENSIONS):
         from .ts_extractor import extract_typescript_file
 
         return extract_typescript_file(path, source, source_root, path_aliases)

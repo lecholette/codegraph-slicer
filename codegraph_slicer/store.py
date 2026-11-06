@@ -14,6 +14,7 @@ from urllib.parse import quote
 from .ast_extractor import (
     MODULE_END,
     SUPPORTED_EXTENSIONS,
+    TS_JS_EXTENSIONS,
     CodeGraphError,
     CodeGraphParseError,
     Edge,
@@ -28,6 +29,9 @@ from .ast_extractor import (
     plain_target,
     valid_path,
 )
+
+_RAW_SOURCE_EXTS = tuple(ext.encode("ascii") for ext in SUPPORTED_EXTENSIONS)
+_RAW_EXCLUDED_EXTS = (b".d.ts", b".min.js", b".bundle.js")
 
 _SKIP_DIRS = {
     ".git",
@@ -62,7 +66,7 @@ def _lang_group(path: str) -> str:
         return "py"
     if path.endswith(".java"):
         return "java"
-    if path.endswith((".ts", ".tsx")):
+    if path.endswith(TS_JS_EXTENSIONS):
         return "ts"
     return ""
 
@@ -70,7 +74,7 @@ def _lang_group(path: str) -> str:
 def _raw_stem_module(path: str, source_root: str) -> str:
     if path.endswith(".py"):
         return module_name(path, source_root)
-    if path.endswith((".ts", ".tsx")):
+    if path.endswith(TS_JS_EXTENSIONS):
         from .ts_extractor import ts_module_name
 
         return ts_module_name(path, source_root)
@@ -140,9 +144,17 @@ def _iter_workspace_files(root: Path) -> list[Path]:
     found: set[Path] = set()
     for ext in SUPPORTED_EXTENSIONS:
         for path in root.rglob(f"*{ext}"):
-            if not path.name.endswith(".d.ts"):
+            if is_supported_source_path(path.name):
                 found.add(path)
     return sorted(found)
+
+
+def _read_ts_or_js_config(root: Path) -> bytes:
+    for cfg_name in ("tsconfig.json", "jsconfig.json"):
+        cfg_path = root / cfg_name
+        if cfg_path.is_file() and not cfg_path.is_symlink():
+            return cfg_path.read_bytes()
+    return b""
 
 
 class InvalidRevisionError(CodeGraphError):
@@ -255,12 +267,7 @@ class GraphStore:
             name = valid_path(rel.as_posix())
             data = path.read_bytes()
             files[name] = ("sha256:" + hashlib.sha256(data).hexdigest(), data)
-        tsconfig_path = root / "tsconfig.json"
-        tsconfig_bytes = (
-            tsconfig_path.read_bytes()
-            if tsconfig_path.is_file() and not tsconfig_path.is_symlink()
-            else b""
-        )
+        tsconfig_bytes = _read_ts_or_js_config(root)
         return self._sync(
             files,
             snapshot_root=str(root),
@@ -298,6 +305,7 @@ class GraphStore:
         rev = git("rev-parse", "--verify", revision + "^{commit}").decode().strip()
         files = {}
         tsconfig_oid = None
+        jsconfig_oid = None
         for entry in git("ls-tree", "-r", "-z", rev).split(b"\0"):
             if not entry:
                 continue
@@ -306,7 +314,10 @@ class GraphStore:
             if raw_path == b"tsconfig.json" and typ == b"blob":
                 tsconfig_oid = oid.decode("ascii")
                 continue
-            if not raw_path.endswith((b".py", b".java", b".ts", b".tsx")) or raw_path.endswith(b".d.ts"):
+            if raw_path == b"jsconfig.json" and typ == b"blob":
+                jsconfig_oid = oid.decode("ascii")
+                continue
+            if not raw_path.endswith(_RAW_SOURCE_EXTS) or raw_path.endswith(_RAW_EXCLUDED_EXTS):
                 continue
             if typ != b"blob" or mode not in {b"100644", b"100755"}:
                 raise CodeGraphError(f"non-regular Python source refused: {raw_path!r}")
@@ -317,7 +328,8 @@ class GraphStore:
             if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden):
                 continue
             files[name] = ("git:" + oid.decode("ascii"), oid.decode("ascii"))
-        tsconfig_bytes = git("cat-file", "blob", tsconfig_oid) if tsconfig_oid else b""
+        cfg_oid = tsconfig_oid or jsconfig_oid
+        tsconfig_bytes = git("cat-file", "blob", cfg_oid) if cfg_oid else b""
         return self._sync(
             files,
             loader=lambda oid: git("cat-file", "blob", oid),
@@ -546,10 +558,10 @@ class GraphStore:
             raise StaleSnapshotError("snapshot freshness cannot be verified: missing source metadata; run codegraph-slicer sync ROOT --db DB")
         try:
             root = Path(root_text).resolve(strict=True)
-            tsconfig_path = root / "tsconfig.json"
+            cfg_bytes = _read_ts_or_js_config(root)
             actual_tsconfig_sha = (
-                "sha256:" + hashlib.sha256(tsconfig_path.read_bytes()).hexdigest()
-                if tsconfig_path.is_file() and not tsconfig_path.is_symlink()
+                "sha256:" + hashlib.sha256(cfg_bytes).hexdigest()
+                if cfg_bytes
                 else ""
             )
             if "tsconfig_sha" in metadata and actual_tsconfig_sha != metadata.get("tsconfig_sha", ""):
@@ -586,7 +598,7 @@ class GraphStore:
                         continue
                     meta, raw_path = entry.split(b"\t", 1)
                     mode, typ, oid = meta.split()
-                    if not raw_path.endswith((b".py", b".java", b".ts", b".tsx")) or raw_path.endswith(b".d.ts"):
+                    if not raw_path.endswith(_RAW_SOURCE_EXTS) or raw_path.endswith(_RAW_EXCLUDED_EXTS):
                         continue
                     if typ != b"blob" or mode not in {b"100644", b"100755"}:
                         raise StaleSnapshotError(f"snapshot source cannot be verified: non-regular Python source {raw_path!r}")
@@ -753,7 +765,17 @@ class GraphStore:
                     target = ".".join([bound, *parts[index:]])
                     break
                 else:
-                    return direct(target, module_parts)
+                    found = direct(target, module_parts)
+                    if found is not None:
+                        return found
+                    if module_parts >= 1 and len(parts) > module_parts:
+                        def_key = ".".join([*parts[:module_parts], "default"])
+                        def_bound = aliases.get(def_key)
+                        if def_bound and def_key not in applied:
+                            applied.add(def_key)
+                            target = ".".join([def_bound, *parts[module_parts:]])
+                            continue
+                    return None
 
         _META_KINDS = (
             "ALIAS",

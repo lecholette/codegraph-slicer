@@ -38,6 +38,10 @@ def _fence_lang(path: str) -> str:
         return "tsx"
     if path.endswith(".ts"):
         return "typescript"
+    if path.endswith(".jsx"):
+        return "jsx"
+    if path.endswith((".js", ".mjs", ".cjs")):
+        return "javascript"
     return "python"
 
 
