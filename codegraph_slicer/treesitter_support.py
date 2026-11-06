@@ -97,12 +97,18 @@ def descendants(node):
         stack.extend(reversed(current.children))
 
 
-def scoped_descendants(node, skip_types: set[str] | frozenset[str]):
+def scoped_descendants(
+    node,
+    skip_types: set[str] | frozenset[str],
+    yield_skipped_types: set[str] | frozenset[str] = frozenset(),
+):
     root_id = node.id
     stack = [node]
     while stack:
         current = stack.pop()
         if current.id != root_id and current.type in skip_types:
+            if current.type in yield_skipped_types:
+                yield current
             continue
         yield current
         stack.extend(reversed(current.children))

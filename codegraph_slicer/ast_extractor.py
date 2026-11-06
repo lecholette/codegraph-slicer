@@ -880,13 +880,15 @@ def extract_file(
                         if len(target_names) == 1 and not is_unpack:
                             ct = _extract_callable_elements(stmt.value) or _container_lookup_targets(stmt.value)
                             if ct:
-                                local_callables[target_names[0]] = ct
+                                prev_ct = local_callables.get(target_names[0], ())
+                                local_callables[target_names[0]] = tuple(dict.fromkeys([*prev_ct, *ct]))
                         if target_names and isinstance(stmt.value, ast.Call):
                             if is_unpack:
                                 unpack_types = _expr_elem_types(stmt.value)
                                 if unpack_types:
                                     for vname in target_names:
-                                        local_types[vname] = unpack_types
+                                        prev_ut = local_types.get(vname, ())
+                                        local_types[vname] = tuple(dict.fromkeys([*prev_ut, *unpack_types]))
                             else:
                                 ret_types: list[str] = []
                                 ret_elem_types: list[str] = []
@@ -906,15 +908,18 @@ def extract_file(
                                 if ret_types:
                                     dedup_rt = tuple(dict.fromkeys(ret_types))
                                     for vname in target_names:
-                                        local_types[vname] = dedup_rt
+                                        prev_rt = local_types.get(vname, ())
+                                        local_types[vname] = tuple(dict.fromkeys([*prev_rt, *dedup_rt]))
                                 elif deferred_refs:
                                     dedup_dr = tuple(dict.fromkeys(deferred_refs))
                                     for vname in target_names:
-                                        local_deferred_ret[vname] = dedup_dr
+                                        prev_dr = local_deferred_ret.get(vname, ())
+                                        local_deferred_ret[vname] = tuple(dict.fromkeys([*prev_dr, *dedup_dr]))
                                 if ret_elem_types:
                                     dedup_re = tuple(dict.fromkeys(ret_elem_types))
                                     for vname in target_names:
-                                        local_elem_types[vname] = dedup_re
+                                        prev_re = local_elem_types.get(vname, ())
+                                        local_elem_types[vname] = tuple(dict.fromkeys([*prev_re, *dedup_re]))
                     elif isinstance(stmt, (ast.For, ast.AsyncFor)):
                         iter_types = list(_expr_elem_types(stmt.iter))
                         if iter_types:
@@ -929,7 +934,8 @@ def extract_file(
                                 )
                             )
                             for vname in target_names:
-                                local_types[vname] = dedup_it
+                                prev_it = local_types.get(vname, ())
+                                local_types[vname] = tuple(dict.fromkeys([*prev_it, *dedup_it]))
             for statement in node.body:
                 self.visit(statement)
             frame_local_callables.pop()

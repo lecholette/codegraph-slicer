@@ -241,20 +241,39 @@ def extract_java_file(
     block_nodes: list = []
 
     imports: dict[str, str] = {}
-    local_types_defined: set[str] = set()
+    local_types_defined: dict[str, str] = {}
     pkg_scope = package or "__default_pkg__"
 
     edges.append(Edge(module, pkg_scope, "WILDCARD_IMPORT", 0))
 
-    for child in root.children:
-        if child.type in _JAVA_TYPE_NODES:
-            ident = child_of_type(child, "identifier")
+    def _collect_local_types(node, scope_parts: list[str]):
+        if node.type in _JAVA_TYPE_NODES:
+            ident = child_of_type(node, "identifier")
             if ident is not None:
                 tname = node_text(data, ident)
-                local_types_defined.add(tname)
-                sid = f"{module}:{tname}"
-                edges.append(Edge(f"{module}.{tname}", sid, "ALIAS", 0))
-                edges.append(Edge(f"{pkg_scope}.{tname}", sid, "ALIAS", 0))
+                qparts = [*scope_parts, tname]
+                qualname = ".".join(qparts)
+                sid = f"{module}:{qualname}"
+                local_types_defined[qualname] = sid
+                edges.append(Edge(f"{module}.{qualname}", sid, "ALIAS", 0))
+                edges.append(Edge(f"{pkg_scope}.{qualname}", sid, "ALIAS", 0))
+                if not scope_parts:
+                    local_types_defined[tname] = sid
+                    edges.append(Edge(f"{module}.{tname}", sid, "ALIAS", 0))
+                    edges.append(Edge(f"{pkg_scope}.{tname}", sid, "ALIAS", 0))
+                bnode = child_of_type(
+                    node, "class_body", "interface_body", "enum_body", "annotation_type_body"
+                )
+                if bnode is not None:
+                    for ch in bnode.children:
+                        if ch.type == "enum_body_declarations":
+                            for sub in ch.children:
+                                _collect_local_types(sub, qparts)
+                        else:
+                            _collect_local_types(ch, qparts)
+
+    for child in root.children:
+        _collect_local_types(child, [])
 
     for child in root.children:
         if child.type != "import_declaration":
@@ -279,11 +298,21 @@ def extract_java_file(
         if not type_name or type_name in _JAVA_BUILTINS or len(type_name) == 1 and type_name.isupper():
             return None
         if "." in type_name:
+            if type_name in local_types_defined:
+                return local_types_defined[type_name]
             head, _, tail = type_name.partition(".")
             if head in imports:
                 return f"{imports[head]}.{tail}"
+            if head in local_types_defined:
+                return f"{local_types_defined[head]}.{tail}"
             return type_name
-        if type_name in enclosing_types or type_name in local_types_defined:
+        for depth in range(len(enclosing_types), 0, -1):
+            cand = ".".join([*enclosing_types[:depth], type_name])
+            if cand in local_types_defined:
+                return local_types_defined[cand]
+        if type_name in local_types_defined:
+            return local_types_defined[type_name]
+        if type_name in enclosing_types:
             return f"{module}:{type_name}"
         if type_name in imports:
             return imports[type_name]
@@ -431,7 +460,11 @@ def extract_java_file(
         for member in member_nodes:
             if member.type in _JAVA_TYPE_NODES:
                 visit_type_decl(member, qual_parts)
-            elif member.type in {"method_declaration", "constructor_declaration"}:
+            elif member.type in {
+                "method_declaration",
+                "constructor_declaration",
+                "compact_constructor_declaration",
+            }:
                 visit_executable(
                     member,
                     sid,
@@ -468,7 +501,49 @@ def extract_java_file(
         superclass_target: str | None,
         in_test: bool,
     ):
-        for desc in scoped_descendants(root_expr, _JAVA_TYPE_NODES):
+        for desc in scoped_descendants(
+            root_expr,
+            {*_JAVA_TYPE_NODES, "lambda_expression"},
+            {"lambda_expression"},
+        ):
+            if desc.id != root_expr.id and desc.type == "lambda_expression":
+                cb_local_types = dict(local_types)
+                lparams = child_of_type(desc, "formal_parameters", "inferred_parameters")
+                if lparams is not None:
+                    for p in lparams.children:
+                        if p.type == "identifier":
+                            cb_local_types[node_text(data, p)] = "?"
+                        elif p.type in {"formal_parameter", "spread_parameter"}:
+                            ptype = child_of_type(
+                                p,
+                                "type_identifier",
+                                "scoped_type_identifier",
+                                "generic_type",
+                                "array_type",
+                            )
+                            emit_type_uses(sid, ptype, enclosing_types, in_test)
+                            pident = child_of_type(p, "identifier")
+                            base_t = _base_type_name(data, ptype)
+                            if pident is not None:
+                                cb_local_types[node_text(data, pident)] = base_t or "?"
+                else:
+                    single_p = child_of_type(desc, "identifier")
+                    if single_p is not None:
+                        cb_local_types[node_text(data, single_p)] = "?"
+                lbody = child_of_type(desc, "block") or desc.children[-1]
+                _scan_java_expressions(
+                    lbody,
+                    sid,
+                    class_sid,
+                    enclosing_types,
+                    field_types,
+                    own_methods,
+                    overload_arities,
+                    cb_local_types,
+                    superclass_target,
+                    in_test,
+                )
+                continue
             if desc.type == "local_variable_declaration":
                 ltype = child_of_type(
                     desc,

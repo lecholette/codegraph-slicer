@@ -686,8 +686,10 @@ def _recover_chained_callers(store, row, chosen, all_target_in_test, callers, ca
     )[0]["c"]
     if mcount > 3:
         return
+    target_class = row["qualname"].rpartition(".")[0]
+    target_class_sid = f"{row['module']}:{target_class}" if target_class else ""
     for related in store.rows(
-        """SELECT s.*, d.line AS call_line FROM diagnostics d
+        """SELECT s.*, d.line AS call_line, d.target AS diag_target FROM diagnostics d
            JOIN symbols s ON s.symbol_id=d.source_id
            WHERE d.kind='CALLS' AND d.target GLOB ?
            ORDER BY d.line""",
@@ -697,6 +699,27 @@ def _recover_chained_callers(store, row, chosen, all_target_in_test, callers, ca
         if csid in chosen or related["kind"] not in {"function", "async_function", "method"}:
             continue
         if not all_target_in_test and _is_test_symbol(related):
+            continue
+        diag_target = related["diag_target"]
+        if not (
+            diag_target.startswith(("?self.", "?this."))
+            or "." in diag_target.lstrip("?") and diag_target.lstrip("?").count(".") >= 2
+        ):
+            continue
+        has_type_link = bool(
+            target_class_sid
+            and store.rows(
+                "SELECT 1 FROM edges WHERE source_id IN (?, ?) AND target_id=? AND kind IN ('USES_TYPE', 'CALLS', 'INHERITS')",
+                (csid, f"{related['module']}:", target_class_sid),
+            )
+        )
+        if not has_type_link and related["module"] == row["module"]:
+            enclosing_qual = related["qualname"].rpartition(".")[0]
+            if target_class and (
+                enclosing_qual == target_class or target_class in related["body"]
+            ):
+                has_type_link = True
+        if not has_type_link:
             continue
         caller_body = related["body"].splitlines()
         idx = related["call_line"] - related["start_line"]
@@ -1079,7 +1102,8 @@ def slice_context(
         and sid not in chosen_enclosing_classes
         and not _is_enclosed_by_chosen(row)
         and not (
-            row["file_path"].endswith(".py")
+            not include_callee_bodies
+            and row["file_path"].endswith(".py")
             and row["kind"] == "method"
             and "." in row["qualname"]
             and f"{row['module']}:{row['qualname'].rpartition('.')[0]}" in (set(chosen) | set(types))

@@ -248,7 +248,13 @@ def _xml(result):
 
     if result.get("profile") == "python-call-impact-v2":
         blocks = [f'<call_impact anchor={_xml_attr(result.get("anchor", ""))} tokens="{result.get("tokens", 0)}">']
-        for caller in result.get("callers", []):
+        raw_callers = result.get("callers", [])
+        if isinstance(raw_callers, dict) and "columns" in raw_callers and "rows" in raw_callers:
+            cols = raw_callers["columns"]
+            caller_dicts = [dict(zip(cols, r)) for r in raw_callers["rows"]]
+        else:
+            caller_dicts = raw_callers if isinstance(raw_callers, list) else []
+        for caller in caller_dicts:
             blocks.append(
                 f'  <caller id={_xml_attr(caller.get("id", ""))} '
                 f'symbol={_xml_attr(caller.get("symbol", ""))} '
@@ -292,7 +298,7 @@ def _xml(result):
                 end = item.get("end_line")
                 lines_attr = f' lines="{start}-{end}"' if start and end else (f' lines="{lines_span}"' if lines_span else "")
                 blocks.append(f'    <code_slice{sym_attr}{file_attr}{lines_attr}>')
-                blocks.append(raw_text)
+                blocks.append(_saxutils.escape(raw_text))
                 blocks.append("    </code_slice>")
             blocks.append(f"  </{section_name}>")
         blocks.append("</context>")
@@ -311,7 +317,7 @@ def _xml(result):
             file_attr = f' path={_xml_attr(file_path)}' if file_path else ""
             sym_attr = f' symbol={_xml_attr(item["symbol"])}' if "symbol" in item else ""
             blocks.append(f'  <file{file_attr}{sym_attr}>')
-            blocks.append(item.get("text", "").rstrip())
+            blocks.append(_saxutils.escape(item.get("text", "").rstrip()))
             blocks.append("  </file>")
         blocks.append("</repository_map>")
         return "\n".join(blocks)

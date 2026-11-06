@@ -390,7 +390,7 @@ def _base_ts_type_name(data: bytes, node) -> str | None:
             return name
     if node.type == "array_type":
         return "Array"
-    if node.type in {"type_identifier", "nested_type_identifier", "identifier"}:
+    if node.type in {"type_identifier", "nested_type_identifier", "identifier", "predefined_type"}:
         return node_text(data, node)
     return None
 
@@ -657,8 +657,27 @@ def extract_typescript_file(
             return
         for desc in scoped_descendants(
             body_node,
-            {*_TS_TYPE_NODES, "function_declaration", "method_definition"},
+            {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES},
+            {"arrow_function", "function_expression"},
         ):
+            if desc.id != body_node.id and desc.type in {"arrow_function", "function_expression"}:
+                cb_tparams = tparams | _type_params_set(desc)
+                cb_params = child_of_type(desc, "formal_parameters") or child_of_type(desc, "identifier")
+                cb_local_types = {**local_types, **_extract_params(cb_params, owner_sid, cb_tparams)}
+                for child in desc.children:
+                    if child.type == "type_annotation":
+                        emit_type_uses(owner_sid, child, cb_tparams)
+                cb_body = child_of_type(desc, "statement_block") or desc
+                _scan_body_expressions(
+                    cb_body,
+                    owner_sid,
+                    class_sid,
+                    field_types,
+                    cb_local_types,
+                    superclass_target,
+                    cb_tparams,
+                )
+                continue
             if desc.type in {"lexical_declaration", "variable_declaration"}:
                 for decl in desc.children:
                     if decl.type != "variable_declarator":
@@ -744,10 +763,10 @@ def extract_typescript_file(
             return
         if callee.type == "identifier":
             fn_name = node_text(data, callee)
-            if (
-                fn_name in _TS_BUILTINS
-                or fn_name in _TS_GLOBAL_FUNCTIONS
-                or local_types.get(fn_name) == "__closure__"
+            if local_types.get(fn_name) == "__closure__":
+                return
+            if fn_name not in bindings and (
+                fn_name in _TS_BUILTINS or fn_name in _TS_GLOBAL_FUNCTIONS
             ):
                 return
             emit(owner_sid, resolve_ref(fn_name, local_types), "CALLS", line)
@@ -793,6 +812,10 @@ def extract_typescript_file(
                     ltype = local_types[rname]
                     if ltype == "__closure__":
                         return
+                    if ltype == "__unannotated__":
+                        if mname not in _TS_BUILTIN_PROTOTYPE_METHODS:
+                            emit(owner_sid, f"?{rname}.{mname}", "CALLS", line)
+                        return
                     if ltype and ltype != "?" and ltype not in _TS_BUILTINS:
                         emit(owner_sid, f"{resolve_ref(ltype)}.{mname}", "CALLS", line)
                         return
@@ -827,7 +850,7 @@ def extract_typescript_file(
         if params_node is None:
             return local_types
         if params_node.type == "identifier":
-            local_types[node_text(data, params_node)] = "?"
+            local_types[node_text(data, params_node)] = "__unannotated__"
             return local_types
         for param in params_node.children:
             if param.type in {"required_parameter", "optional_parameter", "rest_pattern"}:
@@ -837,7 +860,7 @@ def extract_typescript_file(
                 pident = child_of_type(param, "identifier")
                 if pident is not None:
                     pname = node_text(data, pident)
-                    local_types[pname] = base_t or "?"
+                    local_types[pname] = base_t or ("?" if tann is not None else "__unannotated__")
                     is_prop = any(
                         c.type in {"accessibility_modifier", "readonly", "override_modifier"}
                         for c in param.children
@@ -1021,7 +1044,7 @@ def extract_typescript_file(
                     )
 
     def visit_function(node, outer_node=None):
-        ident = child_of_type(node, "identifier")
+        ident = child_of_type(node, "identifier") if node.type != "arrow_function" else None
         is_def = outer_node is not None and any(c.type == "default" for c in outer_node.children)
         fbody = child_of_type(node, "statement_block")
         if ident is None and not is_def:
@@ -1130,6 +1153,7 @@ def extract_typescript_file(
         tparams = _type_params_set(node) | {tname}
         emit_type_uses(sid, node, tparams)
 
+    module_local_types: dict[str, str] = {}
     for top in root.children:
         target_node = top
         outer = None
@@ -1164,7 +1188,7 @@ def extract_typescript_file(
             visit_type_alias(target_node, outer)
         elif target_node.type == "expression_statement":
             _scan_body_expressions(
-                target_node, f"{module}:", None, {}, {}, None, set()
+                target_node, f"{module}:", None, {}, module_local_types, None, set()
             )
 
     skeleton = build_brace_skeleton(data, block_nodes)

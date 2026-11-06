@@ -463,7 +463,7 @@ def test_rsi_mutations_m1_m2_m3_m4(tmp_path, capsys):
     assert 'lines="' in xml_out
     # M1: HugeSchema is auto-skeletonized to constructor + referenced m_3 (+ omitted count)
     assert "def __init__(self, name: str):" in xml_out
-    assert "def m_3(self, x: int) -> int:" in xml_out
+    assert "def m_3(self, x: int) -&gt; int:" in xml_out
     assert "# ... (+3 more methods)" in xml_out
     assert "v_14 = x + 14" not in xml_out
     # M3: test_target filtered out of upstream_callers; prod_caller includes # L<line> snippet without docstring/sig noise

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codegraph-slicer"
-version = "0.3.1"
+version = "0.3.2"
 description = "Static Python, Java, and TypeScript/TSX code graph: repo maps, symbol slices, local flow slices and base-vs-head deltas"
 readme = "README.md"
 license = "Apache-2.0"

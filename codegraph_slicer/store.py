@@ -237,6 +237,8 @@ class GraphStore:
 
     def sync_workspace(self, root, *, include_hidden: bool = False, skip_unparseable: bool = False):
         root = Path(root).resolve(strict=True)
+        if not root.is_dir():
+            raise CodeGraphError(f"workspace root is not a directory: {root}")
         if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
             include_hidden = True
         files = {}
