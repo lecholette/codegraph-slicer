@@ -3,6 +3,7 @@
 import ast
 import json
 import difflib
+import re
 import shlex
 import textwrap
 from .ast_extractor import CodeGraphError, is_supported_source_path, is_test_path
@@ -625,6 +626,17 @@ def _first_code_line_offset(body: str) -> int:
     return 1
 
 
+_BOUNDARY_TOKENS = (".split(", ".rsplit(", ".partition(", ".rpartition(", ".strip(")
+
+
+def _caller_boundary_lines(body_lines: list[str], code_start: int, window_start: int) -> list[tuple[int, str]]:
+    return [
+        (k, body_lines[k].strip())
+        for k in range(code_start, window_start)
+        if any(tok in body_lines[k] for tok in _BOUNDARY_TOKENS)
+    ][:3]
+
+
 def _caller_item(row, call_lines):
     base = _slice_item(row, False)
     if row["end_line"] - row["start_line"] < 3 or not call_lines:
@@ -639,6 +651,10 @@ def _caller_item(row, call_lines):
         if 0 < idx < len(body_lines):
             window_start = max(code_start, idx - 5)
             window_end = min(len(body_lines) - 1, idx + 1)
+            for k, cl in _caller_boundary_lines(body_lines, code_start, window_start):
+                if k not in seen_idxs:
+                    seen_idxs.add(k)
+                    snippets.append(f"    {comment_pfx} L{row['start_line'] + k}: {cl}")
             cand = []
             for k in range(window_start, window_end + 1):
                 if k in seen_idxs:
@@ -738,10 +754,71 @@ def _first_docstring_line(body: str, preceding_lines: list[str] | None = None):
     return "\n".join(comment_lines) if comment_lines else None
 
 
-def _build_type_summaries(store, class_types, referenced_names, database, max_tokens):
+_SELF_ATTR_RE = re.compile(r"\b(?:self|this)\.([A-Za-z_]\w*)\b")
+
+
+def _extract_self_attrs(body: str) -> set[str]:
+    return set(_SELF_ATTR_RE.findall(body))
+
+
+def _extract_py_init_fields(methods: list[dict]) -> list[str]:
+    init_rows = [m for m in methods if m["qualname"].endswith(".__init__")]
+    if not init_rows:
+        return []
+    return [
+        f"        {raw.strip()}"
+        for raw in init_rows[0]["body"].splitlines()
+        if raw.strip().startswith("self.") and "=" in raw and not raw.strip().startswith("self._")
+    ][:6]
+
+
+def _is_priority_compact_method(
+    m: dict,
+    ctor_names: set[str],
+    referenced_names: set[str],
+    target_self_attrs: set[str],
+) -> bool:
+    m_short = m["qualname"].rpartition(".")[2]
+    return bool(
+        m_short in (ctor_names | referenced_names)
+        or "@property" in m["body"]
+        or (_extract_self_attrs(m["body"]) & target_self_attrs)
+    )
+
+
+def _select_compact_methods(
+    row: dict,
+    methods: list[dict],
+    ctor_names: set[str],
+    referenced_names: set[str],
+    target_self_attrs: set[str],
+) -> list[dict]:
+    public_methods = [m for m in methods if not m["signature"].lstrip().startswith("private ")]
+    candidate_methods = public_methods or methods
+    kept = [
+        m for m in candidate_methods
+        if _is_priority_compact_method(m, ctor_names, referenced_names, target_self_attrs)
+    ]
+    is_java_all = row["file_path"].endswith(".java") and len(candidate_methods) <= 18
+    fill_limit = 18 if is_java_all else 4
+    extra = [m for m in candidate_methods if m not in kept][: max(0, fill_limit - len(kept))]
+    return (kept + extra)[: (18 if is_java_all else 10)]
+
+
+def _build_type_summaries(
+    store,
+    class_types,
+    referenced_names,
+    database,
+    max_tokens,
+    target_self_attrs: set[str] | None = None,
+    enclosing_py_classes: set[str] | None = None,
+):
     summaries = {}
     compact_summaries = {}
     auto_summarize_ids = set()
+    self_attrs = target_self_attrs or set()
+    py_enclosing = enclosing_py_classes or set()
     db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
     for sid, row in class_types:
         methods = store.rows(
@@ -811,24 +888,12 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
                             compact_lines.append(f"    {sline}")
         class_short_name = row["qualname"].rsplit(".", 1)[-1]
         ctor_names = {"__init__", "__new__", "constructor", class_short_name}
-        public_methods = [
-            m for m in methods
-            if not m["signature"].lstrip().startswith("private ")
-        ]
-        candidate_methods = public_methods if public_methods else methods
-        kept_methods = [
-            m for m in candidate_methods
-            if m["qualname"].rsplit(".", 1)[-1] in (ctor_names | referenced_names)
-        ]
-        max_kept = 18 if (row["file_path"].endswith(".java") and len(candidate_methods) <= 18) else 4
-        max_cap = 18 if (row["file_path"].endswith(".java") and len(candidate_methods) <= 18) else 6
-        for m in candidate_methods:
-            if len(kept_methods) >= max_kept:
-                break
-            if m not in kept_methods:
-                kept_methods.append(m)
-        kept_methods = kept_methods[:max_cap]
-        compact_lines.extend(f"    {method['signature']}" for method in kept_methods)
+        kept_methods = _select_compact_methods(row, methods, ctor_names, referenced_names, self_attrs)
+        py_init_fields = _extract_py_init_fields(methods) if row["file_path"].endswith(".py") else []
+        for method in kept_methods:
+            compact_lines.append(f"    {method['signature']}")
+            if method["qualname"].rsplit(".", 1)[-1] == "__init__" and py_init_fields:
+                compact_lines.extend(py_init_fields)
         omitted_m = len(methods) - len(kept_methods)
         if omitted_m > 0:
             comment_pfx = _comment_prefix(row["file_path"])
@@ -843,10 +908,14 @@ def _build_type_summaries(store, class_types, referenced_names, database, max_to
             and len(non_ctor_methods) >= 1
         ):
             compact_summaries[sid] = compact_rec
-        if (len(methods) >= 5 and full_size >= 500) or (
-            row["file_path"].endswith((".java", ".ts", ".tsx"))
-            and len(non_ctor_methods) >= 1
-            and full_size >= 200
+        if (
+            (len(methods) >= 5 and full_size >= 500)
+            or (sid in py_enclosing and len(methods) >= 5)
+            or (
+                row["file_path"].endswith((".java", ".ts", ".tsx"))
+                and len(non_ctor_methods) >= 1
+                and full_size >= 200
+            )
         ):
             auto_summarize_ids.add(sid)
     return summaries, compact_summaries, auto_summarize_ids
@@ -921,10 +990,13 @@ def slice_context(
         and "." in r["qualname"]
     }
     emitted_headers: set[str] = set()
+    target_self_attrs: set[str] = set()
+    enclosing_py_classes: set[str] = set()
     for sid, row in sorted(chosen.items()):
         sections["target_implementations"].append(
             _target_item_with_preamble(store, row, chosen, max_tokens, emitted_headers)
         )
+        target_self_attrs.update(_extract_self_attrs(row["body"]))
         for token in row["body"].replace("(", " ").replace(".", " ").split():
             if token.isidentifier():
                 referenced_names.add(token)
@@ -933,6 +1005,19 @@ def slice_context(
         if row["kind"] == "method" and "." in row["qualname"]:
             enclosing_class_sid = f"{row['module']}:{row['qualname'].rpartition('.')[0]}"
             type_seeds.append(enclosing_class_sid)
+            if (
+                row["file_path"].endswith(".py")
+                and max_tokens >= 2000
+                and "self." in row["body"]
+                and enclosing_class_sid not in chosen
+            ):
+                enc_rows = store.rows(
+                    "SELECT * FROM symbols WHERE symbol_id=? AND kind='class'",
+                    (enclosing_class_sid,),
+                )
+                if enc_rows:
+                    types[enclosing_class_sid] = enc_rows[0]
+                    enclosing_py_classes.add(enclosing_class_sid)
         elif row["kind"] == "class" and row["file_path"].endswith((".java", ".ts", ".tsx")):
             for mrow in store.rows(
                 "SELECT target_id FROM edges WHERE source_id=? AND kind='DEFINES'",
@@ -1022,7 +1107,13 @@ def slice_context(
     ]
     class_types = [(sid, row) for sid, row in sorted(types.items()) if row["kind"] == "class"]
     summaries, compact_summaries, auto_summarize_ids = _build_type_summaries(
-        store, class_types, referenced_names, database, max_tokens
+        store,
+        class_types,
+        referenced_names,
+        database,
+        max_tokens,
+        target_self_attrs=target_self_attrs,
+        enclosing_py_classes=enclosing_py_classes,
     )
     totals = {name: len(items) for name, items in sections.items()}
     totals["upstream_callers"] = len(callers)

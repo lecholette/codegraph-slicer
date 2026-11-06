@@ -423,3 +423,104 @@ def test_p0_4_javadoc_tsdoc_contracts_and_compact_cross_file_callees(tmp_path):
         assert "Must preserve monotonic sequence numbers." in types_text
         assert "minSeq" in types_text
         assert "isValid" in downstream_text
+
+
+def test_v031_python_state_coupling_properties_and_dispatcher_boundary_window(tmp_path):
+    """v0.3.1: Python class summaries retain __init__ state fields, @property methods, and
+    state-coupled sibling methods (e.g. resolve_config reading self.active_versions), and
+    upstream_callers retains entry-boundary route splitting lines above deep call sites."""
+    _write_files(
+        tmp_path,
+        {
+            "pkg/service.py": (
+                "class ConfigStore:\n"
+                "    def __init__(self):\n"
+                "        self.active_versions = {}\n"
+                "        self.reviews_by_actor = {}\n"
+                "        self.resolution = None\n"
+                "\n"
+                "    def m1(self): return 1\n"
+                "    def m2(self): return 2\n"
+                "    def m3(self): return 3\n"
+                "    def m4(self): return 4\n"
+                "    def m5(self): return 5\n"
+                "\n"
+                "    @property\n"
+                "    def status(self) -> str:\n"
+                "        return self.resolution or 'open'\n"
+                "\n"
+                "    def merge_proposal(self, key: str, ver: int) -> None:\n"
+                "        self.active_versions[key] = ver\n"
+                "\n"
+                "    def resolve_config(self, key: str) -> int:\n"
+                "        return self.active_versions.get(key, 0)\n"
+                "\n"
+                "def do_post(store: ConfigStore, path: str) -> None:\n"
+                "    segments = path.strip('/').split('/')\n"
+                "    resource, sep, action = segments[-1].partition(':')\n"
+                "    x1 = 1\n"
+                "    x2 = 2\n"
+                "    x3 = 3\n"
+                "    x4 = 4\n"
+                "    x5 = 5\n"
+                "    x6 = 6\n"
+                "    if action == 'merge':\n"
+                "        store.merge_proposal(resource, x6)\n"
+            ),
+        },
+    )
+    with GraphStore(":memory:") as store:
+        store.sync_workspace(tmp_path)
+        sliced = slice_context(store, ["pkg.service:ConfigStore.merge_proposal"], max_tokens=4000)
+        types_text = "\n".join(item["text"] for item in sliced["sections"]["types_and_schemas"])
+        callers_text = "\n".join(item["text"] for item in sliced["sections"]["upstream_callers"])
+        assert "self.active_versions" in types_text
+        assert "def status(" in types_text
+        assert "def resolve_config(" in types_text
+        assert "segments = path.strip" in callers_text
+        assert "partition(':')" in callers_text
+
+    from codegraph_slicer.slicer import (
+        _caller_boundary_lines,
+        _extract_py_init_fields,
+        _is_priority_compact_method,
+        _select_compact_methods,
+    )
+
+    b_lines = ["def f():", "    a = x.split('/')", "    b = y.rsplit(':', 1)", "    c = z.partition(':')", "    d = w.strip()", "    call()"]
+    assert _caller_boundary_lines(b_lines, 1, 1) == []
+    assert _caller_boundary_lines(b_lines, 1, 5) == [
+        (1, "a = x.split('/')"),
+        (2, "b = y.rsplit(':', 1)"),
+        (3, "c = z.partition(':')"),
+    ]
+    assert _extract_py_init_fields([{"qualname": "C.other", "body": "def other(self):\n    self.x = 1"}]) == []
+    init_body = "def __init__(self):\n    self._priv = 0\n    self.a = 1\n    self.b = 2\n    self.c = 3\n    self.d = 4\n    self.e = 5\n    self.f = 6\n    self.g = 7"
+    assert _extract_py_init_fields([{"qualname": "C.__init__", "body": init_body}]) == [
+        "        self.a = 1",
+        "        self.b = 2",
+        "        self.c = 3",
+        "        self.d = 4",
+        "        self.e = 5",
+        "        self.f = 6",
+    ]
+    assert _is_priority_compact_method({"qualname": "C.foo", "body": "def foo(self): pass"}, {"__init__"}, {"foo"}, set()) is True
+    assert _is_priority_compact_method({"qualname": "C.bar", "body": "@property\ndef bar(self): pass"}, set(), set(), set()) is True
+    assert _is_priority_compact_method({"qualname": "C.baz", "body": "def baz(self): return self.state"}, set(), set(), {"state"}) is True
+    assert _is_priority_compact_method({"qualname": "C.qux", "body": "def qux(self): return self.other"}, set(), set(), {"state"}) is False
+
+    py_methods = [
+        {"qualname": f"C.m{i}", "signature": f"def m{i}(self):", "body": f"def m{i}(self): pass"}
+        for i in range(6)
+    ]
+    assert len(_select_compact_methods({"file_path": "a.py"}, py_methods, set(), {"m4"}, set())) == 4
+    assert len(_select_compact_methods({"file_path": "a.py"}, py_methods, set(), {"m0", "m1", "m2", "m3", "m4"}, set())) == 5
+    java_methods = [
+        {"qualname": f"C.m{i}", "signature": ("private void m0()" if i == 0 else f"public void m{i}()"), "body": f"void m{i}() {{}}"}
+        for i in range(19)
+    ]
+    selected_java = _select_compact_methods({"file_path": "A.java"}, java_methods, set(), set(), set())
+    assert len(selected_java) == 18
+    assert all(m["qualname"] != "C.m0" for m in selected_java)
+
+
