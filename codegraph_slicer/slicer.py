@@ -515,7 +515,6 @@ def _target_item_with_preamble(
     base = _slice_item(row, True)
     if (
         max_tokens < 2000
-        or not row["file_path"].endswith(_BRACE_LANG_EXTS)
         or row["kind"] not in {"method", "function", "async_function", "class", "type_alias"}
     ):
         return base
@@ -556,7 +555,7 @@ def _target_item_with_preamble(
                 break
         if emitted_headers is not None and header_lines:
             emitted_headers.add(file_key)
-    if row["kind"] == "method" and "." in row["qualname"]:
+    if row["kind"] == "method" and "." in row["qualname"] and row["file_path"].endswith(_BRACE_LANG_EXTS):
         class_qual = row["qualname"].rpartition(".")[0]
         class_sid = f"{row['module']}:{class_qual}"
         if class_sid in chosen:

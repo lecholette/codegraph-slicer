@@ -1164,7 +1164,10 @@ def extract_typescript_file(
                 if ctor is not None:
                     cname = node_text(data, ctor)
                     if cname not in _TS_BUILTINS and cname.split(".", 1)[0] not in _TS_BUILTINS:
-                        emit(owner_sid, resolve_ref(cname, local_types), "CALLS", start_line(desc))
+                        target_cls = resolve_ref(cname, local_types)
+                        emit(owner_sid, target_cls, "CALLS", start_line(desc))
+                        if not target_cls.startswith("?"):
+                            emit(owner_sid, target_cls, "USES_TYPE", start_line(desc))
                 targs = child_of_type(desc, "type_arguments")
                 emit_type_uses(owner_sid, targs, tparams)
             elif desc.type in {"jsx_opening_element", "jsx_self_closing_element"}:

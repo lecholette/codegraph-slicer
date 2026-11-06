@@ -1,12 +1,23 @@
 """Conservative Python syntax extraction; no runtime or inferred dispatch."""
 
 import ast
+import builtins
 import copy
 import hashlib
 import io
 import tokenize
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+
+_PY_BUILTINS = frozenset(dir(builtins)) - {
+    "__import__",
+    "eval",
+    "exec",
+    "getattr",
+    "globals",
+    "locals",
+    "vars",
+}
 
 
 class CodeGraphError(ValueError):
@@ -455,6 +466,8 @@ def extract_file(
         return "?" + ast.unparse(node)
 
     def emit(target: str, kind: str, line: int):
+        if target.startswith("?") and target[1:] in _PY_BUILTINS:
+            return
         edges.append(Edge(owner(), target, kind, line))
         if is_test and kind == "CALLS":
             edges.append(Edge(owner(), target, "TESTS", line))

@@ -1147,6 +1147,77 @@ export class PolicyValidator {{
         assert "condensed" in xml_multi
 
 
+def test_python_file_imports_builtin_diag_filter_and_js_new_uses_type(tmp_path):
+    repo = tmp_path / "mixed_repo"
+    _write(
+        repo,
+        {
+            "pkg/api.py": """def ensure_positive_int(v: int) -> int:
+    return int(v)
+
+def ensure_body_object(payload: dict) -> dict:
+    return dict(payload)
+""",
+            "pkg/server.py": """from pkg.api import ensure_positive_int
+
+def handle_request(payload: dict) -> int:
+    if isinstance(payload, dict) and len(payload) > 0:
+        missing_helper(payload)
+        return ensure_positive_int(1)
+    return 0
+""",
+            "src/archive/tar_helper.js": """export class ExistingPackSnapshot {
+  constructor(packName, checksum, members) {
+    this.packName = packName;
+    this.checksum = checksum;
+    this.members = members;
+  }
+}
+
+export class GnuTarPackHelper {
+  inspectExistingPack(tarPath) {
+    const members = [];
+    return new ExistingPackSnapshot(tarPath, "sha256:abc", members);
+  }
+}
+""",
+        },
+    )
+
+    db = tmp_path / "graph.sqlite"
+    assert main(["sync", str(repo), "--db", str(db)]) == 0
+
+    with GraphStore(db) as store:
+        # 1. Python built-ins (isinstance, len, int, dict) are filtered from CALLS diagnostics,
+        # while genuine missing imports (?missing_helper) remain in diagnostics.
+        py_diags = [
+            r["target"]
+            for r in store.rows(
+                "SELECT target FROM diagnostics WHERE source_id='pkg.server:handle_request' AND kind='CALLS'"
+            )
+        ]
+        assert py_diags == ["?missing_helper"]
+
+        # 2. Slicing a Python function includes the file's top-level import header
+        sliced_py = slice_context(
+            store,
+            ["pkg/server.py:handle_request"],
+            max_tokens=4000,
+        )
+        target_text = sliced_py["sections"]["target_implementations"][0]["text"]
+        assert "from pkg.api import ensure_positive_int" in target_text
+
+        # 3. JS method returning `new ExistingPackSnapshot(...)` emits USES_TYPE and includes ExistingPackSnapshot in types_and_schemas
+        sliced_js = slice_context(
+            store,
+            ["src/archive/tar_helper.js:GnuTarPackHelper.inspectExistingPack"],
+            max_tokens=4000,
+        )
+        type_symbols = {e["symbol"] for e in sliced_js["sections"]["types_and_schemas"]}
+        assert "archive.tar_helper:ExistingPackSnapshot" in type_symbols
+
+
+
 
 
 
