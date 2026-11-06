@@ -1158,14 +1158,17 @@ def test_python_file_imports_builtin_diag_filter_and_js_new_uses_type(tmp_path):
 def ensure_body_object(payload: dict) -> dict:
     return dict(payload)
 """,
-            "pkg/server.py": """from pkg.api import ensure_positive_int
+            "pkg/server.py": '''"""
+Multi-line module docstring header.
+"""
+from pkg.api import ensure_positive_int
 
 def handle_request(payload: dict) -> int:
     if isinstance(payload, dict) and len(payload) > 0:
         missing_helper(payload)
         return ensure_positive_int(1)
     return 0
-""",
+''',
             "src/archive/tar_helper.js": """export class ExistingPackSnapshot {
   constructor(packName, checksum, members) {
     this.packName = packName;

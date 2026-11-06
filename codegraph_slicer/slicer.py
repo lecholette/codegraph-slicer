@@ -532,9 +532,19 @@ def _target_item_with_preamble(
     emit_file_imports = emitted_headers is None or file_key not in emitted_headers
     if emit_file_imports:
         in_multiline_import = False
+        in_docstring_delim = None
         for idx in range(limit_idx):
             raw = file_lines[idx]
             stripped = raw.strip()
+            if in_docstring_delim is not None:
+                if in_docstring_delim in stripped:
+                    in_docstring_delim = None
+                continue
+            if stripped.startswith(('"""', "'''")):
+                delim = stripped[:3]
+                if stripped.count(delim) == 1:
+                    in_docstring_delim = delim
+                continue
             if in_multiline_import:
                 header_lines.append(raw)
                 header_end_line = idx + 1
@@ -551,7 +561,7 @@ def _target_item_with_preamble(
                 ):
                     in_multiline_import = True
                 continue
-            if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/", '"""', "'''")):
+            if stripped and not stripped.startswith(("#", "//", "/*", "*", "*/")):
                 break
         if emitted_headers is not None and header_lines:
             emitted_headers.add(file_key)
