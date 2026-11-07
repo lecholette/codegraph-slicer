@@ -184,6 +184,8 @@ def _extract_package(data: bytes, root) -> str | None:
 def _base_type_name(data: bytes, type_node) -> str | None:
     if type_node is None:
         return None
+    if type_node.type in {"integral_type", "floating_point_type", "boolean_type"}:
+        return node_text(data, type_node).strip()
     if type_node.type == "generic_type":
         inner = child_of_type(type_node, "type_identifier", "scoped_type_identifier")
         return node_text(data, inner) if inner is not None else None
@@ -195,6 +197,96 @@ def _base_type_name(data: bytes, type_node) -> str | None:
     if type_node.type in {"type_identifier", "scoped_type_identifier", "identifier"}:
         return node_text(data, type_node)
     return None
+
+
+_JAVA_BOXED_EQUIV = {
+    "int": {"int", "Integer", "long", "Long", "Number", "Object"},
+    "long": {"long", "Long", "Number", "Object"},
+    "double": {"double", "Double", "float", "Float", "Number", "Object"},
+    "boolean": {"boolean", "Boolean", "Object"},
+    "char": {"char", "Character", "Object"},
+    "String": {"String", "CharSequence", "Object"},
+}
+
+
+def _extract_param_types(data: bytes, m_params) -> tuple[str | None, ...]:
+    if m_params is None:
+        return ()
+    out: list[str | None] = []
+    for c in m_params.children:
+        if c.type in {"formal_parameter", "spread_parameter"}:
+            pt_node = child_of_type(
+                c,
+                "type_identifier",
+                "scoped_type_identifier",
+                "generic_type",
+                "array_type",
+                "integral_type",
+                "floating_point_type",
+                "boolean_type",
+            )
+            out.append(_base_type_name(data, pt_node))
+    return tuple(out)
+
+
+_JAVA_LITERAL_TYPES = {
+    "string_literal": "String",
+    "decimal_integer_literal": "int",
+    "hex_integer_literal": "int",
+    "octal_integer_literal": "int",
+    "binary_integer_literal": "int",
+    "decimal_floating_point_literal": "double",
+    "hex_floating_point_literal": "double",
+    "true": "boolean",
+    "false": "boolean",
+    "character_literal": "char",
+}
+
+
+def _infer_java_arg_type(
+    data: bytes, arg_node, local_types: dict[str, str], field_types: dict[str, str]
+) -> str | None:
+    lit = _JAVA_LITERAL_TYPES.get(arg_node.type)
+    if lit is not None:
+        return lit
+    if arg_node.type == "object_creation_expression":
+        tn = child_of_type(
+            arg_node, "type_identifier", "scoped_type_identifier", "generic_type"
+        )
+        return _base_type_name(data, tn)
+    if arg_node.type == "identifier":
+        name = node_text(data, arg_node)
+        return local_types.get(name) or field_types.get(name)
+    return None
+
+
+def _param_matches_arg(pt: str | None, at: str | None) -> bool:
+    if not at or not pt or at == "?":
+        return True
+    return pt == at or pt in _JAVA_BOXED_EQUIV.get(at, ())
+
+
+def _select_overload_targets(
+    mname: str,
+    arg_nodes: list,
+    class_sid: str,
+    overload_arities: dict,
+    data: bytes,
+    local_types: dict[str, str],
+    field_types: dict[str, str],
+) -> list[str]:
+    cands = overload_arities.get(mname, {}).get(len(arg_nodes), [])
+    if not cands:
+        return [f"{class_sid}.{mname}"]
+    arg_types = [
+        _infer_java_arg_type(data, a, local_types, field_types) for a in arg_nodes
+    ]
+    matched = [
+        m_sid
+        for ptypes, m_sid in cands
+        if all(_param_matches_arg(pt, at) for pt, at in zip(ptypes, arg_types))
+    ]
+    return matched or [m_sid for _, m_sid in cands]
 
 
 def _all_type_identifiers(data: bytes, node) -> list[tuple[str, int]]:
@@ -418,7 +510,7 @@ def extract_java_file(
                 member_nodes.append(member)
 
         own_methods: set[str] = set()
-        overload_arities: dict[str, dict[int, str]] = {}
+        overload_arities: dict[str, dict[int, list[tuple[tuple[str | None, ...], str]]]] = {}
         pre_counts: dict[str, int] = {}
         for member in member_nodes:
             if member.type == "method_declaration":
@@ -430,16 +522,10 @@ def extract_java_file(
                     pre_counts[m_name] = cnt
                     m_sid = f"{sid}.{m_name}" if cnt == 1 else f"{sid}.{m_name}#{cnt}"
                     m_params = child_of_type(member, "formal_parameters")
-                    arity = (
-                        sum(
-                            1
-                            for c in m_params.children
-                            if c.type in {"formal_parameter", "spread_parameter"}
-                        )
-                        if m_params is not None
-                        else 0
-                    )
-                    overload_arities.setdefault(m_name, {}).setdefault(arity, m_sid)
+                    ptypes = _extract_param_types(data, m_params)
+                    overload_arities.setdefault(m_name, {}).setdefault(
+                        len(ptypes), []
+                    ).append((ptypes, m_sid))
             elif member.type == "field_declaration":
                 ftype_node = child_of_type(
                     member,
@@ -699,10 +785,10 @@ def extract_java_file(
     ):
         line = start_line(call_node)
         arg_list = child_of_type(call_node, "argument_list")
-        arg_count = (
-            sum(1 for c in arg_list.children if c.type not in {"(", ")", ","})
+        arg_nodes = (
+            [c for c in arg_list.children if c.type not in {"(", ")", ","}]
             if arg_list is not None
-            else 0
+            else []
         )
         non_arg_children = [
             c
@@ -715,13 +801,22 @@ def extract_java_file(
         if callee_ident.type != "identifier":
             return
         mname = node_text(data, callee_ident)
-        own_target = overload_arities.get(mname, {}).get(arg_count, f"{class_sid}.{mname}")
+        own_targets = _select_overload_targets(
+            mname,
+            arg_nodes,
+            class_sid,
+            overload_arities,
+            data,
+            local_types,
+            field_types,
+        )
 
         if len(non_arg_children) == 1:
             if mname in imports:
                 emit(sid, imports[mname], "CALLS", line, in_test)
             elif mname in own_methods:
-                emit(sid, own_target, "CALLS", line, in_test)
+                for ot in own_targets:
+                    emit(sid, ot, "CALLS", line, in_test)
             elif superclass_target:
                 emit(sid, f"{superclass_target}.{mname}", "CALLS", line, in_test)
             else:
@@ -730,7 +825,8 @@ def extract_java_file(
 
         receiver = non_arg_children[0]
         if receiver.type == "this":
-            emit(sid, own_target, "CALLS", line, in_test)
+            for ot in own_targets:
+                emit(sid, ot, "CALLS", line, in_test)
             return
         if receiver.type == "super":
             if superclass_target:

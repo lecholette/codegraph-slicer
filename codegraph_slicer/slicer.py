@@ -1,9 +1,11 @@
 """Bounded contexts and output budget estimates."""
 
 import ast
+import contextlib
 import difflib
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -912,6 +914,30 @@ def _extract_py_init_fields(methods: list[dict]) -> list[str]:
     ][:6]
 
 
+def _is_public_class_field_stmt(stmt: ast.stmt) -> bool:
+    if isinstance(stmt, ast.AnnAssign):
+        return isinstance(stmt.target, ast.Name) and not stmt.target.id.startswith("_")
+    if isinstance(stmt, ast.Assign) and stmt.targets:
+        return all(
+            isinstance(t, ast.Name) and not t.id.startswith("_") for t in stmt.targets
+        )
+    return False
+
+
+def _extract_py_class_fields(row: dict) -> list[str]:
+    try:
+        mod = ast.parse(textwrap.dedent(row["body"]))
+    except SyntaxError:
+        return []
+    if not mod.body or not isinstance(mod.body[0], ast.ClassDef):
+        return []
+    return [
+        f"    {ast.unparse(stmt)}"
+        for stmt in mod.body[0].body
+        if _is_public_class_field_stmt(stmt)
+    ][:12]
+
+
 def _is_priority_compact_method(
     m: dict,
     ctor_names: set[str],
@@ -1013,9 +1039,13 @@ def _build_type_summaries(
             else None
         )
         doc_line = _first_docstring_line(row["body"], preceding)
+        py_class_fields = (
+            _extract_py_class_fields(row) if row["file_path"].endswith(".py") else []
+        )
         lines = [row["signature"]]
         if doc_line:
             lines.append(doc_line)
+        lines.extend(py_class_fields)
         for method in methods:
             lines.append(f"{method['file_path']}:{method['start_line']}-{method['end_line']} {method['signature']}")
             method_doc = _first_docstring_line(method["body"])
@@ -1033,6 +1063,7 @@ def _build_type_summaries(
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
+        compact_lines.extend(py_class_fields)
         nested_classes = (
             store.rows(
                 """SELECT * FROM symbols WHERE file_path=? AND kind='class'
@@ -1165,22 +1196,47 @@ def _compact_cached_entry(entry: dict) -> dict:
     return {"symbol": entry["symbol"], "text": f"{head} // [cached in earlier slice]"}
 
 
-def _apply_session_dedup(sections: dict, database) -> set[str]:
-    if not database or str(database) == ":memory:":
-        return set()
+def _session_scope_key(dedup_session) -> str:
+    if isinstance(dedup_session, str) and dedup_session.strip():
+        return dedup_session.strip()
+    return os.environ.get("CODEGRAPH_DEDUP_SESSION", "").strip() or "default"
+
+
+def _parse_session_cache_file(cache_path: Path) -> dict[str, dict[str, str]]:
+    if not cache_path.is_file():
+        return {}
+    try:
+        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return {
+        str(k): {str(sk): str(sv) for sk, sv in v.items()}
+        for k, v in loaded.items()
+        if isinstance(v, dict)
+    }
+
+
+def _read_session_dedup(
+    database, dedup_session
+) -> tuple[Path | None, str, dict[str, dict[str, str]]]:
+    if not dedup_session or not database or str(database) == ":memory:":
+        return None, "", {}
     cache_path = Path(f"{database}.session.json")
-    seen: dict[str, str] = {}
-    if cache_path.is_file():
-        try:
-            seen = json.loads(cache_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            seen = {}
+    scope = _session_scope_key(dedup_session)
+    return cache_path, scope, _parse_session_cache_file(cache_path)
+
+
+def _stage_session_dedup(
+    sections: dict, base_seen: dict[str, str]
+) -> tuple[set[str], dict[str, str]]:
+    seen = dict(base_seen)
     deduped: set[str] = set()
     for sec in ("types_and_schemas", "upstream_callers", "downstream_dependencies"):
         updated = []
         for entry in sections[sec]:
-            head_key = "\n".join(entry["text"].splitlines()[:2])
-            digest = hashlib.sha256(head_key.encode("utf-8")).hexdigest()
+            digest = hashlib.sha256(entry["text"].encode("utf-8")).hexdigest()
             if seen.get(entry["symbol"]) == digest:
                 updated.append(_compact_cached_entry(entry))
                 deduped.add(entry["symbol"])
@@ -1188,10 +1244,36 @@ def _apply_session_dedup(sections: dict, database) -> set[str]:
                 seen[entry["symbol"]] = digest
                 updated.append(entry)
         sections[sec] = updated
+    return deduped, seen
+
+
+def _commit_session_dedup(
+    cache_path: Path | None,
+    scope: str,
+    all_sessions: dict[str, dict[str, str]],
+    updated_seen: dict[str, str],
+) -> None:
+    if cache_path is None:
+        return
+    merged = dict(all_sessions)
+    merged[scope] = updated_seen
+    tmp_path = cache_path.with_suffix(f".json.tmp.{os.getpid()}")
     try:
-        cache_path.write_text(json.dumps(seen), encoding="utf-8")
+        tmp_path.write_text(json.dumps(merged), encoding="utf-8")
+        os.replace(tmp_path, cache_path)
     except OSError:
-        pass
+        with contextlib.suppress(OSError):
+            tmp_path.unlink(missing_ok=True)
+
+
+def _apply_session_dedup(sections: dict, database, dedup_session=True) -> set[str]:
+    cache_path, scope, all_sessions = _read_session_dedup(database, dedup_session)
+    if cache_path is None:
+        return set()
+    deduped, updated_seen = _stage_session_dedup(
+        sections, all_sessions.get(scope, {})
+    )
+    _commit_session_dedup(cache_path, scope, all_sessions, updated_seen)
     return deduped
 
 
@@ -1243,11 +1325,21 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
     return required
 
 
-def _resolve_anchor_batch(store, anchors):
-    if len(anchors) == 1:
-        row = _anchor(store, anchors[0])
-        return {row["symbol_id"]: row}
+def _resolve_batch_method_fallback(store, anchor_str: str) -> dict | None:
+    mod_part, sep, qual_part = anchor_str.rpartition(":")
+    if not sep or "." not in qual_part:
+        return None
+    _, _, m_short = qual_part.rpartition(".")
+    m_rows = store.rows(
+        "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='method' AND qualname GLOB ? ORDER BY start_line, symbol_id",
+        (mod_part, mod_part, f"*.{m_short}"),
+    )
+    return m_rows[0] if len(m_rows) == 1 else None
+
+
+def _resolve_anchor_batch_with_status(store, anchors) -> tuple[dict, list[str]]:
     chosen = {}
+    unresolved: list[str] = []
     first_err = None
     for a in anchors:
         try:
@@ -1256,16 +1348,18 @@ def _resolve_anchor_batch(store, anchors):
         except AnchorNotFoundError as exc:
             if first_err is None:
                 first_err = exc
-            mod_part, sep, _ = a.rpartition(":")
-            if sep:
-                cls_rows = store.rows(
-                    "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='class' ORDER BY start_line, symbol_id",
-                    (mod_part, mod_part),
-                )
-                if len(cls_rows) == 1:
-                    chosen[cls_rows[0]["symbol_id"]] = cls_rows[0]
+            fb = len(anchors) > 1 and _resolve_batch_method_fallback(store, a)
+            if fb:
+                chosen[fb["symbol_id"]] = fb
+            else:
+                unresolved.append(a)
     if not chosen and first_err is not None:
         raise first_err
+    return chosen, unresolved
+
+
+def _resolve_anchor_batch(store, anchors) -> dict:
+    chosen, _ = _resolve_anchor_batch_with_status(store, anchors)
     return chosen
 
 
@@ -1281,7 +1375,31 @@ def slice_context(
         raise InvalidBudgetError("max_tokens must be a positive integer")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
-    chosen = _resolve_anchor_batch(store, anchors)
+    with store.read_snapshot():
+        return _slice_context_in_snapshot(
+            store,
+            anchors,
+            max_tokens=max_tokens,
+            include_callee_bodies=include_callee_bodies,
+            render_estimator=render_estimator,
+            database=database,
+            target_mode=target_mode,
+            dedup_session=dedup_session,
+        )
+
+
+def _slice_context_in_snapshot(
+    store,
+    anchors,
+    *,
+    max_tokens=8000,
+    include_callee_bodies=False,
+    render_estimator=None,
+    database=None,
+    target_mode="full",
+    dedup_session=False,
+):
+    chosen, unresolved_anchors = _resolve_anchor_batch_with_status(store, anchors)
     sections = {
         name: []
         for name in (
@@ -1438,17 +1556,19 @@ def slice_context(
     from .pagerank import rank
 
     scores = rank(store, seed_symbols=tuple(chosen))
-    if len(chosen) > 1 and callees and len(callers) > 4:
-        top_caller_ids = sorted(callers, key=lambda s: (-scores.get(s, 0), s))[:4]
-        callers = {sid: callers[sid] for sid in top_caller_ids}
     totals = {name: len(items) for name, items in sections.items()}
     totals["upstream_callers"] = len(callers)
     totals["downstream_dependencies"] = len(callees)
+    if len(chosen) > 1 and callees and len(callers) > 4:
+        top_caller_ids = sorted(callers, key=lambda s: (-scores.get(s, 0), s))[:4]
+        callers = {sid: callers[sid] for sid in top_caller_ids}
     body_fallbacks = {}
     omitted_detail_limit = None
 
     def result():
         payload = {"tokens": 0, "sections": sections}
+        if unresolved_anchors:
+            payload["unresolved_anchors"] = list(unresolved_anchors)
         dropped = {
             name: totals[name] - len(items)
             for name, items in sections.items()
@@ -1540,10 +1660,16 @@ def slice_context(
                     candidates[sid]
                 )
                 sections[name].append(_callee_item(candidates[sid], full))
-    deduped_ids = _apply_session_dedup(sections, database) if dedup_session else set()
+    pre_dedup_types = list(sections["types_and_schemas"])
+    cache_path, sess_scope, all_sessions = _read_session_dedup(database, dedup_session)
+    base_seen = all_sessions.get(sess_scope, {})
+    deduped_ids, staged_seen = (
+        _stage_session_dedup(sections, base_seen) if cache_path is not None else (set(), {})
+    )
     auto_summarize_ids.update(deduped_ids)
     complete = result()
     if complete["tokens"] <= max_tokens:
+        _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
         return complete
     for sid, summary in summaries.items():
         if sid in auto_summarize_ids:
@@ -1562,14 +1688,14 @@ def slice_context(
                 for entry in sections["types_and_schemas"]
             ]
     if complete["tokens"] <= max_tokens:
+        _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
         return complete
+    sections["types_and_schemas"] = list(pre_dedup_types)
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
     required = result()
     if required["tokens"] > max_tokens and compact_summaries:
         for sid, c_summary in compact_summaries.items():
-            if sid in deduped_ids:
-                continue
             sections["types_and_schemas"] = [
                 c_summary if entry["symbol"] == sid else entry
                 for entry in sections["types_and_schemas"]
@@ -1616,11 +1742,13 @@ def slice_context(
                     if result()["tokens"] > max_tokens:
                         sections[name].pop()
                         body_fallbacks.pop(sid)
-    if dedup_session:
-        _apply_session_dedup(sections, database)
+    _, final_seen = (
+        _stage_session_dedup(sections, base_seen) if cache_path is not None else (set(), {})
+    )
     final = result()
     if final["tokens"] > max_tokens:
         raise RequiredAnchorOverflow(
             f"required definitions need {final['tokens']} tokens including omission metadata, budget is {max_tokens}"
         )
+    _commit_session_dedup(cache_path, sess_scope, all_sessions, final_seen)
     return final

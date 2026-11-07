@@ -1,6 +1,7 @@
 """Transactional index, retaining raw references for rebinding across snapshots."""
 
 from collections import defaultdict
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -246,6 +247,19 @@ class GraphStore:
 
     def close(self):
         self.db.close()
+
+    @contextlib.contextmanager
+    def read_snapshot(self):
+        if self.db.in_transaction:
+            yield
+            return
+        self.db.execute("BEGIN DEFERRED")
+        try:
+            self.db.execute("SELECT 1 FROM metadata LIMIT 1").fetchall()
+            yield
+        finally:
+            if self.db.in_transaction:
+                self.db.rollback()
 
     def sync_workspace(self, root, *, include_hidden: bool = False, skip_unparseable: bool = False):
         root = Path(root).resolve(strict=True)

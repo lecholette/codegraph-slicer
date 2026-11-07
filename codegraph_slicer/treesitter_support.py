@@ -135,28 +135,49 @@ def binary_logic(node, operators=("&&", "||")) -> bool:
 
 
 def _is_private_skeleton_line(line: str) -> bool:
-    s = line.lstrip()
-    return "{ ... }" in s and s.startswith(
-        ("private ", "#", "_", "async _", "static _")
+    s = line.strip()
+    return (
+        s.endswith("{ ... }")
+        and s.count("{ ... }") == 1
+        and s.startswith(("private ", "#", "_", "async _", "static _"))
     )
+
+
+def _is_class_boundary_line(line: str) -> bool:
+    s = line.strip()
+    return s.endswith("{") and any(
+        tok in s for tok in ("class ", "interface ", "enum ", "record ")
+    )
+
+
+def _group_private_lines_by_class(lines: list[str]) -> list[list[int]]:
+    groups: list[list[int]] = [[]]
+    for i, ln in enumerate(lines):
+        if _is_class_boundary_line(ln) and groups[-1]:
+            groups.append([])
+        if _is_private_skeleton_line(ln):
+            groups[-1].append(i)
+    return groups
 
 
 def _fold_brace_private_methods(text: str) -> str:
     lines = text.splitlines()
-    priv_idxs = [i for i, ln in enumerate(lines) if _is_private_skeleton_line(ln)]
-    if len(priv_idxs) <= 3:
+    drop_set: set[int] = set()
+    kept_tail_counts: dict[int, int] = {}
+    for g in _group_private_lines_by_class(lines):
+        for idx in g[3:]:
+            drop_set.add(idx)
+            kept_tail_counts[g[2]] = len(g) - 3
+    if not drop_set:
         return text
-    omitted = len(priv_idxs) - 3
-    drop_set = set(priv_idxs[3:])
-    last_kept = priv_idxs[2]
-    indent = lines[last_kept][: len(lines[last_kept]) - len(lines[last_kept].lstrip())]
     out_lines: list[str] = []
     for i, ln in enumerate(lines):
         if i in drop_set:
             continue
         out_lines.append(ln)
-        if i == last_kept:
-            out_lines.append(f"{indent}// ... (+{omitted} private methods)")
+        if i in kept_tail_counts:
+            indent = ln[: len(ln) - len(ln.lstrip())]
+            out_lines.append(f"{indent}// ... (+{kept_tail_counts[i]} private methods)")
     return "\n".join(out_lines) + "\n"
 
 

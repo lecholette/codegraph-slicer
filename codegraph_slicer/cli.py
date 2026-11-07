@@ -216,6 +216,17 @@ def _xml(result):
                 f'line={_xml_attr(edge.get("line", ""))} />'
             )
         blocks.append("  </edges>")
+        if result.get("diagnostics"):
+            blocks.append("  <diagnostics>")
+            for diag in result["diagnostics"]:
+                blocks.append(
+                    f'    <diagnostic source={_xml_attr(diag.get("source", ""))} '
+                    f'target={_xml_attr(diag.get("target", ""))} '
+                    f'kind={_xml_attr(diag.get("kind", ""))} '
+                    f'line={_xml_attr(diag.get("line", ""))} '
+                    f'reason={_xml_attr(diag.get("reason", ""))} />'
+                )
+            blocks.append("  </diagnostics>")
         if result.get("omitted"):
             blocks.append("  <omitted>")
             for k, v in result["omitted"].items():
@@ -326,7 +337,7 @@ def _xml(result):
         blocks.append("</repository_map>")
         return "\n".join(blocks)
 
-    return f"<codegraph_report>\n{json.dumps(result, indent=2)}\n</codegraph_report>"
+    return f"<codegraph_report>\n{_saxutils.escape(json.dumps(result, indent=2))}\n</codegraph_report>"
 
 
 def _render_budget_estimator(output_format, markdown_est=None):
@@ -594,7 +605,7 @@ def main(argv=None):
     slicing.add_argument("--include-imports", action="store_true", help="include module and import hops in an outline")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
     slicing.add_argument("--target-mode", choices=("full", "skeleton"), default="full", help="target implementation detail level (default: full)")
-    slicing.add_argument("--dedup-session", action="store_true", help="compact repeated types and callers across slice calls on the same snapshot")
+    slicing.add_argument("--dedup-session", nargs="?", const="default", default=False, help="compact repeated types and callers across slice calls in the same session")
     impact = sub.add_parser(
         "impact",
         help="find bounded transitive callers over resolved call edges",
