@@ -1130,7 +1130,8 @@ def _build_type_summaries(
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
-        compact_lines.extend(py_class_fields)
+        if len(py_class_fields) <= 4:
+            compact_lines.extend(py_class_fields)
         nested_classes = (
             store.rows(
                 """SELECT * FROM symbols WHERE file_path=? AND kind='class'
