@@ -390,7 +390,7 @@ def _classify_scale(files: int, loc: int, languages: list[str], skipped: object)
     return "graph_optional", False, [], "graph_candidate"
 
 
-def _scale_recommendation(store):
+def _scale_recommendation(store: GraphStore):
     rows = store.rows("SELECT path,loc FROM files")
     production = [row for row in rows if not is_test_path(row["path"])]
     skipped_row = store.db.execute(

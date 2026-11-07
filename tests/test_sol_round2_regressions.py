@@ -327,4 +327,32 @@ def test_rrsi_stage1_js_ts_di_union_and_monorepo_aliases():
         assert ("packages.web.src.app:boot", "packages.web.src.store:useStore", "CALLS") in edges
 
 
+def test_rrsi_stage2_python_context_manager_type_inference():
+    with workspace(
+        {
+            "ctx.py": (
+                "from contextlib import ExitStack\n"
+                "class Store:\n"
+                "    def __enter__(self):\n"
+                "        return self\n"
+                "    def __exit__(self, *a):\n"
+                "        pass\n"
+                "    def query(self) -> int:\n"
+                "        return 1\n"
+                "    def sync(self) -> int:\n"
+                "        return 2\n"
+                "def run(stack: ExitStack):\n"
+                "    with Store() as st:\n"
+                "        st.query()\n"
+                "    st2 = stack.enter_context(Store())\n"
+                "    return st2.sync()\n"
+            ),
+        }
+    ) as (store, _, _):
+        edges = {(r["source_id"], r["target_id"], r["kind"]) for r in store.rows("SELECT * FROM edges")}
+        assert ("ctx:run", "ctx:Store.query", "CALLS") in edges
+        assert ("ctx:run", "ctx:Store.sync", "CALLS") in edges
+
+
+
 

@@ -898,6 +898,38 @@ def extract_file(
             frame_local_deferred_ret.append(local_deferred_ret)
             frame_local_callables.append(local_callables)
             if not is_class:
+                def _bind_call_value_types(call_expr: ast.Call, target_names: list[str]) -> None:
+                    ret_types: list[str] = []
+                    ret_elem_types: list[str] = []
+                    deferred_refs: list[str] = []
+                    for cref in _call_targets(call_expr.func):
+                        if cref in func_returns:
+                            ret_types.extend(func_returns[cref])
+                        elif not cref.startswith("?") and (
+                            cref in local_class_sids
+                            or cref.rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("|", 1)[-1][:1].isupper()
+                        ):
+                            ret_types.append(cref)
+                        elif not cref.startswith("?") and cref not in local_function_sids:
+                            deferred_refs.append(cref)
+                        if cref in func_elem_returns:
+                            ret_elem_types.extend(func_elem_returns[cref])
+                    if ret_types:
+                        dedup_rt = tuple(dict.fromkeys(ret_types))
+                        for vname in target_names:
+                            prev_rt = local_types.get(vname, ())
+                            local_types[vname] = tuple(dict.fromkeys([*prev_rt, *dedup_rt]))
+                    elif deferred_refs:
+                        dedup_dr = tuple(dict.fromkeys(deferred_refs))
+                        for vname in target_names:
+                            prev_dr = local_deferred_ret.get(vname, ())
+                            local_deferred_ret[vname] = tuple(dict.fromkeys([*prev_dr, *dedup_dr]))
+                    if ret_elem_types:
+                        dedup_re = tuple(dict.fromkeys(ret_elem_types))
+                        for vname in target_names:
+                            prev_re = local_elem_types.get(vname, ())
+                            local_elem_types[vname] = tuple(dict.fromkeys([*prev_re, *dedup_re]))
+
                 for stmt in branches(node):
                     if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
                         vname = stmt.target.id
@@ -936,36 +968,19 @@ def extract_file(
                                         prev_ut = local_types.get(vname, ())
                                         local_types[vname] = tuple(dict.fromkeys([*prev_ut, *unpack_types]))
                             else:
-                                ret_types: list[str] = []
-                                ret_elem_types: list[str] = []
-                                deferred_refs: list[str] = []
-                                for cref in _call_targets(stmt.value.func):
-                                    if cref in func_returns:
-                                        ret_types.extend(func_returns[cref])
-                                    elif not cref.startswith("?") and (
-                                        cref in local_class_sids
-                                        or cref.rsplit(".", 1)[-1].rsplit(":", 1)[-1].rsplit("|", 1)[-1][:1].isupper()
-                                    ):
-                                        ret_types.append(cref)
-                                    elif not cref.startswith("?") and cref not in local_function_sids:
-                                        deferred_refs.append(cref)
-                                    if cref in func_elem_returns:
-                                        ret_elem_types.extend(func_elem_returns[cref])
-                                if ret_types:
-                                    dedup_rt = tuple(dict.fromkeys(ret_types))
-                                    for vname in target_names:
-                                        prev_rt = local_types.get(vname, ())
-                                        local_types[vname] = tuple(dict.fromkeys([*prev_rt, *dedup_rt]))
-                                elif deferred_refs:
-                                    dedup_dr = tuple(dict.fromkeys(deferred_refs))
-                                    for vname in target_names:
-                                        prev_dr = local_deferred_ret.get(vname, ())
-                                        local_deferred_ret[vname] = tuple(dict.fromkeys([*prev_dr, *dedup_dr]))
-                                if ret_elem_types:
-                                    dedup_re = tuple(dict.fromkeys(ret_elem_types))
-                                    for vname in target_names:
-                                        prev_re = local_elem_types.get(vname, ())
-                                        local_elem_types[vname] = tuple(dict.fromkeys([*prev_re, *dedup_re]))
+                                inner_call = (
+                                    stmt.value.args[0]
+                                    if isinstance(stmt.value.func, ast.Attribute)
+                                    and stmt.value.func.attr in {"enter_context", "enter_async_context"}
+                                    and stmt.value.args
+                                    and isinstance(stmt.value.args[0], ast.Call)
+                                    else stmt.value
+                                )
+                                _bind_call_value_types(inner_call, target_names)
+                    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                        for witem in stmt.items:
+                            if isinstance(witem.optional_vars, ast.Name) and isinstance(witem.context_expr, ast.Call):
+                                _bind_call_value_types(witem.context_expr, [witem.optional_vars.id])
                     elif isinstance(stmt, (ast.For, ast.AsyncFor)):
                         iter_types = list(_expr_elem_types(stmt.iter))
                         if iter_types:
