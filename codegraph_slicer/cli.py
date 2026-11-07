@@ -194,6 +194,10 @@ def _xml_attr(val):
 
 
 def _xml(result):
+    return render_xml_report(result)
+
+
+def render_xml_report(result):
     if "schema_version" in result and "entities" in result and "edges" in result:
         blocks = [f'<slice_outline schema_version="{result["schema_version"]}" tokens="{result.get("tokens", 0)}">']
         blocks.append("  <entities>")
@@ -227,6 +231,11 @@ def _xml(result):
                     f'reason={_xml_attr(diag.get("reason", ""))} />'
                 )
             blocks.append("  </diagnostics>")
+        if result.get("diagnostic_counts"):
+            blocks.append("  <diagnostic_counts>")
+            for src, cnt in result["diagnostic_counts"].items():
+                blocks.append(f'    <source symbol={_xml_attr(src)} count="{cnt}" />')
+            blocks.append("  </diagnostic_counts>")
         if result.get("omitted"):
             blocks.append("  <omitted>")
             for k, v in result["omitted"].items():
@@ -262,7 +271,12 @@ def _xml(result):
         return "\n".join(blocks)
 
     if result.get("profile") == "python-call-impact-v2":
-        blocks = [f'<call_impact anchor={_xml_attr(result.get("anchor", ""))} tokens="{result.get("tokens", 0)}">']
+        blocks = [
+            f'<call_impact anchor={_xml_attr(result.get("anchor", ""))} '
+            f'tokens="{result.get("tokens", 0)}" '
+            f'unknown_boundary_count="{result.get("unknown_boundary_count", 0)}" '
+            f'truncated="{str(bool(result.get("truncated", False))).lower()}">'
+        ]
         raw_callers = result.get("callers", [])
         if isinstance(raw_callers, dict) and "columns" in raw_callers and "rows" in raw_callers:
             cols = raw_callers["columns"]
@@ -282,6 +296,11 @@ def _xml(result):
 
     if "sections" in result:
         blocks = [f'<context tokens="{result.get("tokens", 0)}">']
+        if result.get("unresolved_anchors"):
+            blocks.append("  <unresolved_anchors>")
+            for anchor in result["unresolved_anchors"]:
+                blocks.append(f"    <anchor name={_xml_attr(anchor)} />")
+            blocks.append("  </unresolved_anchors>")
         if "omitted" in result:
             blocks.append("  <omitted>")
             for k, v in result["omitted"].items():
@@ -349,6 +368,10 @@ def _render_budget_estimator(output_format, markdown_est=None):
 
 
 def _markdown(result):
+    return render_markdown_report(result)
+
+
+def render_markdown_report(result):
     if "schema_version" in result and "entities" in result and "edges" in result:
         blocks = [f"# Slice outline (schema v{result['schema_version']})"]
         blocks.append(f"Estimated context tokens: {result['tokens']}")
@@ -400,11 +423,7 @@ def _markdown(result):
             )
         for name, records in result.get("omitted", {}).items():
             blocks.append(f"## Omitted {name}")
-            blocks.extend(
-                f"- `{item['path']}`{(' ' + item['name']) if 'name' in item else ''}: "
-                f"rerun with --max-tokens {item['max_tokens']}"
-                for item in records
-            )
+            blocks.append(f"- {name}: {records}")
         return "\n\n".join(blocks)
     if result.get("schema") == "python-delta-v2":
         blocks = ["# Static delta report (python-delta-v2)"]
@@ -502,6 +521,11 @@ def _markdown(result):
         )
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
+        if result.get("unresolved_anchors"):
+            blocks.append(
+                "## unresolved anchors\n\n"
+                + "\n".join(f"- `{a}`" for a in result["unresolved_anchors"])
+            )
         omission_blocks = []
         if "omitted" in result:
             omission_blocks.extend(
@@ -530,7 +554,7 @@ def _markdown(result):
         if "omitted" in result:
             mapped["omitted"] = result["omitted"]
             mapped["retrieve_details"] = result["retrieve_details"]
-        return _markdown(mapped)
+        return render_markdown_report(mapped)
     return (
         "# Code graph report\n\n```json\n"
         + json.dumps(result, ensure_ascii=False, indent=2)
@@ -605,7 +629,8 @@ def main(argv=None):
     slicing.add_argument("--include-imports", action="store_true", help="include module and import hops in an outline")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
     slicing.add_argument("--target-mode", choices=("full", "skeleton"), default="full", help="target implementation detail level (default: full)")
-    slicing.add_argument("--dedup-session", nargs="?", const="default", default=False, help="compact repeated types and callers across slice calls in the same session")
+    slicing.add_argument("--dedup-session", action="store_true", help="compact repeated types and callers across slice calls in the same session")
+    slicing.add_argument("--dedup-session-id", default=None, help="explicit session identifier for --dedup-session")
     impact = sub.add_parser(
         "impact",
         help="find bounded transitive callers over resolved call edges",
@@ -730,6 +755,8 @@ def main(argv=None):
                 opening_db_path = str(Path(args.db).resolve())
                 store = stack.enter_context(GraphStore(args.db, readonly=args.cmd != "sync"))
                 opening_db = False
+                if args.cmd != "sync":
+                    stack.enter_context(store.read_snapshot())
                 if args.cmd == "sync":
                     result = (
                         store.sync_git_tree(args.root, args.revision, skip_unparseable=args.skip_unparseable)
@@ -805,7 +832,7 @@ def main(argv=None):
                             database=args.db,
                             render_estimator=_render_budget_estimator(args.format),
                             target_mode=args.target_mode,
-                            dedup_session=args.dedup_session,
+                            dedup_session=args.dedup_session_id or args.dedup_session,
                         )
         if args.format == "markdown":
             rendered = _markdown(result)

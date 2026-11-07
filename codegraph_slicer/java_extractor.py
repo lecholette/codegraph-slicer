@@ -200,13 +200,31 @@ def _base_type_name(data: bytes, type_node) -> str | None:
 
 
 _JAVA_BOXED_EQUIV = {
-    "int": {"int", "Integer", "long", "Long", "Number", "Object"},
-    "long": {"long", "Long", "Number", "Object"},
-    "double": {"double", "Double", "float", "Float", "Number", "Object"},
+    "int": {"int", "Integer"},
+    "long": {"long", "Long"},
+    "double": {"double", "Double"},
+    "float": {"float", "Float"},
     "boolean": {"boolean", "Boolean", "Object"},
     "char": {"char", "Character", "Object"},
     "String": {"String", "CharSequence", "Object"},
 }
+
+_JAVA_WIDENING_EQUIV = {
+    "int": {"long", "float", "double", "Number", "Object"},
+    "long": {"float", "double", "Number", "Object"},
+    "float": {"double", "Number", "Object"},
+    "double": {"Number", "Object"},
+}
+
+
+def _extract_call_args(arg_list) -> list:
+    if arg_list is None:
+        return []
+    return [
+        c
+        for c in arg_list.children
+        if c.type not in {"(", ")", ",", "line_comment", "block_comment"}
+    ]
 
 
 def _extract_param_types(data: bytes, m_params) -> tuple[str | None, ...]:
@@ -225,18 +243,25 @@ def _extract_param_types(data: bytes, m_params) -> tuple[str | None, ...]:
                 "floating_point_type",
                 "boolean_type",
             )
-            out.append(_base_type_name(data, pt_node))
+            base = _base_type_name(data, pt_node)
+            if c.type == "spread_parameter" and base is not None:
+                base = f"{base}..."
+            out.append(base)
     return tuple(out)
 
 
+_JAVA_INT_LITERALS = {
+    "decimal_integer_literal",
+    "hex_integer_literal",
+    "octal_integer_literal",
+    "binary_integer_literal",
+}
+_JAVA_FLOAT_LITERALS = {
+    "decimal_floating_point_literal",
+    "hex_floating_point_literal",
+}
 _JAVA_LITERAL_TYPES = {
     "string_literal": "String",
-    "decimal_integer_literal": "int",
-    "hex_integer_literal": "int",
-    "octal_integer_literal": "int",
-    "binary_integer_literal": "int",
-    "decimal_floating_point_literal": "double",
-    "hex_floating_point_literal": "double",
     "true": "boolean",
     "false": "boolean",
     "character_literal": "char",
@@ -246,6 +271,12 @@ _JAVA_LITERAL_TYPES = {
 def _infer_java_arg_type(
     data: bytes, arg_node, local_types: dict[str, str], field_types: dict[str, str]
 ) -> str | None:
+    if arg_node.type in _JAVA_INT_LITERALS:
+        txt = node_text(data, arg_node).strip()
+        return "long" if txt.endswith(("L", "l")) else "int"
+    if arg_node.type in _JAVA_FLOAT_LITERALS:
+        txt = node_text(data, arg_node).strip()
+        return "float" if txt.endswith(("F", "f")) else "double"
     lit = _JAVA_LITERAL_TYPES.get(arg_node.type)
     if lit is not None:
         return lit
@@ -260,10 +291,33 @@ def _infer_java_arg_type(
     return None
 
 
-def _param_matches_arg(pt: str | None, at: str | None) -> bool:
+def _param_matches_arg(pt: str | None, at: str | None, allow_widening: bool = False) -> bool:
     if not at or not pt or at == "?":
         return True
-    return pt == at or pt in _JAVA_BOXED_EQUIV.get(at, ())
+    if pt == at or pt in _JAVA_BOXED_EQUIV.get(at, ()):
+        return True
+    return allow_widening and pt in _JAVA_WIDENING_EQUIV.get(at, ())
+
+
+def _is_varargs_param_tuple(ptypes: tuple[str | None, ...]) -> bool:
+    return bool(ptypes and ptypes[-1] and ptypes[-1].endswith("..."))
+
+
+def _candidate_overloads_for_arity(
+    by_arity: dict[int, list[tuple[tuple[str | None, ...], str]]], arity: int
+) -> list[tuple[tuple[str | None, ...], str]]:
+    cands = [
+        (ptypes, m_sid)
+        for ptypes, m_sid in by_arity.get(arity, [])
+        if not _is_varargs_param_tuple(ptypes)
+    ]
+    for entries in by_arity.values():
+        for ptypes, m_sid in entries:
+            if _is_varargs_param_tuple(ptypes) and len(ptypes) - 1 <= arity:
+                elem_t = (ptypes[-1] or "")[:-3]
+                expanded = (*ptypes[:-1], *([elem_t] * (arity - len(ptypes) + 1)))
+                cands.append((expanded, m_sid))
+    return cands
 
 
 def _select_overload_targets(
@@ -275,18 +329,22 @@ def _select_overload_targets(
     local_types: dict[str, str],
     field_types: dict[str, str],
 ) -> list[str]:
-    cands = overload_arities.get(mname, {}).get(len(arg_nodes), [])
+    by_arity = overload_arities.get(mname, {})
+    cands = _candidate_overloads_for_arity(by_arity, len(arg_nodes))
     if not cands:
         return [f"{class_sid}.{mname}"]
     arg_types = [
         _infer_java_arg_type(data, a, local_types, field_types) for a in arg_nodes
     ]
-    matched = [
-        m_sid
-        for ptypes, m_sid in cands
-        if all(_param_matches_arg(pt, at) for pt, at in zip(ptypes, arg_types))
-    ]
-    return matched or [m_sid for _, m_sid in cands]
+    for widen in (False, True):
+        matched = [
+            m_sid
+            for ptypes, m_sid in cands
+            if all(_param_matches_arg(pt, at, widen) for pt, at in zip(ptypes, arg_types))
+        ]
+        if matched:
+            return matched
+    return [m_sid for _, m_sid in cands]
 
 
 def _all_type_identifiers(data: bytes, node) -> list[tuple[str, int]]:
@@ -513,7 +571,11 @@ def extract_java_file(
         overload_arities: dict[str, dict[int, list[tuple[tuple[str | None, ...], str]]]] = {}
         pre_counts: dict[str, int] = {}
         for member in member_nodes:
-            if member.type == "method_declaration":
+            if member.type in {
+                "method_declaration",
+                "constructor_declaration",
+                "compact_constructor_declaration",
+            }:
                 m_ident = child_of_type(member, "identifier")
                 if m_ident is not None:
                     m_name = node_text(data, m_ident)
@@ -582,7 +644,7 @@ def extract_java_file(
         enclosing_types: list[str],
         field_types: dict[str, str],
         own_methods: set[str],
-        overload_arities: dict[str, dict[int, str]],
+        overload_arities: dict[str, dict[int, list[tuple[tuple[str | None, ...], str]]]],
         local_types: dict[str, str],
         superclass_target: str | None,
         in_test: bool,
@@ -664,6 +726,18 @@ def extract_java_file(
                     resolved_t = resolve_type_ref(base_t, enclosing_types)
                     if resolved_t:
                         emit(sid, resolved_t, "CALLS", start_line(desc), in_test)
+                        if resolved_t == class_sid and base_t in own_methods:
+                            ctor_args = _extract_call_args(child_of_type(desc, "argument_list"))
+                            for ct in _select_overload_targets(
+                                base_t,
+                                ctor_args,
+                                class_sid,
+                                overload_arities,
+                                data,
+                                local_types,
+                                field_types,
+                            ):
+                                emit(sid, ct, "CALLS", start_line(desc), in_test)
                 if ctype is not None and ctype.type == "generic_type":
                     emit_type_uses(sid, child_of_type(ctype, "type_arguments"), enclosing_types, in_test)
             elif desc.type == "method_invocation":
@@ -686,7 +760,7 @@ def extract_java_file(
         enclosing_types: list[str],
         field_types: dict[str, str],
         own_methods: set[str],
-        overload_arities: dict[str, dict[int, str]],
+        overload_arities: dict[str, dict[int, list[tuple[tuple[str | None, ...], str]]]],
         superclass_target: str | None,
         method_counts: dict[str, int],
     ):
@@ -778,18 +852,14 @@ def extract_java_file(
         enclosing_types: list[str],
         field_types: dict[str, str],
         own_methods: set[str],
-        overload_arities: dict[str, dict[int, str]],
+        overload_arities: dict[str, dict[int, list[tuple[tuple[str | None, ...], str]]]],
         local_types: dict[str, str],
         superclass_target: str | None,
         in_test: bool,
     ):
         line = start_line(call_node)
         arg_list = child_of_type(call_node, "argument_list")
-        arg_nodes = (
-            [c for c in arg_list.children if c.type not in {"(", ")", ","}]
-            if arg_list is not None
-            else []
-        )
+        arg_nodes = _extract_call_args(arg_list)
         non_arg_children = [
             c
             for c in call_node.children

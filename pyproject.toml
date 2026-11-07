@@ -30,3 +30,6 @@ Homepage = "https://github.com/lecholette/codegraph-slicer"
 
 [tool.setuptools]
 packages = ["codegraph_slicer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

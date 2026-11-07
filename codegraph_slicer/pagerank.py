@@ -66,6 +66,21 @@ def build_repo_map(
         or max_tokens <= 0
     ):
         raise InvalidBudgetError("max_tokens must be a positive integer")
+    with store.read_snapshot():
+        return _build_repo_map_in_snapshot(
+            store,
+            seeds=seeds,
+            max_tokens=max_tokens,
+            seed_paths=seed_paths,
+            seed_modules=seed_modules,
+            render_estimator=render_estimator,
+        )
+
+
+def _build_repo_map_in_snapshot(
+    store, seeds=(), max_tokens=2000, *, seed_paths=(), seed_modules=(),
+    render_estimator=None,
+):
     scores = rank(store, seeds, seed_paths=seed_paths, seed_modules=seed_modules)
     by_path = {row["path"]: row for row in store.rows("SELECT * FROM files")}
     symbols = {
@@ -206,10 +221,25 @@ def build_repo_outline(
     render_estimator=None,
 ):
     """Build a versioned, bounded entity outline with local file IDs."""
-    from .slicer import rendered_tokens
-
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise InvalidBudgetError("max_tokens must be a positive integer")
+    with store.read_snapshot():
+        return _build_repo_outline_in_snapshot(
+            store,
+            seeds=seeds,
+            max_tokens=max_tokens,
+            seed_paths=seed_paths,
+            seed_modules=seed_modules,
+            render_estimator=render_estimator,
+        )
+
+
+def _build_repo_outline_in_snapshot(
+    store, seeds=(), max_tokens=2000, *, seed_paths=(), seed_modules=(),
+    render_estimator=None,
+):
+    from .slicer import rendered_tokens
+
     files = {row["path"]: row for row in store.rows("SELECT * FROM files")}
     symbol_rows = store.rows(
         "SELECT symbol_id,file_path,qualname,kind,start_line,signature FROM symbols "

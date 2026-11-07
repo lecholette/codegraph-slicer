@@ -2,6 +2,7 @@
 
 import ast
 import contextlib
+from dataclasses import dataclass
 import difflib
 import hashlib
 import json
@@ -32,6 +33,36 @@ _BARREL_INDEX_NAMES = (
 
 class AnchorNotFoundError(CodeGraphError):
     pass
+
+
+@dataclass(frozen=True)
+class IndexedSymbol:
+    symbol_id: str
+    file_path: str
+    module: str
+    qualname: str
+    kind: str
+    signature: str
+    body: str
+    start_line: int
+    end_line: int
+
+    @classmethod
+    def from_row(cls, row) -> "IndexedSymbol":
+        if isinstance(row, cls):
+            return row
+        data = dict(row)
+        return cls(
+            symbol_id=str(data.get("symbol_id", "")),
+            file_path=str(data.get("file_path", "")),
+            module=str(data.get("module", "")),
+            qualname=str(data.get("qualname", "")),
+            kind=str(data.get("kind", "")),
+            signature=str(data.get("signature", "")),
+            body=str(data.get("body", "")),
+            start_line=int(data.get("start_line", 1)),
+            end_line=int(data.get("end_line", 1)),
+        )
 
 
 class InvalidBudgetError(CodeGraphError):
@@ -232,6 +263,24 @@ def query_call_impact(
         raise InvalidBudgetError("unknown boundary limit must be a non-negative integer")
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise InvalidBudgetError("max_tokens must be a positive integer")
+    with store.read_snapshot():
+        return _query_call_impact_in_snapshot(
+            store,
+            anchor,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            unknown_boundary_limit=unknown_boundary_limit,
+            max_tokens=max_tokens,
+            database=database,
+            render_estimator=render_estimator,
+            output_format=output_format,
+        )
+
+
+def _query_call_impact_in_snapshot(
+    store, anchor, *, max_depth=3, max_nodes=200, unknown_boundary_limit=0,
+    max_tokens=8000, database=None, render_estimator=None, output_format="json"
+):
     target = _anchor(store, anchor)
     if target["kind"] not in {"function", "async_function", "method"}:
         raise AnchorNotFoundError(f"impact requires an observed function or method anchor: {anchor}")
@@ -404,7 +453,19 @@ def build_slice_outline(
         raise InvalidBudgetError("max_tokens must be a positive integer")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
+    with store.read_snapshot():
+        return _build_slice_outline_in_snapshot(
+            store,
+            anchors,
+            max_tokens=max_tokens,
+            include_imports=include_imports,
+            render_estimator=render_estimator,
+        )
 
+
+def _build_slice_outline_in_snapshot(
+    store, anchors, max_tokens=8000, *, include_imports=False, render_estimator=None
+):
     allowed_kinds = ["CALLS", "USES_TYPE", "INHERITS", "DEFINES"]
     if include_imports:
         allowed_kinds.append("IMPORTS")
@@ -559,10 +620,11 @@ def build_slice_outline(
 
 
 def _slice_item(row, full):
-    text = row["body"] if full else row["signature"]
+    sym = IndexedSymbol.from_row(row)
+    text = sym.body if full else sym.signature
     return {
-        "symbol": row["symbol_id"],
-        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{text}",
+        "symbol": sym.symbol_id,
+        "text": f"{sym.file_path}:{sym.start_line}-{sym.end_line}\n{text}",
     }
 
 
@@ -573,33 +635,34 @@ def _target_item_with_preamble(
     max_tokens: int,
     emitted_headers: set[str] | None = None,
 ):
-    base = _slice_item(row, True)
+    sym = IndexedSymbol.from_row(row)
+    base = _slice_item(sym, True)
     if (
         max_tokens < 2000
-        or row["kind"] not in {"method", "function", "async_function", "class", "type_alias"}
+        or sym.kind not in {"method", "function", "async_function", "class", "type_alias"}
     ):
         return base
-    module_sid = f"{row['module']}:"
+    module_sid = f"{sym.module}:"
     if module_sid in chosen:
         return base
     mod_rows = store.rows("SELECT body FROM symbols WHERE symbol_id=?", (module_sid,))
     if not mod_rows:
         return base
     file_lines = mod_rows[0]["body"].splitlines()
-    limit_idx = min(len(file_lines), max(0, row["start_line"] - 1))
+    limit_idx = min(len(file_lines), max(0, sym.start_line - 1))
     header_lines = []
     header_end_line = 0
-    file_key = f"file:{row['file_path']}"
+    file_key = f"file:{sym.file_path}"
     emit_file_imports = emitted_headers is None or file_key not in emitted_headers
     if emit_file_imports:
-        if row["file_path"].endswith(".py"):
+        if sym.file_path.endswith(".py"):
             try:
                 tree = ast.parse(mod_rows[0]["body"])
             except SyntaxError:
                 tree = None
             if tree is not None:
                 for idx_stmt, stmt in enumerate(tree.body):
-                    if getattr(stmt, "lineno", 0) >= row["start_line"]:
+                    if getattr(stmt, "lineno", 0) >= sym.start_line:
                         break
                     if (
                         idx_stmt == 0
@@ -644,9 +707,9 @@ def _target_item_with_preamble(
                     break
         if emitted_headers is not None and header_lines:
             emitted_headers.add(file_key)
-    if row["kind"] == "method" and "." in row["qualname"] and row["file_path"].endswith(_BRACE_LANG_EXTS):
-        class_qual = row["qualname"].rpartition(".")[0]
-        class_sid = f"{row['module']}:{class_qual}"
+    if sym.kind == "method" and "." in sym.qualname and sym.file_path.endswith(_BRACE_LANG_EXTS):
+        class_qual = sym.qualname.rpartition(".")[0]
+        class_sid = f"{sym.module}:{class_qual}"
         if class_sid in chosen:
             return base
         class_key = f"class:{class_sid}"
@@ -660,14 +723,14 @@ def _target_item_with_preamble(
                 class_short = class_qual.rsplit(".", 1)[-1]
                 first_m_rows = store.rows(
                     "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ? AND qualname NOT GLOB ? AND qualname NOT GLOB '*.constructor'",
-                    (row["file_path"], c_start, f"*.{class_short}"),
+                    (sym.file_path, c_start, f"*.{class_short}"),
                 )
                 first_m = (
                     first_m_rows[0]["first_m"]
                     if first_m_rows and first_m_rows[0]["first_m"] is not None
-                    else row["start_line"]
+                    else sym.start_line
                 )
-                c_end = min(first_m - 1, row["start_line"] - 1, c_start + 20)
+                c_end = min(first_m - 1, sym.start_line - 1, c_start + 20)
                 added_class = False
                 for ln in range(c_start, c_end + 1):
                     if 1 <= ln <= len(file_lines):
@@ -678,9 +741,9 @@ def _target_item_with_preamble(
                             added_class = True
                 if emitted_headers is not None and added_class:
                     emitted_headers.add(class_key)
-    comment_pfx = _comment_prefix(row["file_path"])
-    if emit_file_imports and row["file_path"].endswith(TS_JS_EXTENSIONS) and "." in row["module"]:
-        parent_mod_sid = f"{row['module'].rpartition('.')[0]}:"
+    comment_pfx = _comment_prefix(sym.file_path)
+    if emit_file_imports and sym.file_path.endswith(TS_JS_EXTENSIONS) and "." in sym.module:
+        parent_mod_sid = f"{sym.module.rpartition('.')[0]}:"
         barrel_rows = store.rows(
             "SELECT file_path, body FROM symbols WHERE symbol_id=?",
             (parent_mod_sid,),
@@ -700,8 +763,8 @@ def _target_item_with_preamble(
         + "\n"
     )
     return {
-        "symbol": row["symbol_id"],
-        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{preamble}{row['body']}",
+        "symbol": sym.symbol_id,
+        "text": f"{sym.file_path}:{sym.start_line}-{sym.end_line}\n{preamble}{sym.body}",
     }
 
 
@@ -757,23 +820,24 @@ def _caller_boundary_lines(body_lines: list[str], code_start: int, window_start:
 
 
 def _caller_item(row, call_lines):
-    base = _slice_item(row, False)
-    if row["end_line"] - row["start_line"] < 3 or not call_lines:
+    sym = IndexedSymbol.from_row(row)
+    base = _slice_item(sym, False)
+    if sym.end_line - sym.start_line < 3 or not call_lines:
         return base
-    body_lines = row["body"].splitlines()
-    code_start = _first_code_line_offset(row["body"])
-    comment_pfx = _comment_prefix(row["file_path"])
+    body_lines = sym.body.splitlines()
+    code_start = _first_code_line_offset(sym.body)
+    comment_pfx = _comment_prefix(sym.file_path)
     snippets = []
     seen_idxs = set()
     for ln in sorted(call_lines)[:2]:
-        idx = ln - row["start_line"]
+        idx = ln - sym.start_line
         if 0 < idx < len(body_lines):
             window_start = max(code_start, idx - 5)
             window_end = min(len(body_lines) - 1, idx + 1)
             for k, cl in _caller_boundary_lines(body_lines, code_start, window_start):
                 if k not in seen_idxs:
                     seen_idxs.add(k)
-                    snippets.append(f"    {comment_pfx} L{row['start_line'] + k}: {cl}")
+                    snippets.append(f"    {comment_pfx} L{sym.start_line + k}: {cl}")
             cand = []
             for k in range(window_start, window_end + 1):
                 if k in seen_idxs:
@@ -787,7 +851,7 @@ def _caller_item(row, call_lines):
                     cand.append((k, cl))
             for k, cl in cand[-5:]:
                 seen_idxs.add(k)
-                snippets.append(f"    {comment_pfx} L{row['start_line'] + k}: {cl}")
+                snippets.append(f"    {comment_pfx} L{sym.start_line + k}: {cl}")
     if snippets:
         base["text"] = base["text"] + "\n" + "\n".join(snippets)
     return base
@@ -918,7 +982,7 @@ def _is_public_class_field_stmt(stmt: ast.stmt) -> bool:
     if isinstance(stmt, ast.AnnAssign):
         return isinstance(stmt.target, ast.Name) and not stmt.target.id.startswith("_")
     if isinstance(stmt, ast.Assign) and stmt.targets:
-        return all(
+        return any(
             isinstance(t, ast.Name) and not t.id.startswith("_") for t in stmt.targets
         )
     return False
@@ -931,11 +995,14 @@ def _extract_py_class_fields(row: dict) -> list[str]:
         return []
     if not mod.body or not isinstance(mod.body[0], ast.ClassDef):
         return []
-    return [
+    fields = [
         f"    {ast.unparse(stmt)}"
         for stmt in mod.body[0].body
         if _is_public_class_field_stmt(stmt)
-    ][:12]
+    ]
+    if len(fields) > 12:
+        return [*fields[:12], f"    # ... (+{len(fields) - 12} more fields)"]
+    return fields
 
 
 def _is_priority_compact_method(
@@ -1129,43 +1196,45 @@ def _format_condensed_method_body(body: str, comment_pfx: str) -> str:
 def _condense_class_public_methods(
     store, sid: str, row: dict, db_arg: str, max_tokens: int, min_internal: int = 1
 ) -> str | None:
-    if row["kind"] not in {"class", "module"}:
+    sym = IndexedSymbol.from_row(row)
+    if sym.kind not in {"class", "module"}:
         return None
     methods = store.rows(
         """SELECT * FROM symbols WHERE file_path=? AND kind='method'
            AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
-        (row["file_path"], row["start_line"], row["end_line"]),
+        (sym.file_path, sym.start_line, sym.end_line),
     )
-    ctor_names = {"__init__", "__new__", "constructor", row["qualname"].rsplit(".", 1)[-1]}
+    ctor_names = {"__init__", "__new__", "constructor", sym.qualname.rsplit(".", 1)[-1]}
     pub_methods = [m for m in methods if not _is_internal_method(m, ctor_names)]
     int_methods = [m for m in methods if _is_internal_method(m, ctor_names)]
     if not pub_methods or len(int_methods) < min_internal:
         return None
-    body_lines = row["body"].splitlines()
-    first_m_offset = max(1, methods[0]["start_line"] - row["start_line"])
+    body_lines = sym.body.splitlines()
+    first_m_offset = max(1, methods[0]["start_line"] - sym.start_line)
     kept_parts = ["\n".join(body_lines[: min(first_m_offset, 15)])]
-    comment_pfx = _comment_prefix(row["file_path"])
-    full_size = tokens_for_length(len(row["body"]))
+    comment_pfx = _comment_prefix(sym.file_path)
+    full_size = tokens_for_length(len(sym.body))
     expand_budget = max(max_tokens, full_size * 2)
-    span_len = row["end_line"] - row["start_line"] + 1
+    span_len = sym.end_line - sym.start_line + 1
     kept_parts.append(
         f"    {comment_pfx} ... ({len(int_methods)} internal helper methods condensed in "
-        f"{row['file_path']}:{row['start_line']}-{row['end_line']}; "
-        f"use Read offset={row['start_line']} limit={span_len} or --max-tokens {expand_budget})"
+        f"{sym.file_path}:{sym.start_line}-{sym.end_line}; "
+        f"use Read offset={sym.start_line} limit={span_len} or --max-tokens {expand_budget})"
     )
     for m in pub_methods:
         kept_parts.append(_format_condensed_method_body(m["body"], comment_pfx))
-    if row["file_path"].endswith(_BRACE_LANG_EXTS):
+    if sym.file_path.endswith(_BRACE_LANG_EXTS):
         kept_parts.append("}")
     return "\n".join(kept_parts)
 
 
 def _target_skeleton_item(row: dict) -> dict:
-    doc = _first_docstring_line(row["body"])
-    sig = f"{row['signature']}\n    {doc}" if doc else row["signature"]
+    sym = IndexedSymbol.from_row(row)
+    doc = _first_docstring_line(sym.body)
+    sig = f"{sym.signature}\n    {doc}" if doc else sym.signature
     return {
-        "symbol": row["symbol_id"],
-        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{sig}",
+        "symbol": sym.symbol_id,
+        "text": f"{sym.file_path}:{sym.start_line}-{sym.end_line}\n{sig}",
     }
 
 
@@ -1221,6 +1290,8 @@ def _parse_session_cache_file(cache_path: Path) -> dict[str, dict[str, str]]:
 def _read_session_dedup(
     database, dedup_session
 ) -> tuple[Path | None, str, dict[str, dict[str, str]]]:
+    if isinstance(dedup_session, str) and not dedup_session.strip():
+        return None, "", {}
     if not dedup_session or not database or str(database) == ":memory:":
         return None, "", {}
     cache_path = Path(f"{database}.session.json")
@@ -1256,6 +1327,7 @@ def _commit_session_dedup(
     if cache_path is None:
         return
     merged = dict(all_sessions)
+    merged.update(_parse_session_cache_file(cache_path))
     merged[scope] = updated_seen
     tmp_path = cache_path.with_suffix(f".json.tmp.{os.getpid()}")
     try:
@@ -1373,6 +1445,8 @@ def slice_context(
         or max_tokens <= 0
     ):
         raise InvalidBudgetError("max_tokens must be a positive integer")
+    if target_mode not in ("full", "skeleton"):
+        raise ValueError(f"Unsupported target_mode: {target_mode}")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
     with store.read_snapshot():
@@ -1610,13 +1684,14 @@ def _slice_context_in_snapshot(
             for entry in sections["types_and_schemas"]
         ]
     def _should_include_callee_body(cand_row) -> bool:
+        sym = IndexedSymbol.from_row(cand_row)
         if include_callee_bodies:
             return True
         if (
             max_tokens >= 2000
-            and cand_row["file_path"].endswith(_BRACE_LANG_EXTS)
-            and cand_row["kind"] in {"method", "function", "async_function", "class"}
-            and (cand_row["end_line"] - cand_row["start_line"] + 1) <= 20
+            and sym.file_path.endswith(_BRACE_LANG_EXTS)
+            and sym.kind in {"method", "function", "async_function", "class"}
+            and (sym.end_line - sym.start_line + 1) <= 20
         ):
             return True
         return False
@@ -1682,6 +1757,7 @@ def _slice_context_in_snapshot(
         candidate = result()
         if candidate["tokens"] < complete["tokens"]:
             complete = candidate
+            staged_seen[sid] = hashlib.sha256(summary["text"].encode("utf-8")).hexdigest()
         else:
             sections["types_and_schemas"] = [
                 original if entry["symbol"] == sid else entry

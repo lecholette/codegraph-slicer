@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import importlib.metadata
 import json
@@ -33,6 +34,25 @@ from .ast_extractor import (
 
 _RAW_SOURCE_EXTS = tuple(ext.encode("ascii") for ext in SUPPORTED_EXTENSIONS)
 _RAW_EXCLUDED_EXTS = (b".d.ts", b".min.js", b".bundle.js")
+
+
+@dataclass(frozen=True)
+class UnresolvedCallRef:
+    source_file: str
+    source_id: str
+    kind: str
+    line: int
+
+    @classmethod
+    def from_row(cls, row) -> "UnresolvedCallRef":
+        if isinstance(row, cls):
+            return row
+        return cls(
+            source_file=str(row["source_file"]),
+            source_id=str(row["source_id"]),
+            kind=str(row["kind"]),
+            line=int(row["line"]),
+        )
 
 _SKIP_DIRS = {
     ".git",
@@ -907,7 +927,8 @@ class GraphStore:
     def _resolve_unresolved_call(
         self, row, raw_target: str, symbols, return_types, resolve, mro_method
     ) -> bool:
-        if row["kind"] != "CALLS" or "." not in raw_target or raw_target.startswith("?"):
+        ref = UnresolvedCallRef.from_row(row)
+        if ref.kind != "CALLS" or "." not in raw_target or raw_target.startswith("?"):
             return False
         prefix, _, mname = raw_target.rpartition(".")
         owner_sid = resolve(prefix)
@@ -918,7 +939,7 @@ class GraphStore:
         )
         resolved = [mt for c in candidates if (mt := mro_method(c, mname))]
         for mt in resolved:
-            self._emit_resolved_call(row["source_file"], row["source_id"], mt, row["line"])
+            self._emit_resolved_call(ref.source_file, ref.source_id, mt, ref.line)
         return bool(resolved)
 
     def _resolve_deferred_targets(

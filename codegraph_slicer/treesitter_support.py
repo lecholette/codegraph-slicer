@@ -150,14 +150,27 @@ def _is_class_boundary_line(line: str) -> bool:
     )
 
 
+def _pop_closed_classes(stack: list[tuple[int, list[int]]], indent: int) -> None:
+    while len(stack) > 1 and stack[-1][0] >= indent:
+        stack.pop()
+
+
 def _group_private_lines_by_class(lines: list[str]) -> list[list[int]]:
-    groups: list[list[int]] = [[]]
+    root_group: list[int] = []
+    groups: list[list[int]] = [root_group]
+    stack: list[tuple[int, list[int]]] = [(-1, root_group)]
     for i, ln in enumerate(lines):
-        if _is_class_boundary_line(ln) and groups[-1]:
-            groups.append([])
-        if _is_private_skeleton_line(ln):
-            groups[-1].append(i)
-    return groups
+        indent = len(ln) - len(ln.lstrip())
+        if _is_class_boundary_line(ln):
+            _pop_closed_classes(stack, indent)
+            grp: list[int] = []
+            groups.append(grp)
+            stack.append((indent, grp))
+        elif ln.strip().startswith("}"):
+            _pop_closed_classes(stack, indent)
+        elif _is_private_skeleton_line(ln):
+            stack[-1][1].append(i)
+    return [g for g in groups if g]
 
 
 def _fold_brace_private_methods(text: str) -> str:

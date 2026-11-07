@@ -1,7 +1,41 @@
 """Static graph differences; test reachability never asserts tests were executed."""
 
+from dataclasses import dataclass
 from .ast_extractor import CodeGraphError, is_test_path, plain_target
 from .slicer import rendered_tokens
+
+
+@dataclass(frozen=True)
+class DeltaReport:
+    boundary_violations: list
+    new_cycles: list
+    complexity_drift: list
+    added_edges: list
+    removed_edges: list
+    modified_symbols: list
+    affected_entrypoints: list
+    untested_modified_symbols: list
+    test_coverage: list
+    test_gap_note: str
+    raw: dict
+
+    @classmethod
+    def from_dict(cls, result: dict) -> "DeltaReport":
+        if isinstance(result, cls):
+            return result
+        return cls(
+            boundary_violations=list(result["boundary_violations"]),
+            new_cycles=list(result["new_cycles"]),
+            complexity_drift=list(result["complexity_drift"]),
+            added_edges=list(result["added_edges"]),
+            removed_edges=list(result["removed_edges"]),
+            modified_symbols=list(result["modified_symbols"]),
+            affected_entrypoints=list(result["affected_entrypoints"]),
+            untested_modified_symbols=list(result["untested_modified_symbols"]),
+            test_coverage=list(result["test_coverage"]),
+            test_gap_note=str(result["test_gap_note"]),
+            raw=dict(result),
+        )
 
 
 def _cycles(graph):
@@ -66,6 +100,28 @@ def _prefix(value, prefix):
 
 
 def compute_delta(
+    base_store,
+    head_store,
+    boundary_rules=(),
+    *,
+    selected_tests=(),
+    cx_threshold=10,
+    fan_out_threshold=10,
+    _earliest_edge_lines=False,
+):
+    with base_store.read_snapshot(), head_store.read_snapshot():
+        return _compute_delta_in_snapshot(
+            base_store,
+            head_store,
+            boundary_rules,
+            selected_tests=selected_tests,
+            cx_threshold=cx_threshold,
+            fan_out_threshold=fan_out_threshold,
+            _earliest_edge_lines=_earliest_edge_lines,
+        )
+
+
+def _compute_delta_in_snapshot(
     base_store,
     head_store,
     boundary_rules=(),
@@ -230,13 +286,14 @@ def summarize_delta(
 
     if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
         raise InvalidBudgetError("max_tokens must be a positive integer")
+    report = DeltaReport.from_dict(result)
     kinds = (
         "boundary_violations", "new_cycles", "complexity_drift", "added_edges",
         "removed_edges", "modified_symbols", "affected_entrypoints",
         "untested_modified_symbols", "test_coverage",
     )
-    counts = {kind: len(result[kind]) for kind in kinds}
-    gaps = result["test_coverage"]
+    counts = {kind: len(getattr(report, kind)) for kind in kinds}
+    gaps = report.test_coverage
     statuses = []
     for item in gaps:
         statuses.append(
@@ -246,7 +303,7 @@ def summarize_delta(
         )
     imports = [
         {"change": change, "source": edge[0], "target": edge[1], "line": edge[3]}
-        for change, edges in (("added", result["added_edges"]), ("removed", result["removed_edges"]))
+        for change, edges in (("added", report.added_edges), ("removed", report.removed_edges))
         for edge in edges if edge[2] == "IMPORTS"
     ]
     counts["import_changes"] = len(imports)
@@ -260,15 +317,15 @@ def summarize_delta(
         "test_gap_status_counts": {name: statuses.count(name) for name in (
             "updated_or_selected_evidence", "reachable_but_unselected", "no_static_test_reaches"
         )},
-        "test_gap_note": result["test_gap_note"],
+        "test_gap_note": report.test_gap_note,
         "retrieve_details": "rerun with --full --max-tokens N",
     }
     if counts["complexity_drift"] > 0 and render_estimator is None:
         summary["complexity_threshold_exceeded"] = sum(
-            1 for item in result["complexity_drift"] if item.get("threshold_exceeded")
+            1 for item in report.complexity_drift if item.get("threshold_exceeded")
         )
     if full:
-        payload = dict(result)
+        payload = dict(report.raw)
         payload["import_changes"] = imports
         payload["omitted"] = {**{kind: 0 for kind in kinds}, "import_changes": 0}
         payload["test_selection"] = summary["test_selection"]
@@ -278,24 +335,24 @@ def summarize_delta(
         payload["omitted"]["added_edges"] = counts["added_edges"]
         payload["omitted"]["removed_edges"] = counts["removed_edges"]
         priority = (
-            ("boundary_violations", result["boundary_violations"], None),
-            ("new_cycles", result["new_cycles"], None),
-            ("untested_modified_symbols", result["untested_modified_symbols"], 5 if render_estimator is None and max_tokens == 8000 else None),
+            ("boundary_violations", report.boundary_violations, None),
+            ("new_cycles", report.new_cycles, None),
+            ("untested_modified_symbols", report.untested_modified_symbols, 5 if render_estimator is None and max_tokens == 8000 else None),
             ("test_coverage", [
                 {**item, "status": status}
-                for item, status in zip(result["test_coverage"], statuses)
+                for item, status in zip(report.test_coverage, statuses)
             ], 5 if render_estimator is None and max_tokens == 8000 else None),
             ("complexity_drift", sorted(
-                (item for item in result["complexity_drift"] if item["threshold_exceeded"]),
+                (item for item in report.complexity_drift if item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
             ), None),
             ("import_changes", imports, 8 if render_estimator is None else None),
-            ("affected_entrypoints", result["affected_entrypoints"], 5 if render_estimator is None else None),
+            ("affected_entrypoints", report.affected_entrypoints, 5 if render_estimator is None else None),
             ("complexity_drift", sorted(
-                (item for item in result["complexity_drift"] if not item["threshold_exceeded"]),
+                (item for item in report.complexity_drift if not item["threshold_exceeded"]),
                 key=lambda item: (-item["cx_delta"], -item["fan_out_delta"], item["symbol"]),
             ), 5 if render_estimator is None else None),
-            ("modified_symbols", result["modified_symbols"], 5 if render_estimator is None else None),
+            ("modified_symbols", report.modified_symbols, 5 if render_estimator is None else None),
         )
         # Edge lists are intentionally not emitted in summary mode. Their exact
         # counts remain in summary/omitted and are retrievable with --full.

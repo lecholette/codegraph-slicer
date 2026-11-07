@@ -62,7 +62,7 @@ Errors go to stderr with exit 2. An empty result is exit 0.
   codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite
   ```
 
-  Default `delta` JSON bounds each summary list to at most 5 items (`omitted` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
+  Default `delta` JSON bounds non-critical summary lists ( up to 5 items per symbol list and 8 for `import_changes`, while keeping `boundary_violations` and `new_cycles` uncapped within budget; `omitted` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
   Add `--forbid-import SRC_PREFIX TGT_PREFIX` for layer rules.
 
 Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`, `path/File.java:Class.method`, `path/file.ts:Class.method`, `path/file.js:Class.method`, or `path/file:LINE`.
