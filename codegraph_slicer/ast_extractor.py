@@ -207,7 +207,8 @@ class _Strip(ast.NodeTransformer):
 
     def _function(self, node):
         doc = node.body[:1] if ast.get_docstring(node, clean=False) is not None else []
-        node.body = doc + [ast.Expr(value=ast.Constant(value=Ellipsis))]
+        nested_cls = [self.visit_ClassDef(s) for s in node.body if isinstance(s, ast.ClassDef)]
+        node.body = doc + nested_cls + [ast.Expr(value=ast.Constant(value=Ellipsis))]
         return node
 
     visit_FunctionDef = _function

@@ -185,6 +185,13 @@ def _anchor(store, anchor):
             )
             if java_m_rows:
                 return java_m_rows[0]
+    if separator and target:
+        mod_suf_rows = store.rows(
+            "SELECT * FROM symbols WHERE module=? AND qualname GLOB ? ORDER BY end_line-start_line DESC, start_line ASC",
+            (path, f"*.{target}"),
+        )
+        if len(mod_suf_rows) == 1:
+            return mod_suf_rows[0]
     if not separator:
         uniq_match = _resolve_unique_qualname_anchor(store, anchor)
         if uniq_match is not None:
@@ -1236,6 +1243,32 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
     return required
 
 
+def _resolve_anchor_batch(store, anchors):
+    if len(anchors) == 1:
+        row = _anchor(store, anchors[0])
+        return {row["symbol_id"]: row}
+    chosen = {}
+    first_err = None
+    for a in anchors:
+        try:
+            row = _anchor(store, a)
+            chosen[row["symbol_id"]] = row
+        except AnchorNotFoundError as exc:
+            if first_err is None:
+                first_err = exc
+            mod_part, sep, _ = a.rpartition(":")
+            if sep:
+                cls_rows = store.rows(
+                    "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='class' ORDER BY start_line, symbol_id",
+                    (mod_part, mod_part),
+                )
+                if len(cls_rows) == 1:
+                    chosen[cls_rows[0]["symbol_id"]] = cls_rows[0]
+    if not chosen and first_err is not None:
+        raise first_err
+    return chosen
+
+
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
     render_estimator=None, database=None, target_mode="full", dedup_session=False,
@@ -1248,7 +1281,7 @@ def slice_context(
         raise InvalidBudgetError("max_tokens must be a positive integer")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
-    chosen = {row["symbol_id"]: row for row in (_anchor(store, a) for a in anchors)}
+    chosen = _resolve_anchor_batch(store, anchors)
     sections = {
         name: []
         for name in (

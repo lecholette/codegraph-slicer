@@ -9,6 +9,7 @@ from codegraph_slicer.slicer import (
     _build_target_entry,
     _compact_cached_entry,
     _extract_brace_class_fields,
+    _resolve_anchor_batch,
     _resolve_suffix_path_anchor,
     _resolve_unique_qualname_anchor,
     _target_skeleton_item,
@@ -473,3 +474,5 @@ def test_direct_unit_helpers_for_skeleton_folding_and_slicer_compaction(tmp_path
         _apply_session_dedup(sections, db_file)
         _apply_session_dedup(sections, db_file)
         assert "cached in earlier slice" in sections["types_and_schemas"][0]["text"]
+        batch = _resolve_anchor_batch(store, ["a.b.mod:UniqueThing", "a.b.mod:MissingMethod"])
+        assert "a.b.mod:UniqueThing" in batch
