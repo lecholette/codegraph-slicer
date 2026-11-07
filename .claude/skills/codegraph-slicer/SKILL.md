@@ -1,146 +1,84 @@
 ---
 name: codegraph-slicer
 description: >-
-  Static Python, Java, TypeScript, and JavaScript maps, slices, impact, local
-  Python flow, and graph deltas. Use for explicit structural questions or
-  selective navigation across larger or dense source trees. Compact feature
-  work normally uses direct reads or one map, without slicing or delta.
+  Static Python, Java, TypeScript, and JavaScript code graph: map, slice, flow, delta. Use for structural questions
+  about Python (.py), Java (.java), TypeScript (.ts, .tsx), or JavaScript (.js, .jsx, .mjs, .cjs) code: who calls X,
+  where a value comes from, what a change touches, import cycles, forbidden imports, blast radius, or base-vs-head
+  graph changes. Not for runtime behaviour or running tests.
 ---
 
 # codegraph-slicer
 
-Requires Python 3.12+ and `codegraph-slicer` on PATH. This workflow requires
-`map --recommend-workflow`; check `codegraph-slicer map --help` if the installed
-version is uncertain. Never retry an unsupported flag repeatedly.
+Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecholette/codegraph-slicer`) and Python 3.12+.
+Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, .`jsx`, `.mjs`, `.cjs`) source trees.
+Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
-Supported sources: `.py`, `.java`, `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`.
-Use `codegraph-slicer <command> --help` for the command contract.
+## Routing Precedence (When to Slice vs. Read Directly)
 
-## Choose a workflow before indexing
+1. **Compact Scope & Python Segregation Gate (skip `slice` and `delta`; use direct `Read` or at most one `map --recommend-workflow`)** when:
+   - the repository's non-test source scope is compact (**`< 30` files AND `< 5,000` LOC** across Java/TS/JS, or **`< 50` files AND `< 7,500` LOC** for Python-only repositories),
+   - the task modifies **`> 30%` of the existing production source files** in the service,
+   - all target files are already known and compact (**`< 300` lines and `< 15` definitions each**), or
+   - the language is outside Python/Java/TypeScript/JavaScript.
+   In this compact lane (`ScaleRecommendation` reports `bypass_slicer: true` / `mode: "map_then_read"`), read the target files directly (after at most one `codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown` if orientation is needed) and **do not run `slice` or post-edit `delta`**, avoiding the double-context tax of loading both XML slices and full files into context.
+2. **Graph-Eligible Scope (repositories `>= 30` files or `>= 5,000` LOC in Java/TS/JS, or `>= 50` files or `>= 7,500` LOC in Python): use `codegraph-slicer` (`map`, `slice`, or `impact`)** whenever target symbols live inside large files (**`>= 300` lines** or **`>= 15` definitions**) **or** when callers, callees, and interface implementations are unknown across multiple modules/packages.
+   - **Front-load one batched `slice` early:** Pass all 3–8 target `path/file.ext:Class.method` anchors in a single batched `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call so the deduplicated slice is locked into the early prompt cache prefix. Never run separate `slice` calls in a shell loop or across consecutive turns (if a follow-up `slice` is required later in the session, pass `--dedup-session` to elide already-cached types and callers).
+   - **Prefer `Class.method` anchors over giant class anchors:** When slicing multiple classes, pass specific methods from `map` (e.g. `Handler.executeJob`) rather than 500-line class names so method bodies are not condensed.
+   - **Bounded `Read`-before-`Edit` (avoid the double-context tax):** Never `Read` or `cat` an entire large file (`>= 300` lines) whose methods are already in `<target_implementations>`. When `Edit` requires `Read` first (or when inspecting condensed lines), call `Read` with `offset=<start_line>` and `limit=<end_line - start_line + 1>` from `<code_slice lines="start-end">` (or pass `--target-mode skeleton` to `slice` if you plan to read the target files directly).
+3. **Incremental head sync (`delta`):** Only when explicitly requested or needed for multi-package boundary checks on graph-eligible repositories, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
 
-These rules take precedence over every command example below.
+## Contract & Verification Discipline
 
-1. If the user explicitly requests a structural map, caller/impact analysis,
-   local flow, import rule check, or base-vs-head graph delta, perform that
-   analysis regardless of language or repository size. State its limits.
-2. For ordinary implementation work, inspect a cheap source inventory first
-   (`rg --files`, then line counts for a small source set when needed). If the
-   target is a known local file/region, read it directly. Do not index merely
-   to confirm that a known small task is small.
-3. A scope is compact when its existing non-test supported source has BOTH
-   fewer than 30 files AND fewer than 5,000 LOC. A Python-only scope is also
-   compact with BOTH fewer than 50 files AND fewer than 7,500 LOC. Exclude
-   tests and known generated/vendor/build output from the manual task scope;
-   the CLI advisory counts indexed non-test source and may include such files.
-4. For compact implementation work, read known target files directly. If
-   targets are unknown and a map would help, use at most one ordinary map,
-   then source reads and targeted search. Do not automatically run `slice`,
-   `impact`, `flow`, `delta`, or a completion-time sync in this lane. Do not
-   request `map --outline` as a cheap substitute: it includes graph entities
-   and edges and can be much larger than the ordinary map.
-5. If more than 30% of existing production files in the established task scope
-   will change, prefer reading that edit surface directly. Count distinct
-   existing files against the same scope; count new files separately. This
-   does not forbid a specific cross-package structural query needed by the task.
-6. Larger/dense scopes are graph-eligible, not graph-mandatory. Use the graph
-   when relationships or active implementations are unknown and it can avoid
-   substantial unrelated reading. A 300-line file or 15 definitions alone
-   does not override compactness or require slicing.
-7. In mixed monorepos, use a known service/package as the task scope when
-   appropriate. A global map advisory describes indexed source, not the task's
-   edit surface. A map seed changes ranking, not the advisory's scope. Do not
-   create a new index per package just to force a compact classification.
+- **Check helper & scaffold contracts before reuse:** Inspect whether existing helpers preserve required return shapes, formatting, side effects, observable event/output ordering, and state transitions. Preserve existing early-return guards and state fields in `<target>` methods required by earlier callers.
+- **Expand stubbed or omitted context when needed:** When a signature-only callee stub in `<downstream_dependencies>` or an omitted symbol affects formatting, ordering, or state transitions, fetch its body (`slice --include-callee-bodies` or targeted `slice`/`Read`) rather than guessing its implementation.
+- **Requirement-driven verification:** Run available tests. Where acceptance tests are external or legacy tests reflect superseded contracts, run focused checks derived independently from the specification (covering boundary transitions, exact output/event sequences, and error/rejection cases) before completing.
 
-## Optional orientation and index lifecycle
+## Index first
 
-Keep databases outside the repository or in a git-ignored `.codegraph/`.
-Reuse a current database when available. Only when a graph query is needed:
+Keep the index outside the repo (or in a git-ignored dot-directory such as `.codegraph/`). Hidden dot-directories are automatically ignored during workspace sync. One database holds one snapshot.
 
 ```bash
 GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
 codegraph-slicer sync . --db "$GRAPH"
-codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
 ```
 
-The default map budget is 2,000 estimated tokens. Read `ScaleRecommendation`
-and omission metadata. `bypass_slicer: true` means use the compact read workflow;
-`graph_optional` does not instruct you to run every graph command. Empty or
-incomplete indexes require direct inspection and do not prove the repo is small.
-A complete map is not guaranteed to fit in 3,500 tokens, even for ten source files.
+Sync is incremental: unchanged files are not reparsed, so re-run it whenever source changed.
+`map`, `slice`, `impact` and `flow` exit 2 with `StaleSnapshotError` when files changed since the sync.
+Re-sync for symbols you edited. For symbols you did not edit, `--snapshot` (a boolean flag taking no argument) reads the indexed bytes without a re-sync.
+Errors go to stderr with exit 2. An empty result is exit 0.
 
-For compact work, a partial map is orientation, not a reason for repeated map
-expansion. Read/search omitted relevant paths directly. If the opted-in map
-cannot fit even its metadata, fall back to direct reads instead of retry loops.
-With an older CLI lacking the flag, apply the scale rules manually and use at
-most one ordinary map if needed; do not reinstall tools during a coding task.
+## Commands
 
-Source changed? Re-sync only before a further graph query that needs current
-bytes. Fresh queries reject stale snapshots. `--snapshot` reads indexed bytes
-without freshness verification; use it only deliberately for historical or
-known-unchanged context, never as evidence of current edited behavior.
-
-## Selective graph queries for eligible work
-
-- Orient with a map, optionally `--seed package.module` to focus ranking.
-- Batch the anchors you actually need in one call:
+- **In graph-eligible repositories, do not browse or read entire large module files (`>= 300` lines or `>= 15` definitions)** when sliced anchors are known. Query anchors directly with `codegraph-slicer slice ... --format xml` for bounded, token-efficient method context (including enclosing class field/constructor preambles and same-file helper bodies `<= 40` lines).
+- **Skip `slice` and `delta`** for compact repositories (`< 30` files and `< 5,000` LOC, or Python `< 50` files and `< 7,500` LOC), when modifying `> 30%` of existing source files, when all target files are already known and `< 300` lines and `< 15` definitions each, or for languages outside Python/Java/TypeScript/JavaScript.
+- Orient: `codegraph-slicer map --db "$GRAPH" --recommend-workflow --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
+- One function/method with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
+- Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call deduplicates enclosing classes, shared types, and callers across anchors.
+- Structure only (callers, callees, types, no bodies): `slice --outline`. Outlines are not always small; keep the default budget.
+- Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown` (or `--format xml`)
+- Where does a value come from (backward line slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable total --line 42 --format markdown`
+- What a value feeds (forward data slice): `codegraph-slicer flow --db "$GRAPH" package.module:func --variable x --direction forward --data-only --format markdown`
+- Branch vs base: sync each revision into its own database, then diff them:
 
   ```bash
-  codegraph-slicer slice --db "$GRAPH" --format xml \
-    path/file.py:Class.method path/other.py:helper
+  codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite
+  cp /tmp/base.sqlite /tmp/head.sqlite
+  codegraph-slicer sync . --db /tmp/head.sqlite
+  codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite
   ```
 
-- Prefer method/function anchors to giant class anchors. Default slice budget
-  is 8,000 estimated tokens. Do not manufacture 3–8 anchors just to fill a batch.
-- If direct target reads are already planned but relationships are needed,
-  consider `--target-mode skeleton`. Avoid loading a full body in both slice
-  and Read. If Edit requires Read, use a bounded fresh native read where safe;
-  do not assume a slice satisfies that tool's read requirement.
-- Condensed or omitted bodies are not complete source. Read the relevant source
-  before changing behavior whose implementation was omitted. Expand context
-  when surrounding invariants require it; do not obey a blanket ban on full reads.
-- Use `slice --outline` for structure-only questions; it is still budgeted.
-- Use `impact ANCHOR --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown`
-  for bounded transitive callers when that relationship is the question.
-- Use `flow --db "$GRAPH" ANCHOR --variable NAME --line LINE --format markdown`
-  for backward Python function-local flow; add `--direction forward --data-only`
-  for forward data dependence. It is a separate analysis, not routine completion.
-- Batch related retrieval, but do not assume tool output is permanently retained
-  in a model cache. Session deduplication is optional, not a correctness guarantee.
+  Default `delta` JSON bounds non-critical summary lists (up to 5 items per symbol list and 8 for `import_changes`, while keeping `boundary_violations` and `new_cycles` uncapped within budget; `omitted` reports any truncated counts) so output stays compact. Pass `--full` only when you need raw unfiltered delta arrays.
+  Add `--forbid-import SRC_PREFIX TGT_PREFIX` for layer rules.
 
-## Contracts and completion
+Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`, `path/File.java:Class.method`, `path/file.ts:Class.method`, `path/file.js:Class.method`, or `path/file:LINE`.
+`flow` takes only Python (`.py`) function or method anchors.
 
-Check helper return shapes, side effects, output ordering, early-return guards,
-imports, and state transitions before reuse. Preserve existing contracts except
-where the specification deliberately changes them. Run applicable tests and
-independent checks for new boundaries, error cases, and state transitions.
-Report passed, failed, skipped, and blocked cases separately. Static graph
-success never substitutes for executing the relevant behavior.
+## Limits (state them when you cite output)
 
-For ordinary implementation work, review source changes and `git diff --check`.
-Do not run delta as a ritual final step. Run it only for an explicit or necessary
-base-vs-head dependency, cycle, or layer-policy question. When it is needed:
-
-```bash
-codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite
-cp /tmp/base.sqlite /tmp/head.sqlite
-codegraph-slicer sync . --db /tmp/head.sqlite
-codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite
-```
-
-Use task-unique paths in real sessions to avoid collisions. Reuse a valid base
-snapshot instead of rebuilding it. Delta is static and never runs tests.
-
-## Limits
-
-- Unresolved references do not prove absence. Confirm relevant unknown boundaries
-  with source search; aggregate diagnostics are not a language confidence score.
-- `impact` follows resolved CALLS edges and has depth/node limits. Its snapshot-wide
-  unknown boundaries are not automatically linked to the selected anchor.
-- `flow` is Python function-local, calls are opaque, and unsupported constructs
-  may be refused. It does not establish runtime execution or cross-call value flow.
-- A bounded map/slice can omit files, entities, edges, or bodies. Inspect omission
-  metadata and never label a partial view complete.
-- Anchors include `pkg.mod:qualname`, `path/file.py:Class.method`, analogous
-  Java/TS/JS anchors, and `path/file:LINE`. Use hints from errors before retrying.
-- For an explicitly needed graph query that exceeds budget, retry once at the
-  suggested budget if useful. Compact implementation work falls back to reads.
+- Output is static evidence, not a verdict. Unresolved references do not prove absence; confirm with `grep`.
+- `impact` follows resolved `CALLS` edges backward with explicit depth and caller-node bounds. Its witnesses show call reachability, not value flow or runtime execution. It reports unresolved `CALLS` references across the indexed snapshot as potential unknown boundaries, not linked to the selected anchor; excess boundary records are counted and a truncated walk is not a complete impact set.
+- `flow` is function-local. Calls are opaque. Aliases and implicit exceptions are not modelled.
+- `flow` models `try`/`except`/`finally`, `with`, `async with` and comprehensions conservatively. It refuses `await`, `yield`, lambdas, nested definitions and imports with a source location. Use `slice` for those.
+- `delta` never runs tests. Run them separately.
+- Do not pick a budget below the default up front. If a command refuses for size, rerun once with `--max-tokens` at the N the error prints.
+- Errors print `hint:` lines (nearest anchors, snapshot commit). Use them before retrying.
