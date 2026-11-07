@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from pathlib import Path
 import xml.sax.saxutils as _saxutils
 
-from .ast_extractor import CodeGraphError
+from .ast_extractor import CodeGraphError, is_test_path
 from .delta import compute_delta, project_delta_v2, summarize_delta
 from .flow import FlowBudgetExceeded, FlowQueryError, UnsupportedFlowError, compact_flow_result
 from .flow_query import query_flow
@@ -198,6 +198,15 @@ def _xml(result):
 
 
 def render_xml_report(result):
+    recommendation = result.get("scale_recommendation")
+    if recommendation and ("items" in result or "files" in result):
+        clean = {key: value for key, value in result.items() if key != "scale_recommendation"}
+        rendered = render_xml_report(clean)
+        attrs = " ".join(
+            f"{key}={_xml_attr(str(value).lower() if isinstance(value, bool) else ','.join(value) if isinstance(value, list) else value)}"
+            for key, value in recommendation.items()
+        )
+        return rendered.replace("\n", f"\n  <ScaleRecommendation {attrs} />\n", 1)
     if "schema_version" in result and "entities" in result and "edges" in result:
         blocks = [f'<slice_outline schema_version="{result["schema_version"]}" tokens="{result.get("tokens", 0)}">']
         blocks.append("  <entities>")
@@ -359,6 +368,63 @@ def render_xml_report(result):
     return f"<codegraph_report>\n{_saxutils.escape(json.dumps(result, indent=2))}\n</codegraph_report>"
 
 
+def _file_language(path: str) -> str:
+    if path.endswith(".py"):
+        return "python"
+    if path.endswith(".java"):
+        return "java"
+    if path.endswith((".ts", ".tsx")):
+        return "typescript"
+    return "javascript"
+
+
+def _classify_scale(files: int, loc: int, languages: list[str], skipped: object) -> tuple[str, bool, list[str], str]:
+    if skipped:
+        return "direct_read", True, ["slice", "delta"], "incomplete_index"
+    if not files:
+        return "direct_read", True, ["slice", "delta"], "empty_index"
+    if files < 30 and loc < 5000:
+        return "map_then_read", True, ["slice", "delta"], "compact_scale"
+    if languages == ["python"] and files < 50 and loc < 7500:
+        return "map_then_read", True, ["slice", "delta"], "compact_python"
+    return "graph_optional", False, [], "graph_candidate"
+
+
+def _scale_recommendation(store):
+    rows = store.rows("SELECT path,loc FROM files")
+    production = [row for row in rows if not is_test_path(row["path"])]
+    skipped_row = store.db.execute(
+        "SELECT value FROM metadata WHERE key='skipped_files'"
+    ).fetchone()
+    skipped = json.loads(skipped_row[0] or "[]") if skipped_row else []
+    files = len(production)
+    loc = sum(row["loc"] for row in production)
+    languages = sorted({_file_language(row["path"]) for row in production})
+    mode, bypass, commands, reason = _classify_scale(files, loc, languages, skipped)
+    return {
+        "schema_version": 1,
+        "scope": "indexed_non_test_sources",
+        "source_files": files,
+        "source_loc": loc,
+        "languages": languages,
+        "mode": mode,
+        "bypass_slicer": bypass,
+        "skip_commands": commands,
+        "reason": reason,
+    }
+
+
+def _scale_render_estimator(output_format, recommendation):
+    def estimate(candidate):
+        candidate = {**candidate, "scale_recommendation": recommendation}
+        return rendered_tokens(
+            json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+            if output_format == "json" else
+            _markdown(candidate) if output_format == "markdown" else _xml(candidate)
+        )
+    return estimate
+
+
 def _render_budget_estimator(output_format, markdown_est=None):
     if output_format == "markdown":
         return markdown_est if markdown_est is not None else (lambda candidate: rendered_tokens(_markdown(candidate)))
@@ -424,6 +490,8 @@ def render_markdown_report(result):
         for name, records in result.get("omitted", {}).items():
             blocks.append(f"## Omitted {name}")
             blocks.append(f"- {name}: {records}")
+        if "scale_recommendation" in result:
+            blocks.append("ScaleRecommendation: " + json.dumps(result["scale_recommendation"], ensure_ascii=False, separators=(",", ":")))
         return "\n\n".join(blocks)
     if result.get("schema") == "python-delta-v2":
         blocks = ["# Static delta report (python-delta-v2)"]
@@ -554,7 +622,11 @@ def render_markdown_report(result):
         if "omitted" in result:
             mapped["omitted"] = result["omitted"]
             mapped["retrieve_details"] = result["retrieve_details"]
-        return render_markdown_report(mapped)
+        rendered = render_markdown_report(mapped)
+        if "scale_recommendation" in result:
+            rendered = f"Estimated context tokens: {result['tokens']}\n\n" + rendered
+            rendered += "\n\nScaleRecommendation: " + json.dumps(result["scale_recommendation"], ensure_ascii=False, separators=(",", ":"))
+        return rendered
     return (
         "# Code graph report\n\n```json\n"
         + json.dumps(result, ensure_ascii=False, indent=2)
@@ -609,6 +681,7 @@ def main(argv=None):
     mapping.add_argument("--seed", action="append", default=[], help="module or source path to rank from; repeatable (default: whole repository)")
     mapping.add_argument("--max-tokens", type=int, default=2000, help="estimated context budget (default: 2000)")
     mapping.add_argument("--outline", action="store_true", help="emit versioned per-entity JSON outline")
+    mapping.add_argument("--recommend-workflow", action="store_true", help="include an advisory workflow recommendation from indexed source scale")
     slicing = sub.add_parser(
         "slice",
         help="render implementations and related context for anchors",
@@ -766,16 +839,17 @@ def main(argv=None):
                 elif args.cmd == "map":
                     if not args.snapshot:
                         store.assert_fresh()
+                    recommendation = _scale_recommendation(store) if args.recommend_workflow else None
+                    render_estimator = (
+                        _scale_render_estimator(args.format, recommendation) if recommendation else
+                        _render_budget_estimator(args.format, _OutlineMarkdownEstimator() if args.outline else _MapMarkdownEstimator())
+                    )
                     if args.outline:
-                        result = build_repo_outline(
-                            store, args.seed, args.max_tokens,
-                            render_estimator=_render_budget_estimator(args.format, _OutlineMarkdownEstimator()),
-                        )
+                        result = build_repo_outline(store, args.seed, args.max_tokens, render_estimator=render_estimator)
                     else:
-                        result = build_repo_map(
-                            store, args.seed, args.max_tokens,
-                            render_estimator=_render_budget_estimator(args.format, _MapMarkdownEstimator()),
-                        )
+                        result = build_repo_map(store, args.seed, args.max_tokens, render_estimator=render_estimator)
+                    if recommendation:
+                        result["scale_recommendation"] = recommendation
                 elif args.cmd == "flow":
                     if not args.snapshot:
                         store.assert_fresh()

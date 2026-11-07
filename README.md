@@ -9,8 +9,9 @@ Requires Python 3.12+. Start with `codegraph-slicer --help`; see [HELP.md](HELP.
 codegraph-slicer sync /path/to/project --db /tmp/graph.sqlite
 codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
 
-# 2. Ranked repository map (PageRank over call/type/import graph)
+# 2. Ranked repository map (PageRank over call/type/import graph, with optional scale-based workflow advisory)
 codegraph-slicer map --db /tmp/graph.sqlite --seed package.module --max-tokens 2000 --format markdown
+codegraph-slicer map --db /tmp/graph.sqlite --recommend-workflow --format markdown
 
 # 3. Bounded XML context slice (target implementation + file imports + types + callers + callees)
 codegraph-slicer slice --db /tmp/graph.sqlite --max-tokens 8000 --format xml \
@@ -109,6 +110,7 @@ curl -fsSL -o ~/.claude/skills/codegraph-slicer/SKILL.md \
 
 - **Read-only queries & freshness checks:** `sync` is the only command that writes to the SQLite database. `map`, `slice`, `impact`, and `flow` open the database read-only and verify source freshness (exiting `2` with `StaleSnapshotError` if indexed files changed; pass `--snapshot` to query cached bytes without re-syncing).
 - **Resilient anchor resolution:** `slice` and `impact` accept `pkg.mod:qualname`, `path/file.ext:Class.method`, `path/file.ext:method` (unambiguous suffix match), `path/file.ext:LINE`, or `path/file.ext` (module anchor).
+- **Scale-based workflow advisory (`map --recommend-workflow`):** Adds a budget-accounted `scale_recommendation` (`ScaleRecommendation` in Markdown / `<ScaleRecommendation>` in XML) over indexed non-test sources (`source_files < 30 and source_loc < 5000`, or Python-only `source_files < 50 and source_loc < 7500` $\to$ `mode: "map_then_read"`, `bypass_slicer: true`, `skip_commands: ["slice", "delta"]`).
 - **Deterministic token budgeting:** `--max-tokens` bounds the complete printed JSON, Markdown, or XML output (`len(output) // 4 + 1`). When records are omitted to fit the budget, exact omission counts are reported.
 - **Static analysis boundary:** All outputs are static syntax and call/type-graph evidence, never proof of runtime execution or test passage. See [HELP.md](HELP.md) for full schema details and analysis limits.
 
