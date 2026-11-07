@@ -1399,8 +1399,20 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
 
 def _resolve_batch_method_fallback(store, anchor_str: str) -> dict | None:
     mod_part, sep, qual_part = anchor_str.rpartition(":")
-    if not sep or "." not in qual_part:
+    if not sep or not qual_part:
         return None
+    if "." not in qual_part:
+        if not qual_part[0].isupper():
+            return None
+        cls_rows = store.rows(
+            "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='class' ORDER BY start_line, symbol_id",
+            (mod_part, mod_part),
+        )
+        if len(cls_rows) != 1:
+            return None
+        cls_short = cls_rows[0]["qualname"].rsplit(".", 1)[-1]
+        ratio = difflib.SequenceMatcher(None, qual_part.lower(), cls_short.lower()).ratio()
+        return cls_rows[0] if ratio >= 0.6 else None
     _, _, m_short = qual_part.rpartition(".")
     m_rows = store.rows(
         "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='method' AND qualname GLOB ? ORDER BY start_line, symbol_id",
@@ -1735,7 +1747,7 @@ def _slice_context_in_snapshot(
                     candidates[sid]
                 )
                 sections[name].append(_callee_item(candidates[sid], full))
-    pre_dedup_types = list(sections["types_and_schemas"])
+    pre_dedup_map = {entry["symbol"]: entry for entry in sections["types_and_schemas"]}
     cache_path, sess_scope, all_sessions = _read_session_dedup(database, dedup_session)
     base_seen = all_sessions.get(sess_scope, {})
     deduped_ids, staged_seen = (
@@ -1766,12 +1778,17 @@ def _slice_context_in_snapshot(
     if complete["tokens"] <= max_tokens:
         _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
         return complete
-    sections["types_and_schemas"] = list(pre_dedup_types)
+    sections["types_and_schemas"] = [
+        pre_dedup_map[entry["symbol"]] if entry["symbol"] in deduped_ids else entry
+        for entry in sections["types_and_schemas"]
+    ]
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
     required = result()
     if required["tokens"] > max_tokens and compact_summaries:
         for sid, c_summary in compact_summaries.items():
+            if sid in deduped_ids:
+                continue
             sections["types_and_schemas"] = [
                 c_summary if entry["symbol"] == sid else entry
                 for entry in sections["types_and_schemas"]

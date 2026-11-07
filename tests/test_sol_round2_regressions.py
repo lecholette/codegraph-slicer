@@ -269,3 +269,15 @@ def test_round2_direct_helper_contracts(tmp_path):
     assert "<codegraph_report>" in render_xml_report({"custom": 1})
     assert "# Code graph report" in render_markdown_report({"custom": 1})
 
+    with workspace(
+        {
+            "srv.py": "def create_handler():\n    class ConfigRequestHandler:\n        pass\n    return ConfigRequestHandler\n",
+            "api.py": "class ConfigAPI:\n    pass\n",
+        }
+    ) as (s, r, d):
+        res = slice_context(s, ["api.py:ConfigAPI", "srv.py:ConfigHTTPRequestHandler"])
+        target_sids = {item["symbol"] for item in res["sections"]["target_implementations"]}
+        assert "srv:create_handler.ConfigRequestHandler" in target_sids
+        assert "unresolved_anchors" not in res
+
+
