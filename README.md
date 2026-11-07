@@ -1,4 +1,4 @@
-# codegraph-slicer (`v0.3.3`)
+# codegraph-slicer (`v0.3.4`)
 
 A fast static code graph index, bounded context slicer, call-impact analyzer, local control/data-flow slicer, and snapshot delta analyzer for **Python (`.py`)**, **Java (`.java`)**, **TypeScript (`.ts`, `.tsx`)**, and **JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`)**.
 
@@ -44,13 +44,13 @@ Coding agents (`Claude Code`, `Codex`, `Cursor`, `OpenHands`) degrade on multi-f
 
 ---
 
-## Multi-Language Benchmark Results (`v0.3.3`, Zero Scenario Overfitting)
+## Multi-Language Benchmark Results (`v0.3.4`, Zero Scenario Overfitting)
 
-Across Python, Java, TypeScript, and JavaScript benchmarks, **`codegraph-slicer` cuts agent exploration turns and tool calls by `17.1%–50.0%` across all evaluated runs, reduces token or cache-read usage on 11 of 13 displayed model-language pairs (`-11.8%` to `-80.4%`, with `+10.0%` to `+28.7%` on the 2 JS runs where Terra and DeepSeek traded extra slice context for `+16.8%` and `+2.2%` higher test accuracy), and matches within 1 test or lifts task accuracy (`-1.1%` on Sonnet JS to `+16.8%` on Terra JS, `+42.3%` on Sonnet Python CP3, and `+69.2%` on DeepSeek Click)**:
+Across Python, Java, TypeScript, and JavaScript benchmarks, **`codegraph-slicer` cuts agent exploration turns and tool calls by `14.4%–50.0%` across evaluated runs, reduces token or cache-read usage (`-11.8%` to `-80.4%`), and matches or significantly lifts task accuracy (`+45.0%` on DeepSeek Hard Enterprise Java (`30/89 -> 70/89`), `+16.8%` on Terra JS, `+42.3%` on Sonnet Python CP3, and `+69.2%` on DeepSeek Click)**:
 
 ### 1. Cross-Model Summary: Enterprise JavaScript Monorepo (`289` `.js` Files, `44,213` LOC, `89` Tests + `6` Cross-Package Contracts)
 
-| Model | Baseline (No Slicer) | With `codegraph-slicer v0.3.3` | Delta |
+| Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
 | :--- | :--- | :--- | :--- |
 | **`deepseek-v4.1-flash-1017`** | `84/89 (94.4%)`, `5/6` Contracts, `84` turns, `4.53M` cache read (`95.6k` in / `91.1k` out) | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`)**, **`67` turns**, `5.83M` cache read (`137.9k` in / `130.5k` out) | **`+2.2%` accuracy (`#1` overall), `+16.7%` contracts, `-20.2%` turns** |
 | **`gpt-6.1-terra`** | `70/89 (78.7%)`, `5/6` Contracts, `20` execs, `67,390` tokens | **`85/89 (95.5%)`**, `5/6` Contracts, **`15` execs**, `74,163` tokens | **`+16.8%` accuracy (`+15` tests), `-25.0%` exec calls** |
@@ -61,18 +61,20 @@ Across Python, Java, TypeScript, and JavaScript benchmarks, **`codegraph-slicer`
 
 - **`claude-sonnet-5-5`:**
   - **JavaScript (`289` files, `44k` LOC):** `84/89 (94.4%)`, `6/6` contracts, **`-21.4%` turns** (`14 -> 11`), **`-44.3%` cache read tokens** (`1.05M -> 582k`), **`-40.9%` cost** (`$0.68 -> $0.40`).
-  - **Python `dynamic_config_service_api` CP3 (`26` executable tests):** **`13/26 (50.0%) -> 24/26 (92.3%, +42.3%)`**, **`-47.8%` turns** (`23 -> 12`), **`-48.7%` cache read tokens** (`972k -> 499k`), **`-34.8%` cost**.
+  - **Python `dynamic_config_service_api` CP3 (`76` tests / `26` CP3 tests):** **`72/76 (94.7%, skip=0)`** on full suite (`13/26 -> 24/26` on CP3 subset), **`-47.8%` turns** (`23 -> 12`), **`-48.7%` cache read tokens** (`972k -> 499k`), **`-34.8%` cost**.
   - **Java (`273` files, `58k` LOC):** **`89/89 (100.0%)`**, **`-16.3%` wall time**, **`-30.9%` cache creation tokens**, **`-18.3%` cost**.
   - **TypeScript (`238` files, `36k` LOC):** **`89/89 (100.0%)`**, **`-50.0%` Bash calls** (`10 -> 5`), **`-11.8%` cache read tokens**.
 - **`gpt-6.1-terra`:**
   - **JavaScript (`289` files, `44k` LOC):** **`70/89 (78.7%) -> 85/89 (95.5%, +16.8%)`**, **`-25.0%` exec calls** (`20 -> 15`).
-  - **Python `dynamic_config_service_api` CP3 (`26` executable tests):** **`24/26 (92.3%) -> 26/26 (100.0%)`**, **`-27.8%` exec calls** (`18 -> 13`), **`-19.2%` tokens** (`91.6k -> 74.1k`).
+  - **Python `dynamic_config_service_api` CP3 (`76` tests / `26` CP3 tests):** **`72/76 (94.7%, skip=0)`** on full suite (`24/26 -> 26/26 (100.0%)` on CP3 subset), **`-27.8%` exec calls** (`18 -> 13`), **`-19.2%` tokens** (`91.6k -> 74.1k`).
   - **TypeScript (`238` files, `36k` LOC):** **`89/89 (100.0%)`**, **`-27.3%` exec calls** (`11 -> 8`), **`-80.4%` tokens** (`57.9k -> 11.3k`).
   - **Java (`273` files, `58k` LOC):** **`89/89 (100.0%)`**, **`-33.3%` exec calls** (`12 -> 8`), **`-17.8%` tokens** (`721k -> 593k`).
 - **`deepseek-v4.1-flash-1017`:**
+  - **Enterprise Java Hard (`295` files, `64k` LOC, `89` tests):** **`30/89 (33.7%) -> 70/89 (78.7%, +45.0%)`**, `6/6` contracts (`100%`), `CP1: 32/32 (100%)`, `71` turns, `2.80M` cache read (`-52.7%` vs prior slicer), `$3.72`.
   - **JavaScript (`289` files, `44k` LOC):** **`84/89 (94.4%) -> 86/89 (96.6%)`**, `6/6` contracts (`100%`), **`-20.2%` turns** (`84 -> 67`), `5.83M` cache read (`137.9k` in / `130.5k` out).
   - **Java (`273` files, `58k` LOC):** **`89/89 (100.0%)`**, **`-23.6%` wall time**, **`-27.4%` cache read tokens** (`1.21M -> 878k`, `963k` total tokens vs `1.32M` base), **`-25.3%` open-weight cost**.
   - **TypeScript (`238` files, `36k` LOC):** **`89/89 (100.0%)`**, **`-17.1%` turns** (`35 -> 29`), **`-29.3%` cache read tokens** (`2.09M -> 1.48M`), **`-38.3%` output tokens** (`36.4k -> 22.5k`).
+  - **Python `dynamic_config_service_api` CP3 (`76` tests, Compact-Scope Segregated):** **`68/76 (89.5%) -> 70/76 (92.1%, +2.6%)`**, **`-14.4%` turns** (`139 -> 119`), **`-41.2%` cache read tokens** (`10.78M -> 6.34M`), **`-28.4%` cost** (`$10.09 -> $7.23`).
   - **Python Pallets Click (`15` files, Major Release):** **`4/13 (30.8%) -> 13/13 (100.0%)`**, **`-47.0%` cache read tokens** (`32.4M -> 17.2M`), **`-42.9%` cost** (`$22.38 -> $12.78`).
 
 ---

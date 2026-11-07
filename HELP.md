@@ -92,14 +92,19 @@ Next, pass the created database to `map` or `slice`.
 
 ```text
 codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
-                      [--max-tokens N] [--outline]
+                      [--max-tokens N] [--outline] [--recommend-workflow]
                       [--format json|markdown|xml]
 ```
 
 `--db` must name an existing index and is opened read-only. Repeat `--seed` to
 rank from one or more indexed module names or source paths; with no seeds,
 ranking starts across the whole indexed repository. `--max-tokens` defaults to
-2000 and is a deterministic estimate, not a model tokenizer count. The map
+2000 and is a deterministic estimate, not a model tokenizer count. Add
+`--recommend-workflow` to include a deterministic `scale_recommendation`
+advisory (`file_count`, `total_loc`, `dominant_language`, `scale_tier`,
+`recommended_workflow`, `bypass_slicer`, and `reason`) classifying compact
+repositories vs. multi-package graph-eligible repositories within the
+`--max-tokens` budget. The map
 includes whole file skeletons in rank order while they fit. When files are
 omitted, JSON and Markdown report the exact omitted count; emitted and omitted
 counts reconcile to the complete map. Increase `--max-tokens` to retrieve more.
