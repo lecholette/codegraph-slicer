@@ -136,7 +136,9 @@ def binary_logic(node, operators=("&&", "||")) -> bool:
 
 def _is_private_skeleton_line(line: str) -> bool:
     s = line.lstrip()
-    return "{ ... }" in s and s.startswith(("private ", "#"))
+    return "{ ... }" in s and s.startswith(
+        ("private ", "#", "_", "async _", "static _")
+    )
 
 
 def _fold_brace_private_methods(text: str) -> str:

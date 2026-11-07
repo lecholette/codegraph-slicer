@@ -80,11 +80,21 @@ def _resolve_suffix_path_anchor(store, path: str, target: str):
     )
     if len(cand_files) != 1:
         return None
+    fpath = cand_files[0]["path"]
     rows = store.rows(
         "SELECT * FROM symbols WHERE file_path=? AND qualname=?",
-        (cand_files[0]["path"], target),
+        (fpath, target),
     )
-    return rows[0] if rows else None
+    if rows:
+        return rows[0]
+    if target and "." not in target:
+        s_rows = store.rows(
+            "SELECT * FROM symbols WHERE file_path=? AND qualname GLOB ? ORDER BY start_line, symbol_id",
+            (fpath, f"*.{target}"),
+        )
+        if len(s_rows) == 1:
+            return s_rows[0]
+    return None
 
 
 def _resolve_unique_qualname_anchor(store, anchor: str):
@@ -1055,7 +1065,7 @@ def _build_type_summaries(
         ):
             compact_summaries[sid] = compact_rec
         if (
-            (len(methods) >= 5 and full_size >= 500)
+            (len(methods) >= 3 and full_size >= 250)
             or (sid in py_enclosing and len(methods) >= 5)
             or (
                 row["file_path"].endswith(_BRACE_LANG_EXTS)
@@ -1148,9 +1158,9 @@ def _compact_cached_entry(entry: dict) -> dict:
     return {"symbol": entry["symbol"], "text": f"{head} // [cached in earlier slice]"}
 
 
-def _apply_session_dedup(sections: dict, database) -> None:
+def _apply_session_dedup(sections: dict, database) -> set[str]:
     if not database or str(database) == ":memory:":
-        return
+        return set()
     cache_path = Path(f"{database}.session.json")
     seen: dict[str, str] = {}
     if cache_path.is_file():
@@ -1158,12 +1168,15 @@ def _apply_session_dedup(sections: dict, database) -> None:
             seen = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             seen = {}
+    deduped: set[str] = set()
     for sec in ("types_and_schemas", "upstream_callers", "downstream_dependencies"):
         updated = []
         for entry in sections[sec]:
-            digest = hashlib.sha256(entry["text"].encode("utf-8")).hexdigest()
+            head_key = "\n".join(entry["text"].splitlines()[:2])
+            digest = hashlib.sha256(head_key.encode("utf-8")).hexdigest()
             if seen.get(entry["symbol"]) == digest:
                 updated.append(_compact_cached_entry(entry))
+                deduped.add(entry["symbol"])
             else:
                 seen[entry["symbol"]] = digest
                 updated.append(entry)
@@ -1172,11 +1185,12 @@ def _apply_session_dedup(sections: dict, database) -> None:
         cache_path.write_text(json.dumps(seen), encoding="utf-8")
     except OSError:
         pass
+    return deduped
 
 
 def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database, max_tokens):
     required = result_fn()
-    if required["tokens"] <= max_tokens or len(chosen) <= 1 or max_tokens < 1000:
+    if required["tokens"] <= max_tokens or max_tokens < 1000:
         return required
     db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
     sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
@@ -1493,8 +1507,8 @@ def slice_context(
                     candidates[sid]
                 )
                 sections[name].append(_callee_item(candidates[sid], full))
-    if dedup_session:
-        _apply_session_dedup(sections, database)
+    deduped_ids = _apply_session_dedup(sections, database) if dedup_session else set()
+    auto_summarize_ids.update(deduped_ids)
     complete = result()
     if complete["tokens"] <= max_tokens:
         return complete
@@ -1521,6 +1535,8 @@ def slice_context(
     required = result()
     if required["tokens"] > max_tokens and compact_summaries:
         for sid, c_summary in compact_summaries.items():
+            if sid in deduped_ids:
+                continue
             sections["types_and_schemas"] = [
                 c_summary if entry["symbol"] == sid else entry
                 for entry in sections["types_and_schemas"]
