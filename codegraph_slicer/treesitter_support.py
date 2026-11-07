@@ -134,6 +134,30 @@ def binary_logic(node, operators=("&&", "||")) -> bool:
     )
 
 
+def _is_private_skeleton_line(line: str) -> bool:
+    s = line.lstrip()
+    return "{ ... }" in s and s.startswith(("private ", "#"))
+
+
+def _fold_brace_private_methods(text: str) -> str:
+    lines = text.splitlines()
+    priv_idxs = [i for i, ln in enumerate(lines) if _is_private_skeleton_line(ln)]
+    if len(priv_idxs) <= 3:
+        return text
+    omitted = len(priv_idxs) - 3
+    drop_set = set(priv_idxs[3:])
+    last_kept = priv_idxs[2]
+    indent = lines[last_kept][: len(lines[last_kept]) - len(lines[last_kept].lstrip())]
+    out_lines: list[str] = []
+    for i, ln in enumerate(lines):
+        if i in drop_set:
+            continue
+        out_lines.append(ln)
+        if i == last_kept:
+            out_lines.append(f"{indent}// ... (+{omitted} private methods)")
+    return "\n".join(out_lines) + "\n"
+
+
 def build_brace_skeleton(data: bytes, block_nodes: list) -> str:
     span_set = {(n.start_byte, n.end_byte) for n in block_nodes}
     outer = [
@@ -149,7 +173,8 @@ def build_brace_skeleton(data: bytes, block_nodes: list) -> str:
     for block in outer:
         out[block.start_byte : block.end_byte] = b"{ ... }"
     text = out.decode("utf-8")
-    return text if text.endswith("\n") else text + "\n"
+    normalized = text if text.endswith("\n") else text + "\n"
+    return _fold_brace_private_methods(normalized)
 
 
 def signature_before_body(data: bytes, decl_node, body_node) -> str:

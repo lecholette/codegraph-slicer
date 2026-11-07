@@ -1,8 +1,10 @@
 """Bounded contexts and output budget estimates."""
 
 import ast
-import json
 import difflib
+import hashlib
+import json
+from pathlib import Path
 import re
 import shlex
 import textwrap
@@ -69,6 +71,33 @@ def _with_output_tokens(result, render_estimator=None):
         result["tokens"] = estimate
 
 
+def _resolve_suffix_path_anchor(store, path: str, target: str):
+    if not is_supported_source_path(path):
+        return None
+    cand_files = store.rows(
+        "SELECT path FROM files WHERE path GLOB ? ORDER BY length(path), path",
+        (f"*/{path.lstrip('/')}",),
+    )
+    if len(cand_files) != 1:
+        return None
+    rows = store.rows(
+        "SELECT * FROM symbols WHERE file_path=? AND qualname=?",
+        (cand_files[0]["path"], target),
+    )
+    return rows[0] if rows else None
+
+
+def _resolve_unique_qualname_anchor(store, anchor: str):
+    q_rows = store.rows(
+        "SELECT * FROM symbols WHERE qualname=? AND kind!='module' ORDER BY start_line, symbol_id",
+        (anchor,),
+    )
+    non_test = [r for r in q_rows if not _is_test_symbol(r)]
+    if len(non_test) == 1:
+        return non_test[0]
+    return q_rows[0] if len(q_rows) == 1 else None
+
+
 def _anchor(store, anchor):
     exact = store.rows("SELECT * FROM symbols WHERE symbol_id=?", (anchor,))
     if exact:
@@ -104,6 +133,10 @@ def _anchor(store, anchor):
             )
             if len(suffix_rows) == 1:
                 return suffix_rows[0]
+        if line == 0:
+            suf_match = _resolve_suffix_path_anchor(store, path, target)
+            if suf_match is not None:
+                return suf_match
     if not separator and is_supported_source_path(anchor):
         mod_rows = store.rows(
             "SELECT * FROM symbols WHERE file_path=? AND qualname=''",
@@ -111,6 +144,9 @@ def _anchor(store, anchor):
         )
         if mod_rows:
             return mod_rows[0]
+        suf_mod = _resolve_suffix_path_anchor(store, anchor, "")
+        if suf_mod is not None:
+            return suf_mod
     if separator and "." in path and target:
         java_cls = path.rsplit(".", 1)[-1]
         java_cand = f"{path}:{java_cls}.{target}"
@@ -139,6 +175,10 @@ def _anchor(store, anchor):
             )
             if java_m_rows:
                 return java_m_rows[0]
+    if not separator:
+        uniq_match = _resolve_unique_qualname_anchor(store, anchor)
+        if uniq_match is not None:
+            return uniq_match
     error = AnchorNotFoundError(anchor)
     rows = sorted(
         store.rows("SELECT file_path,module,qualname FROM symbols"),
@@ -889,10 +929,34 @@ def _select_compact_methods(
         m for m in candidate_methods
         if _is_priority_compact_method(m, ctor_names, referenced_names, target_self_attrs)
     ]
-    is_java_all = row["file_path"].endswith(".java") and len(candidate_methods) <= 18
+    is_java_all = (
+        row["file_path"].endswith(".java")
+        and not referenced_names
+        and len(candidate_methods) <= 18
+    )
     fill_limit = 18 if is_java_all else 4
     extra = [m for m in candidate_methods if m not in kept][: max(0, fill_limit - len(kept))]
     return (kept + extra)[: (18 if is_java_all else 10)]
+
+
+def _extract_brace_class_fields(
+    row: dict, methods: list[dict], nested_classes: list[dict]
+) -> list[str]:
+    body_lines = row["body"].splitlines()
+    bound_lines = [m["start_line"] for m in (*methods, *nested_classes)]
+    first_offset = (
+        min(bound_lines) - row["start_line"] if bound_lines else len(body_lines)
+    )
+    fields: list[str] = []
+    for fline in body_lines[1 : max(1, first_offset)]:
+        sf = fline.strip()
+        if (
+            sf.endswith(";")
+            and "(" not in sf
+            and not sf.startswith(("this.", "return ", "//", "/*", "*"))
+        ):
+            fields.append(f"    {sf}")
+    return fields
 
 
 def _build_type_summaries(
@@ -952,30 +1016,25 @@ def _build_type_summaries(
         compact_lines = [row["signature"]]
         if doc_line:
             compact_lines.append(doc_line)
-        if row["file_path"].endswith(_BRACE_LANG_EXTS):
-            first_m_offset = (
-                (methods[0]["start_line"] - row["start_line"])
-                if methods
-                else len(row["body"].splitlines())
-            )
-            for fline in row["body"].splitlines()[1:max(1, first_m_offset)]:
-                sf = fline.strip()
-                if sf.endswith(";") and "(" not in sf and not sf.startswith(("//", "/*", "*")):
-                    compact_lines.append(f"    {sf}")
-        if row["file_path"].endswith(".java"):
-            nested_classes = store.rows(
+        nested_classes = (
+            store.rows(
                 """SELECT * FROM symbols WHERE file_path=? AND kind='class'
                    AND qualname GLOB ? ORDER BY start_line, symbol_id""",
                 (row["file_path"], f"{row['qualname']}.*"),
             )
-            for nc in nested_classes:
-                if nc["qualname"].rpartition(".")[0] == row["qualname"] and (
-                    nc["end_line"] - nc["start_line"] <= 30
-                ):
-                    for nline in nc["body"].splitlines():
-                        sline = nline.strip()
-                        if sline.startswith(("public final ", "public static class ", "public " + nc["qualname"].rsplit(".", 1)[-1] + "(")):
-                            compact_lines.append(f"    {sline}")
+            if row["file_path"].endswith(".java")
+            else []
+        )
+        if row["file_path"].endswith(_BRACE_LANG_EXTS):
+            compact_lines.extend(_extract_brace_class_fields(row, methods, nested_classes))
+        for nc in nested_classes:
+            if nc["qualname"].rpartition(".")[0] == row["qualname"] and (
+                nc["end_line"] - nc["start_line"] <= 30
+            ):
+                for nline in nc["body"].splitlines():
+                    sline = nline.strip()
+                    if sline.startswith(("public final ", "public static class ", "public " + nc["qualname"].rsplit(".", 1)[-1] + "(")):
+                        compact_lines.append(f"    {sline}")
         class_short_name = row["qualname"].rsplit(".", 1)[-1]
         ctor_names = {"__init__", "__new__", "constructor", class_short_name}
         kept_methods = _select_compact_methods(row, methods, ctor_names, referenced_names, self_attrs)
@@ -990,12 +1049,9 @@ def _build_type_summaries(
             compact_lines.append(f"    {comment_pfx} ... (+{omitted_m} more methods)")
         compact_rec = _slice_item(row, False)
         compact_rec["text"] = f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n" + "\n".join(compact_lines)
-        non_ctor_methods = [
-            m for m in methods if m["qualname"].rsplit(".", 1)[-1] not in ctor_names
-        ]
         if len(methods) >= 2 or (
             row["file_path"].endswith(_BRACE_LANG_EXTS)
-            and len(non_ctor_methods) >= 1
+            and len(methods) >= 1
         ):
             compact_summaries[sid] = compact_rec
         if (
@@ -1003,8 +1059,8 @@ def _build_type_summaries(
             or (sid in py_enclosing and len(methods) >= 5)
             or (
                 row["file_path"].endswith(_BRACE_LANG_EXTS)
-                and len(non_ctor_methods) >= 1
-                and full_size >= 200
+                and len(methods) >= 1
+                and full_size >= 120
             )
         ):
             auto_summarize_ids.add(sid)
@@ -1022,18 +1078,20 @@ def _format_condensed_method_body(body: str, comment_pfx: str) -> str:
     )
 
 
-def _condense_class_public_methods(store, sid: str, row: dict, db_arg: str, max_tokens: int) -> str | None:
-    if row["kind"] != "class":
+def _condense_class_public_methods(
+    store, sid: str, row: dict, db_arg: str, max_tokens: int, min_internal: int = 1
+) -> str | None:
+    if row["kind"] not in {"class", "module"}:
         return None
     methods = store.rows(
         """SELECT * FROM symbols WHERE file_path=? AND kind='method'
            AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
         (row["file_path"], row["start_line"], row["end_line"]),
     )
-    ctor_names = {"__init__", "__new__", "constructor", row["qualname"]}
+    ctor_names = {"__init__", "__new__", "constructor", row["qualname"].rsplit(".", 1)[-1]}
     pub_methods = [m for m in methods if not _is_internal_method(m, ctor_names)]
     int_methods = [m for m in methods if _is_internal_method(m, ctor_names)]
-    if not pub_methods or not int_methods:
+    if not pub_methods or len(int_methods) < min_internal:
         return None
     body_lines = row["body"].splitlines()
     first_m_offset = max(1, methods[0]["start_line"] - row["start_line"])
@@ -1041,15 +1099,79 @@ def _condense_class_public_methods(store, sid: str, row: dict, db_arg: str, max_
     comment_pfx = _comment_prefix(row["file_path"])
     full_size = tokens_for_length(len(row["body"]))
     expand_budget = max(max_tokens, full_size * 2)
+    span_len = row["end_line"] - row["start_line"] + 1
     kept_parts.append(
-        f"    {comment_pfx} ... ({len(int_methods)} internal helper methods condensed; fetch full class with: "
-        f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {expand_budget})"
+        f"    {comment_pfx} ... ({len(int_methods)} internal helper methods condensed in "
+        f"{row['file_path']}:{row['start_line']}-{row['end_line']}; "
+        f"use Read offset={row['start_line']} limit={span_len} or --max-tokens {expand_budget})"
     )
     for m in pub_methods:
         kept_parts.append(_format_condensed_method_body(m["body"], comment_pfx))
     if row["file_path"].endswith(_BRACE_LANG_EXTS):
         kept_parts.append("}")
     return "\n".join(kept_parts)
+
+
+def _target_skeleton_item(row: dict) -> dict:
+    doc = _first_docstring_line(row["body"])
+    sig = f"{row['signature']}\n    {doc}" if doc else row["signature"]
+    return {
+        "symbol": row["symbol_id"],
+        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{sig}",
+    }
+
+
+def _build_target_entry(
+    store,
+    row: dict,
+    chosen: dict,
+    max_tokens: int,
+    emitted_headers: set[str],
+    target_mode: str,
+) -> dict:
+    if target_mode == "skeleton":
+        return _target_skeleton_item(row)
+    entry = _target_item_with_preamble(store, row, chosen, max_tokens, emitted_headers)
+    if max_tokens >= 2000 and len(row["body"].splitlines()) >= 100:
+        condensed = _condense_class_public_methods(
+            store, row["symbol_id"], row, "GRAPH", max_tokens, min_internal=5
+        )
+        if condensed is not None and len(condensed) < len(row["body"]):
+            prefix = entry["text"][: len(entry["text"]) - len(row["body"])]
+            return {"symbol": entry["symbol"], "text": f"{prefix}{condensed}"}
+    return entry
+
+
+def _compact_cached_entry(entry: dict) -> dict:
+    lines = entry["text"].splitlines()
+    head = "\n".join(lines[:2]) if len(lines) >= 2 else entry["text"]
+    return {"symbol": entry["symbol"], "text": f"{head} // [cached in earlier slice]"}
+
+
+def _apply_session_dedup(sections: dict, database) -> None:
+    if not database or str(database) == ":memory:":
+        return
+    cache_path = Path(f"{database}.session.json")
+    seen: dict[str, str] = {}
+    if cache_path.is_file():
+        try:
+            seen = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            seen = {}
+    for sec in ("types_and_schemas", "upstream_callers", "downstream_dependencies"):
+        updated = []
+        for entry in sections[sec]:
+            digest = hashlib.sha256(entry["text"].encode("utf-8")).hexdigest()
+            if seen.get(entry["symbol"]) == digest:
+                updated.append(_compact_cached_entry(entry))
+            else:
+                seen[entry["symbol"]] = digest
+                updated.append(entry)
+        sections[sec] = updated
+    try:
+        cache_path.write_text(json.dumps(seen), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database, max_tokens):
@@ -1078,12 +1200,14 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
         body_lines = row["body"].splitlines()
         if len(body_lines) <= 30:
             continue
-        full_size = tokens_for_length(len(row["body"]))
         comment_pfx = _comment_prefix(row["file_path"])
+        omitted_count = len(body_lines) - 26
+        omitted_start = row["start_line"] + 18
+        omitted_end = row["end_line"] - 8
         condensed_body = (
             "\n".join(body_lines[:18])
-            + f"\n    {comment_pfx} ... ({len(body_lines) - 26} lines condensed; fetch full body with: "
-            + f"codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)})\n"
+            + f"\n    {comment_pfx} ... ({omitted_count} lines condensed; lines {omitted_start}-{omitted_end} of {row['file_path']}; "
+            + f"use Read offset={omitted_start} limit={omitted_count})\n"
             + "\n".join(body_lines[-8:])
         )
         condensed_item = {
@@ -1100,7 +1224,7 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
 
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
-    render_estimator=None, database=None,
+    render_estimator=None, database=None, target_mode="full", dedup_session=False,
 ):
     if (
         not isinstance(max_tokens, int)
@@ -1138,9 +1262,10 @@ def slice_context(
     emitted_headers: set[str] = set()
     target_self_attrs: set[str] = set()
     enclosing_py_classes: set[str] = set()
+    max_type_depth = 2 if len(chosen) > 1 else 3
     for sid, row in sorted(chosen.items()):
         sections["target_implementations"].append(
-            _target_item_with_preamble(store, row, chosen, max_tokens, emitted_headers)
+            _build_target_entry(store, row, chosen, max_tokens, emitted_headers, target_mode)
         )
         target_self_attrs.update(_extract_self_attrs(row["body"]))
         for token in row["body"].replace("(", " ").replace(".", " ").split():
@@ -1164,7 +1289,7 @@ def slice_context(
                 if enc_rows:
                     types[enclosing_class_sid] = enc_rows[0]
                     enclosing_py_classes.add(enclosing_class_sid)
-        elif row["kind"] == "class" and row["file_path"].endswith(_BRACE_LANG_EXTS):
+        elif row["kind"] == "class":
             for mrow in store.rows(
                 "SELECT target_id FROM edges WHERE source_id=? AND kind='DEFINES'",
                 (sid,),
@@ -1175,10 +1300,10 @@ def slice_context(
                 """WITH RECURSIVE closure(node,depth) AS (
                     SELECT ?,0 UNION SELECT e.target_id,c.depth+1 FROM edges e
                     JOIN closure c ON e.source_id=c.node
-                    WHERE e.kind IN ('USES_TYPE','INHERITS') AND c.depth<3
+                    WHERE e.kind IN ('USES_TYPE','INHERITS') AND c.depth<?
                 ) SELECT DISTINCT s.* FROM symbols s JOIN closure c ON s.symbol_id=c.node
                     WHERE c.depth>0 AND s.kind IN ('class','type_alias') ORDER BY s.symbol_id""",
-                (seed_id,),
+                (seed_id, max_type_depth),
             ):
                 if (
                     related["symbol_id"] not in chosen
@@ -1198,7 +1323,8 @@ def slice_context(
         _recover_chained_callers(store, row, chosen, all_target_in_test, callers, caller_lines)
         for related in store.rows(
             """SELECT DISTINCT s.* FROM symbols s JOIN edges e
-                ON s.symbol_id=e.target_id WHERE e.source_id=? AND e.kind='CALLS' """,
+                ON s.symbol_id=e.target_id WHERE e.source_id=? AND e.kind='CALLS'
+                ORDER BY s.symbol_id""",
             (sid,),
         ):
             if related["symbol_id"] not in chosen and related["symbol_id"] not in types:
@@ -1262,6 +1388,12 @@ def slice_context(
         target_self_attrs=target_self_attrs,
         enclosing_py_classes=enclosing_py_classes,
     )
+    from .pagerank import rank
+
+    scores = rank(store, seed_symbols=tuple(chosen))
+    if len(chosen) > 1 and callees and len(callers) > 4:
+        top_caller_ids = sorted(callers, key=lambda s: (-scores.get(s, 0), s))[:4]
+        callers = {sid: callers[sid] for sid in top_caller_ids}
     totals = {name: len(items) for name, items in sections.items()}
     totals["upstream_callers"] = len(callers)
     totals["downstream_dependencies"] = len(callees)
@@ -1282,8 +1414,9 @@ def slice_context(
             omitted_ids = []
             omitted_budget = 0
             for name, candidates in (("upstream_callers", callers), ("downstream_dependencies", callees)):
-                for sid, candidate in candidates.items():
+                for sid in sorted(candidates, key=lambda s: (-scores.get(s, 0), s)):
                     if sid not in emitted:
+                        candidate = candidates[sid]
                         size = tokens_for_length(len(candidate["body"]))
                         omitted_details.append(f"{sid} ({size} tokens)")
                         omitted_ids.append(shlex.quote(sid))
@@ -1304,9 +1437,6 @@ def slice_context(
             payload["retrieve_details"] = "; ".join(notes) or "rerun with --max-tokens N"
         return _with_output_tokens(payload, render_estimator)
 
-    from .pagerank import rank
-
-    scores = rank(store, seed_symbols=tuple(chosen))
     for sid in auto_summarize_ids:
         sections["types_and_schemas"] = [
             compact_summaries[sid] if entry["symbol"] == sid else entry
@@ -1363,6 +1493,8 @@ def slice_context(
                     candidates[sid]
                 )
                 sections[name].append(_callee_item(candidates[sid], full))
+    if dedup_session:
+        _apply_session_dedup(sections, database)
     complete = result()
     if complete["tokens"] <= max_tokens:
         return complete
@@ -1387,11 +1519,6 @@ def slice_context(
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
     required = result()
-    if required["tokens"] > max_tokens:
-        sections["target_implementations"] = [
-            item(row, True) for _, row in sorted(chosen.items())
-        ]
-        required = result()
     if required["tokens"] > max_tokens and compact_summaries:
         for sid, c_summary in compact_summaries.items():
             sections["types_and_schemas"] = [
@@ -1400,6 +1527,11 @@ def slice_context(
             ]
         required = result()
     required = _condense_multi_anchor_targets(store, chosen, sections, result, database, max_tokens)
+    if required["tokens"] > max_tokens and target_mode != "skeleton":
+        sections["target_implementations"] = [
+            item(row, True) for _, row in sorted(chosen.items())
+        ]
+        required = _condense_multi_anchor_targets(store, chosen, sections, result, database, max_tokens)
     if required["tokens"] > max_tokens and any(
         totals[name] > len(sections[name])
         for name in ("upstream_callers", "downstream_dependencies")
@@ -1414,8 +1546,8 @@ def slice_context(
             f"required definitions need {required['tokens']} tokens including omission metadata, budget is {max_tokens}"
         )
     for name, candidates in (
-        ("upstream_callers", callers),
         ("downstream_dependencies", callees),
+        ("upstream_callers", callers),
     ):
         for sid in sorted(candidates, key=lambda s: (-scores.get(s, 0), s)):
             if name == "upstream_callers":
@@ -1435,6 +1567,8 @@ def slice_context(
                     if result()["tokens"] > max_tokens:
                         sections[name].pop()
                         body_fallbacks.pop(sid)
+    if dedup_session:
+        _apply_session_dedup(sections, database)
     final = result()
     if final["tokens"] > max_tokens:
         raise RequiredAnchorOverflow(

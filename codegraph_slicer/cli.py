@@ -593,6 +593,8 @@ def main(argv=None):
     slicing.add_argument("--outline", action="store_true", help="emit a versioned, body-free entity graph")
     slicing.add_argument("--include-imports", action="store_true", help="include module and import hops in an outline")
     slicing.add_argument("--include-callee-bodies", action="store_true", help="include optional callee implementations (default: disabled)")
+    slicing.add_argument("--target-mode", choices=("full", "skeleton"), default="full", help="target implementation detail level (default: full)")
+    slicing.add_argument("--dedup-session", action="store_true", help="compact repeated types and callers across slice calls on the same snapshot")
     impact = sub.add_parser(
         "impact",
         help="find bounded transitive callers over resolved call edges",
@@ -791,6 +793,8 @@ def main(argv=None):
                             store, args.anchors, args.max_tokens, args.include_callee_bodies,
                             database=args.db,
                             render_estimator=_render_budget_estimator(args.format),
+                            target_mode=args.target_mode,
+                            dedup_session=args.dedup_session,
                         )
         if args.format == "markdown":
             rendered = _markdown(result)

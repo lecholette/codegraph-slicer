@@ -56,7 +56,7 @@ def _graph_cycles(store):
             src, dst = source.split(":")[0], target.split(":")[0]
             if src != dst:
                 modules[src].add(dst)
-        elif edge["kind"] == "CALLS":
+        elif edge["kind"] == "CALLS" and source != target:
             calls[source].add(target)
     return _cycles(modules) | _cycles(calls)
 
@@ -76,7 +76,9 @@ def compute_delta(
     _earliest_edge_lines=False,
 ):
     def edges(store):
-        rows = store.rows("SELECT source_id,target_id,kind,line FROM edges")
+        rows = store.rows(
+            "SELECT source_id,target_id,kind,line FROM edges ORDER BY source_id,target_id,kind,line"
+        )
         if not _earliest_edge_lines:
             return {(r["source_id"], r["target_id"], r["kind"]): r["line"] for r in rows}
         found = {}

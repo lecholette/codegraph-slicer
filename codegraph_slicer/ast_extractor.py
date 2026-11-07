@@ -185,7 +185,26 @@ def _signature(node, text: str) -> str:
     raise CodeGraphParseError(f"missing definition header on line {node.lineno}")
 
 
+def _is_py_private_method(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and stmt.name.startswith("_")
+        and not (stmt.name.startswith("__") and stmt.name.endswith("__"))
+    )
+
+
 class _Strip(ast.NodeTransformer):
+    def visit_ClassDef(self, node: ast.ClassDef):
+        self.generic_visit(node)
+        priv_idxs = [i for i, s in enumerate(node.body) if _is_py_private_method(s)]
+        if len(priv_idxs) <= 3:
+            return node
+        omitted = len(priv_idxs) - 3
+        drop_set = set(priv_idxs[3:])
+        node.body = [s for i, s in enumerate(node.body) if i not in drop_set]
+        node.body.append(ast.Expr(value=ast.Constant(value=f"... (+{omitted} private methods)")))
+        return node
+
     def _function(self, node):
         doc = node.body[:1] if ast.get_docstring(node, clean=False) is not None else []
         node.body = doc + [ast.Expr(value=ast.Constant(value=Ellipsis))]
