@@ -330,8 +330,18 @@ def _resolve_ts_import(
             cleaned = _strip_ts_source_root(replacement, source_root)
             break
     else:
-        if cleaned.startswith("@/"):
+        if cleaned.startswith(("@/", "~/")):
             cleaned = cleaned[2:]
+            rel_mod = _strip_ts_source_root(current_path, source_root)
+            parts = PurePosixPath(rel_mod).parts
+            if len(parts) >= 3 and parts[0] in {"packages", "apps", "libs", "services", "modules"}:
+                pkg_prefix = (
+                    f"{parts[0]}/{parts[1]}/src"
+                    if len(parts) >= 4 and parts[2] == "src"
+                    else f"{parts[0]}/{parts[1]}"
+                )
+                if not cleaned.startswith(pkg_prefix + "/"):
+                    cleaned = f"{pkg_prefix}/{cleaned}"
         elif cleaned.startswith("."):
             rel_file = current_path.removeprefix(source_root)
             parent_parts = list(PurePosixPath(rel_file).parent.parts)
@@ -576,6 +586,7 @@ def extract_typescript_file(
     exported_names: set[str] = set()
     has_explicit_exports = False
     func_return_types: dict[str, str] = {}
+    method_return_types: list[tuple[str, str]] = []
     deferred_local_exports: list[tuple[str, str]] = []
 
     def add_or_merge_symbol(sym: Symbol, prefer_new_sig: bool = True):
@@ -632,32 +643,42 @@ def extract_typescript_file(
             return base
         return f"?{name}"
 
-    def _clean_jsdoc_type(raw_expr: str, owner_sid: str, line: int) -> str | None:
+    def _clean_jsdoc_types(raw_expr: str, owner_sid: str, line: int) -> list[str]:
         expr = raw_expr.strip().rstrip("=").strip().lstrip("?!.")
         parts = [
             p.strip().lstrip("?!")
             for p in expr.split("|")
             if p.strip() not in {"null", "undefined", "void", "*"}
         ]
-        if not parts:
-            return None
-        expr = re.sub(r"^(?:Promise|Readonly|Partial|Required|NonNullable|Awaited)\s*<\s*(.+)\s*>$", r"\1", parts[0]).strip()
-        m_imp = _JSDOC_IMPORT_RE.match(expr)
-        if m_imp:
-            spec, sym_name = m_imp.group(1), m_imp.group(2) or "default"
-            mod_target = _resolve_ts_import(spec, path, source_root, aliases_cfg)
-            target = f"{mod_target}{MODULE_END}{sym_name}"
-            emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
-            emit(owner_sid, target, "USES_TYPE", line)
-            local_alias = f"__jsdoc_{mod_target}::{sym_name}"
-            bindings[local_alias] = target
-            return local_alias
-        tname = re.split(r"[^A-Za-z0-9_$.]", expr)[0]
-        if not tname:
-            return None
-        if tname.split(".")[0] not in _TS_BUILTINS:
-            emit(owner_sid, resolve_ref(tname), "USES_TYPE", line)
-        return tname
+        out: list[str] = []
+        for raw_part in parts[:4]:
+            part = re.sub(
+                r"^(?:Promise|Readonly|Partial|Required|NonNullable|Awaited)\s*<\s*(.+)\s*>$",
+                r"\1",
+                raw_part,
+            ).strip()
+            m_imp = _JSDOC_IMPORT_RE.match(part)
+            if m_imp:
+                spec, sym_name = m_imp.group(1), m_imp.group(2) or "default"
+                mod_target = _resolve_ts_import(spec, path, source_root, aliases_cfg)
+                target = f"{mod_target}{MODULE_END}{sym_name}"
+                emit(f"{module}:", f"{mod_target}{MODULE_END}", "IMPORTS", line)
+                emit(owner_sid, target, "USES_TYPE", line)
+                local_alias = f"__jsdoc_{mod_target}::{sym_name}"
+                bindings[local_alias] = target
+                out.append(local_alias)
+                continue
+            tname = re.split(r"[^A-Za-z0-9_$.]", part)[0]
+            if not tname:
+                continue
+            if tname.split(".")[0] not in _TS_BUILTINS:
+                emit(owner_sid, resolve_ref(tname), "USES_TYPE", line)
+            out.append(tname)
+        return out
+
+    def _clean_jsdoc_type(raw_expr: str, owner_sid: str, line: int) -> str | None:
+        cleaned = _clean_jsdoc_types(raw_expr, owner_sid, line)
+        return cleaned[0] if cleaned else None
 
     def _parse_jsdoc(
         node, outer_node, owner_sid: str
@@ -672,7 +693,15 @@ def extract_typescript_file(
             cleaned = _clean_jsdoc_type(m.group(1), owner_sid, line)
             if cleaned:
                 param_types[pname] = cleaned
-        ret_type = next((_clean_jsdoc_type(raw, owner_sid, line) for raw in _JSDOC_RETURN_RE.findall(txt)), None)
+        ret_types = [
+            t
+            for raw in _JSDOC_RETURN_RE.findall(txt)
+            for t in _clean_jsdoc_types(raw, owner_sid, line)
+        ]
+        for rt in ret_types:
+            if ":" in owner_sid and "." in owner_sid.split(":", 1)[1] and rt not in _TS_BUILTINS:
+                method_return_types.append((owner_sid, rt))
+        ret_type = ret_types[0] if ret_types else None
         var_type = next((_clean_jsdoc_type(raw, owner_sid, line) for raw in _JSDOC_TYPE_RE.findall(txt)), None)
         return param_types, ret_type, var_type
 
@@ -875,6 +904,11 @@ def extract_typescript_file(
                         bindings.setdefault("require", f"{module}:require")
                     ident = child_of_type(decl, "identifier")
                     val = child_of_type(decl, "arrow_function", "function_expression", "class")
+                    if val is None and is_exported:
+                        call_val = child_of_type(decl, "call_expression")
+                        args_node = child_of_type(call_val, "arguments") if call_val is not None else None
+                        if args_node is not None and child_of_type(args_node, "arrow_function", "function_expression", "object") is not None:
+                            val = call_val
                     if ident is not None and val is not None:
                         name = node_text(data, ident)
                         sid = f"{module}:{name}"
@@ -1183,7 +1217,10 @@ def extract_typescript_file(
                         local_types[node_text(data, vident)] = "__closure__"
                         continue
                     base_t = _base_ts_type_name(data, tann) or jsdoc_var_type
-                    new_expr = child_of_type(decl, "new_expression")
+                    new_expr = child_of_type(decl, "new_expression") or next(
+                        (d for d in scoped_descendants(decl, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}) if d.type == "new_expression"),
+                        None,
+                    )
                     if base_t is None and new_expr is not None:
                         ctor = child_of_type(
                             new_expr, "identifier", "type_identifier", "member_expression"
@@ -1198,12 +1235,28 @@ def extract_typescript_file(
                                 call_expr = child_of_type(aw, "call_expression")
                         if call_expr is not None:
                             cident = child_of_type(call_expr, "identifier")
+                            cmem = child_of_type(call_expr, "member_expression")
                             if cident is not None:
                                 cname = node_text(data, cident)
                                 if cname in func_return_types:
                                     base_t = func_return_types[cname]
                                 elif cname in bindings and not bindings[cname].startswith(f"{module}:"):
                                     base_t = f"__ret__{bindings[cname]}"
+                            elif cmem is not None and cmem.children:
+                                mprop = child_of_type(cmem, "property_identifier", "private_property_identifier")
+                                mobj = cmem.children[0]
+                                if mprop is not None and mobj is not None:
+                                    mname = node_text(data, mprop)
+                                    if mobj.type == "member_expression" and mobj.children and mobj.children[0].type == "this":
+                                        fprop = child_of_type(mobj, "property_identifier", "private_property_identifier")
+                                        ft = field_types.get(node_text(data, fprop)) if fprop is not None else None
+                                        if ft and ft not in _TS_BUILTINS and not ft.startswith("__ret__"):
+                                            base_t = f"__ret__{resolve_ref(ft)}.{mname}"
+                                    elif mobj.type == "identifier":
+                                        rname = node_text(data, mobj)
+                                        lt = local_types.get(rname)
+                                        if lt and lt not in {"?", "__unannotated__", "__closure__"} and lt not in _TS_BUILTINS and not lt.startswith("__ret__"):
+                                            base_t = f"__ret__{resolve_ref(lt)}.{mname}"
                     if vident is not None:
                         local_types[node_text(data, vident)] = base_t or "?"
             elif desc.type == "new_expression":
@@ -1382,15 +1435,20 @@ def extract_typescript_file(
             local_types[pname] = jparams.get(pname, "__unannotated__")
             return local_types
         for param in params_node.children:
-            if param.type in {"required_parameter", "optional_parameter", "rest_pattern"}:
+            if param.type in {"required_parameter", "optional_parameter", "rest_pattern", "identifier", "assignment_pattern"}:
                 tann = child_of_type(param, "type_annotation")
                 emit_type_uses(owner_sid, tann, tparams)
                 base_t = _base_ts_type_name(data, tann)
-                pident = child_of_type(param, "identifier")
-                if pident is None:
-                    asgn = child_of_type(param, "assignment_pattern")
-                    if asgn is not None:
-                        pident = child_of_type(asgn, "identifier")
+                pident = param if param.type == "identifier" else child_of_type(param, "identifier")
+                asgn = param if param.type == "assignment_pattern" else child_of_type(param, "assignment_pattern")
+                if pident is None and asgn is not None:
+                    pident = child_of_type(asgn, "identifier")
+                if base_t is None:
+                    new_node = child_of_type(param, "new_expression") or (child_of_type(asgn, "new_expression") if asgn is not None else None)
+                    if new_node is not None:
+                        ctor = child_of_type(new_node, "identifier", "type_identifier", "member_expression")
+                        if ctor is not None:
+                            base_t = node_text(data, ctor)
                 if pident is not None:
                     pname = node_text(data, pident)
                     eff_t = base_t or jparams.get(pname)
@@ -1426,9 +1484,13 @@ def extract_typescript_file(
             if jsdoc_ft:
                 field_types[fname] = jsdoc_ft
                 continue
-            if rhs.type == "new_expression":
+            new_node = rhs if rhs.type == "new_expression" else next(
+                (d for d in scoped_descendants(rhs, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}) if d.type == "new_expression"),
+                None,
+            )
+            if new_node is not None:
                 ctor_ident = child_of_type(
-                    rhs, "identifier", "type_identifier", "member_expression"
+                    new_node, "identifier", "type_identifier", "member_expression"
                 )
                 if ctor_ident is not None:
                     cname = node_text(data, ctor_ident)
@@ -1439,10 +1501,15 @@ def extract_typescript_file(
                             field_types[fname] = ptype
                     else:
                         field_types[fname] = cname
-            elif rhs.type == "identifier":
-                ptype = local_scope.get(node_text(data, rhs), "?")
-                if ptype not in {"?", "__unannotated__", "__closure__"}:
-                    field_types[fname] = ptype
+            elif rhs.type in {"identifier", "binary_expression", "ternary_expression", "parenthesized_expression"}:
+                ident_nodes = [rhs] if rhs.type == "identifier" else [
+                    d for d in scoped_descendants(rhs, {*_TS_TYPE_NODES, *_TS_FUNCTION_NODES}) if d.type == "identifier"
+                ]
+                for id_node in ident_nodes:
+                    ptype = local_scope.get(node_text(data, id_node), "?")
+                    if ptype not in {"?", "__unannotated__", "__closure__"}:
+                        field_types[fname] = ptype
+                        break
             elif rhs.type in {"call_expression", "await_expression"}:
                 call = child_of_type(rhs, "call_expression") or rhs
                 cident = child_of_type(call, "identifier")
@@ -1584,6 +1651,9 @@ def extract_typescript_file(
                 for child in member.children:
                     if child.type == "type_annotation":
                         emit_type_uses(msid, child, mtparams)
+                        mret = _base_ts_type_name(data, child)
+                        if mret and mret not in _TS_BUILTINS and mret not in mtparams:
+                            method_return_types.append((msid, mret))
                 _scan_body_expressions(
                     mbody,
                     msid,
@@ -1713,6 +1783,12 @@ def extract_typescript_file(
                 visit_class_or_interface(cls_val, decl_root, explicit_name=node_text(data, ident))
                 continue
             fn_val = child_of_type(decl, "arrow_function", "function_expression")
+            if fn_val is None and outer_node is not None:
+                call_val = child_of_type(decl, "call_expression")
+                args_node = child_of_type(call_val, "arguments") if call_val is not None else None
+                if args_node is not None and child_of_type(args_node, "arrow_function", "function_expression", "object") is not None:
+                    fn_val = child_of_type(args_node, "arrow_function", "function_expression") or call_val
+                    emit_type_uses(f"{module}:{node_text(data, ident)}" if ident is not None else f"{module}:", child_of_type(call_val, "type_arguments"), set())
             if ident is None or fn_val is None:
                 decl_tann = child_of_type(decl, "type_annotation")
                 emit_type_uses(f"{module}:", decl_tann, set())
@@ -1884,6 +1960,8 @@ def extract_typescript_file(
         edges.append(Edge(module, ",".join(sorted(exported_names)), "MODULE_EXPORTS", 0))
     for fname, rt in func_return_types.items():
         edges.append(Edge(f"{module}:{fname}", resolve_ref(rt), "RETURN_TYPE", 0))
+    for msid, rt in method_return_types:
+        edges.append(Edge(msid, resolve_ref(rt), "RETURN_TYPE", 0))
 
     skeleton = build_brace_skeleton(data, block_nodes)
     symbols.insert(

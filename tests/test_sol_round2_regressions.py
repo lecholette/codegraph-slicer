@@ -281,3 +281,50 @@ def test_round2_direct_helper_contracts(tmp_path):
         assert "unresolved_anchors" not in res
 
 
+def test_rrsi_stage1_js_ts_di_union_and_monorepo_aliases():
+    with workspace(
+        {
+            "svc.js": (
+                "class DefaultValidator {\n"
+                "  validate() { return true; }\n"
+                "}\n"
+                "class HandlerA { execute() { return 1; } }\n"
+                "class HandlerB { execute() { return 2; } }\n"
+                "class Registry {\n"
+                "  /** @returns {HandlerA|HandlerB|undefined} */\n"
+                "  resolve(k) { return k ? new HandlerA() : new HandlerB(); }\n"
+                "}\n"
+                "class Engine {\n"
+                "  /** @param {DefaultValidator} [validator] */\n"
+                "  constructor(validator = new DefaultValidator(), reg = new Registry()) {\n"
+                "    this.validator = validator || new DefaultValidator();\n"
+                "    this.reg = reg;\n"
+                "  }\n"
+                "  run(k) {\n"
+                "    this.validator.validate();\n"
+                "    const h = this.reg.resolve(k);\n"
+                "    return h.execute();\n"
+                "  }\n"
+                "}\n"
+            ),
+            "packages/web/src/lib/util.ts": "export function cn(x: string): string { return x; }\n",
+            "packages/web/src/store.ts": (
+                "import { cn } from '@/lib/util';\n"
+                "function create(fn: any) { return fn; }\n"
+                "export const useStore = create(() => ({ label: cn('ok') }));\n"
+            ),
+            "packages/web/src/app.ts": (
+                "import { useStore } from '@/store';\n"
+                "export function boot() { return useStore(); }\n"
+            ),
+        }
+    ) as (store, _, _):
+        edges = {(r["source_id"], r["target_id"], r["kind"]) for r in store.rows("SELECT * FROM edges")}
+        assert ("svc:Engine.run", "svc:DefaultValidator.validate", "CALLS") in edges
+        assert ("svc:Engine.run", "svc:Registry.resolve", "CALLS") in edges
+        assert ("svc:Engine.run", "svc:HandlerA.execute", "CALLS") in edges
+        assert ("svc:Engine.run", "svc:HandlerB.execute", "CALLS") in edges
+        assert ("packages.web.src.app:boot", "packages.web.src.store:useStore", "CALLS") in edges
+
+
+
