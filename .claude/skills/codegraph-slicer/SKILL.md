@@ -9,7 +9,7 @@ description: >-
 
 # codegraph-slicer
 
-Requires `codegraph-slicer` on `PATH` (`pip install git+https://github.com/lecholette/codegraph-slicer`) and Python 3.12+.
+Requires `codegraph-slicer` on `PATH` and Python 3.12+. Do not run `pip install` to reinstall `codegraph-slicer`.
 Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, .`jsx`, `.mjs`, `.cjs`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
 
@@ -23,7 +23,7 @@ Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`
    In this compact lane (`ScaleRecommendation` reports `bypass_slicer: true` / `mode: "map_then_read"`), read the target files directly (after at most one `codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown` if orientation is needed) and **do not run `slice` or post-edit `delta`**, avoiding the double-context tax of loading both XML slices and full files into context.
 2. **Graph-Eligible Scope (repositories `>= 30` files or `>= 5,000` LOC in Java/TS/JS, or `>= 50` files or `>= 7,500` LOC in Python): use `codegraph-slicer` (`map`, `slice`, or `impact`)** whenever target symbols live inside large files (**`>= 300` lines** or **`>= 15` definitions**) **or** when callers, callees, and interface implementations are unknown across multiple modules/packages.
    - **Front-load one batched `slice` early:** Pass all 3–8 target `path/file.ext:Class.method` anchors in a single batched `codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml <anchors...>` call so the deduplicated slice is locked into the early prompt cache prefix. Never run separate `slice` calls in a shell loop or across consecutive turns (if a follow-up `slice` is required later in the session, pass `--dedup-session` to elide already-cached types and callers).
-   - **Prefer `Class.method` anchors over giant class anchors:** When slicing multiple classes, pass specific methods from `map` (e.g. `Handler.executeJob`) rather than 500-line class names so method bodies are not condensed.
+   - **Prefer `Class.method` anchors when known, or `Class` anchors when method names are unknown:** When slicing multiple classes, pass specific methods from `map` (e.g. `path/file.ext:Handler.executeJob`) when known; if a class's exact method names are not yet known, pass the class anchor directly (`path/file.ext:ClassName`) rather than guessing method names.
    - **Bounded `Read`-before-`Edit` (avoid the double-context tax):** Never `Read` or `cat` an entire large file (`>= 300` lines) whose methods are already in `<target_implementations>`. When `Edit` requires `Read` first (or when inspecting condensed lines), call `Read` with `offset=<start_line>` and `limit=<end_line - start_line + 1>` from `<code_slice lines="start-end">` (or pass `--target-mode skeleton` to `slice` if you plan to read the target files directly).
 3. **Incremental head sync (`delta`):** Only when explicitly requested or needed for multi-package boundary checks on graph-eligible repositories, copy `cp "$GRAPH" /tmp/head.sqlite` before `codegraph-slicer sync . --db /tmp/head.sqlite` so only modified files are reparsed.
 

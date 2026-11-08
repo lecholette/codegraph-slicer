@@ -628,6 +628,113 @@ def _slice_item(row, full):
     }
 
 
+def _preceding_doc_comment_start(file_lines: list[str], decl_line: int) -> int:
+    idx = decl_line - 2
+    while idx >= 0 and not file_lines[idx].strip():
+        idx -= 1
+    start_ln = decl_line
+    count = 0
+    while idx >= 0 and count < 22:
+        s = file_lines[idx].strip()
+        if s.startswith(("//", "/*", "*", "*/", "@")):
+            start_ln = idx + 1
+            count += 1
+            if s.startswith("/*"):
+                break
+            idx -= 1
+        else:
+            break
+    return start_ln
+
+
+def _append_line_span(
+    file_lines: list[str], start_ln: int, end_ln: int, header_lines: list[str], header_end_line: int
+) -> tuple[bool, int]:
+    added = False
+    for ln in range(start_ln, end_ln + 1):
+        if 1 <= ln <= len(file_lines):
+            line_txt = file_lines[ln - 1]
+            if line_txt.strip():
+                header_lines.append(line_txt)
+                header_end_line = max(header_end_line, ln)
+                added = True
+    return added, header_end_line
+
+
+def _append_enclosing_brace_class_header(
+    store,
+    sym: IndexedSymbol,
+    chosen,
+    file_lines: list[str],
+    header_lines: list[str],
+    header_end_line: int,
+    emitted_headers: set[str] | None,
+) -> int:
+    class_qual = sym.qualname.rpartition(".")[0]
+    class_sid = f"{sym.module}:{class_qual}"
+    class_key = f"class:{class_sid}"
+    if class_sid in chosen or (emitted_headers is not None and class_key in emitted_headers):
+        return header_end_line
+    class_rows = store.rows(
+        "SELECT start_line, end_line FROM symbols WHERE symbol_id=?",
+        (class_sid,),
+    )
+    if not class_rows:
+        return header_end_line
+    raw_c_start = class_rows[0]["start_line"]
+    c_start = max(header_end_line + 1, _preceding_doc_comment_start(file_lines, raw_c_start))
+    class_short = class_qual.rsplit(".", 1)[-1]
+    first_m_rows = store.rows(
+        """SELECT MIN(start_line) AS first_m FROM symbols
+           WHERE file_path=? AND kind='method' AND start_line > ?
+             AND qualname NOT GLOB ? AND qualname NOT GLOB '*.constructor'""",
+        (sym.file_path, raw_c_start, f"*.{class_short}"),
+    )
+    first_m = (
+        first_m_rows[0]["first_m"]
+        if first_m_rows and first_m_rows[0]["first_m"] is not None
+        else sym.start_line
+    )
+    c_end = min(first_m - 1, sym.start_line - 1, raw_c_start + 20)
+    added_class, header_end_line = _append_line_span(
+        file_lines, c_start, c_end, header_lines, header_end_line
+    )
+    if emitted_headers is not None and added_class:
+        emitted_headers.add(class_key)
+    return header_end_line
+
+
+def _append_brace_class_or_method_doc_preamble(
+    store,
+    sym: IndexedSymbol,
+    chosen,
+    file_lines: list[str],
+    header_lines: list[str],
+    header_end_line: int,
+    emitted_headers: set[str] | None,
+) -> int:
+    if not sym.file_path.endswith(_BRACE_LANG_EXTS):
+        return header_end_line
+    if sym.kind == "class":
+        doc_start = _preceding_doc_comment_start(file_lines, sym.start_line)
+        if doc_start < sym.start_line:
+            _, header_end_line = _append_line_span(
+                file_lines, max(header_end_line + 1, doc_start), sym.start_line - 1, header_lines, header_end_line
+            )
+        return header_end_line
+    if sym.kind != "method" or "." not in sym.qualname:
+        return header_end_line
+    header_end_line = _append_enclosing_brace_class_header(
+        store, sym, chosen, file_lines, header_lines, header_end_line, emitted_headers
+    )
+    m_doc_start = _preceding_doc_comment_start(file_lines, sym.start_line)
+    if m_doc_start < sym.start_line and m_doc_start > header_end_line:
+        _, header_end_line = _append_line_span(
+            file_lines, m_doc_start, sym.start_line - 1, header_lines, header_end_line
+        )
+    return header_end_line
+
+
 def _target_item_with_preamble(
     store,
     row,
@@ -707,40 +814,9 @@ def _target_item_with_preamble(
                     break
         if emitted_headers is not None and header_lines:
             emitted_headers.add(file_key)
-    if sym.kind == "method" and "." in sym.qualname and sym.file_path.endswith(_BRACE_LANG_EXTS):
-        class_qual = sym.qualname.rpartition(".")[0]
-        class_sid = f"{sym.module}:{class_qual}"
-        if class_sid in chosen:
-            return base
-        class_key = f"class:{class_sid}"
-        if emitted_headers is None or class_key not in emitted_headers:
-            class_rows = store.rows(
-                "SELECT start_line, end_line FROM symbols WHERE symbol_id=?",
-                (class_sid,),
-            )
-            if class_rows:
-                c_start = class_rows[0]["start_line"]
-                class_short = class_qual.rsplit(".", 1)[-1]
-                first_m_rows = store.rows(
-                    "SELECT MIN(start_line) AS first_m FROM symbols WHERE file_path=? AND kind='method' AND start_line > ? AND qualname NOT GLOB ? AND qualname NOT GLOB '*.constructor'",
-                    (sym.file_path, c_start, f"*.{class_short}"),
-                )
-                first_m = (
-                    first_m_rows[0]["first_m"]
-                    if first_m_rows and first_m_rows[0]["first_m"] is not None
-                    else sym.start_line
-                )
-                c_end = min(first_m - 1, sym.start_line - 1, c_start + 20)
-                added_class = False
-                for ln in range(c_start, c_end + 1):
-                    if 1 <= ln <= len(file_lines):
-                        line_txt = file_lines[ln - 1]
-                        if line_txt.strip():
-                            header_lines.append(line_txt)
-                            header_end_line = max(header_end_line, ln)
-                            added_class = True
-                if emitted_headers is not None and added_class:
-                    emitted_headers.add(class_key)
+    header_end_line = _append_brace_class_or_method_doc_preamble(
+        store, sym, chosen, file_lines, header_lines, header_end_line, emitted_headers
+    )
     comment_pfx = _comment_prefix(sym.file_path)
     if emit_file_imports and sym.file_path.endswith(TS_JS_EXTENSIONS) and "." in sym.module:
         parent_mod_sid = f"{sym.module.rpartition('.')[0]}:"
@@ -940,15 +1016,33 @@ def _extract_preceding_comments(preceding_lines: list[str]) -> list[str]:
     return [fmt for s in reversed(block) if (fmt := _format_comment_line(s))]
 
 
+def _parse_python_first_stmt_docstring(body: str) -> str | None:
+    if not body:
+        return None
+    with contextlib.suppress(SyntaxError, IndexError):
+        parsed = ast.parse(textwrap.dedent(body))
+        if parsed.body:
+            return ast.get_docstring(parsed.body[0])
+    return None
+
+
+def _extract_python_docstring_summary(body: str) -> str | None:
+    doc = _parse_python_first_stmt_docstring(body)
+    if not doc:
+        return None
+    d_lines = [ln.strip() for ln in doc.splitlines() if ln.strip()]
+    is_contract = "CONTRACT" in doc or any(ln.startswith("-") for ln in d_lines[1:])
+    if len(d_lines) > 1 and is_contract:
+        return "\n".join(
+            [d_lines[0], *(f"    # {ln}" for ln in d_lines[1:8])]
+        )
+    return d_lines[0]
+
+
 def _first_docstring_line(body: str, preceding_lines: list[str] | None = None):
-    if body:
-        try:
-            parsed = ast.parse(textwrap.dedent(body))
-            doc = ast.get_docstring(parsed.body[0]) if parsed.body else None
-        except (SyntaxError, IndexError):
-            doc = None
-        if doc:
-            return doc.splitlines()[0]
+    py_doc = _extract_python_docstring_summary(body)
+    if py_doc is not None:
+        return py_doc
     comment_lines = _extract_preceding_comments(preceding_lines) if preceding_lines else []
     for line in body.splitlines()[1:10]:
         s = line.strip()
@@ -1398,28 +1492,120 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
     return required
 
 
+_BOILERPLATE_METHOD_RE = re.compile(r"(?:_[0-9]{2}$|Step[0-9]{2}$|^_helper[0-9]+$)")
+
+
+def _is_non_boilerplate_public_method(m: dict, ctor_names: set[str]) -> bool:
+    if _is_internal_method(m, ctor_names):
+        return False
+    m_short = m["qualname"].rpartition(".")[2]
+    if m_short in ctor_names or m_short in ("__enter__", "__exit__"):
+        return False
+    return not bool(_BOILERPLATE_METHOD_RE.search(m_short))
+
+
+def _find_class_for_fallback(store, mod_part: str, cls_part: str) -> dict | None:
+    cls_rows = store.rows(
+        "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='class' AND qualname=? ORDER BY start_line, symbol_id",
+        (mod_part, mod_part, cls_part),
+    )
+    if not cls_rows and is_supported_source_path(mod_part):
+        suf_cls = _resolve_suffix_path_anchor(store, mod_part, cls_part)
+        if suf_cls is not None and suf_cls["kind"] == "class":
+            cls_rows = [suf_cls]
+    if not cls_rows:
+        pkg_stem = mod_part[:-3] if mod_part.endswith(".py") else mod_part
+        cls_rows = store.rows(
+            "SELECT * FROM symbols WHERE file_path GLOB ? AND kind='class' AND qualname=? ORDER BY start_line, symbol_id",
+            (f"*{pkg_stem.lstrip('/')}*/*", cls_part),
+        )
+    return cls_rows[0] if len(cls_rows) == 1 else None
+
+
+def _non_boilerplate_class_methods(store, cls_row: dict, cls_part: str) -> list[dict]:
+    all_methods = store.rows(
+        """SELECT * FROM symbols WHERE file_path=? AND kind='method'
+           AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
+        (cls_row["file_path"], cls_row["start_line"], cls_row["end_line"]),
+    )
+    ctor_names = {"__init__", "__new__", "constructor", cls_part.rsplit(".", 1)[-1]}
+    return [m for m in all_methods if _is_non_boilerplate_public_method(m, ctor_names)]
+
+
+def _identifier_word_tokens(name: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[A-Z]?[a-z0-9]+", name) if len(t) >= 3}
+
+
+def _match_fuzzy_class_method(core_pub: list[dict], m_short: str) -> dict | None:
+    if len(core_pub) == 1:
+        return core_pub[0]
+    m_norm = m_short.lower().replace("_", "")
+    m_tokens = _identifier_word_tokens(m_short)
+    best_m = None
+    best_score = 0.0
+    for cand in core_pub:
+        c_short = cand["qualname"].rpartition(".")[2]
+        c_norm = c_short.lower().replace("_", "")
+        c_tokens = _identifier_word_tokens(c_short)
+        tok_overlap = (
+            len(m_tokens & c_tokens) / max(1, min(len(m_tokens), len(c_tokens)))
+            if (m_tokens and c_tokens)
+            else 0.0
+        )
+        score = max(difflib.SequenceMatcher(None, m_norm, c_norm).ratio(), tok_overlap)
+        if score > best_score:
+            best_score = score
+            best_m = cand
+    return best_m if (best_m is not None and best_score >= 0.45) else None
+
+
+def _resolve_fuzzy_single_class_in_module(store, mod_part: str, qual_part: str) -> dict | None:
+    if not qual_part[0].isupper():
+        return None
+    cls_rows = store.rows(
+        "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='class' ORDER BY start_line, symbol_id",
+        (mod_part, mod_part),
+    )
+    if len(cls_rows) != 1:
+        return None
+    cls_short = cls_rows[0]["qualname"].rsplit(".", 1)[-1]
+    ratio = difflib.SequenceMatcher(None, qual_part.lower(), cls_short.lower()).ratio()
+    return cls_rows[0] if ratio >= 0.6 else None
+
+
 def _resolve_batch_method_fallback(store, anchor_str: str) -> dict | None:
     mod_part, sep, qual_part = anchor_str.rpartition(":")
     if not sep or not qual_part:
         return None
     if "." not in qual_part:
-        if not qual_part[0].isupper():
-            return None
-        cls_rows = store.rows(
-            "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='class' ORDER BY start_line, symbol_id",
-            (mod_part, mod_part),
-        )
-        if len(cls_rows) != 1:
-            return None
-        cls_short = cls_rows[0]["qualname"].rsplit(".", 1)[-1]
-        ratio = difflib.SequenceMatcher(None, qual_part.lower(), cls_short.lower()).ratio()
-        return cls_rows[0] if ratio >= 0.6 else None
-    _, _, m_short = qual_part.rpartition(".")
+        return _resolve_fuzzy_single_class_in_module(store, mod_part, qual_part)
+    cls_part, _, m_short = qual_part.rpartition(".")
     m_rows = store.rows(
         "SELECT * FROM symbols WHERE (module=? OR file_path=?) AND kind='method' AND qualname GLOB ? ORDER BY start_line, symbol_id",
         (mod_part, mod_part, f"*.{m_short}"),
     )
-    return m_rows[0] if len(m_rows) == 1 else None
+    if len(m_rows) == 1:
+        return m_rows[0]
+    cls_row = _find_class_for_fallback(store, mod_part, cls_part)
+    if cls_row is None:
+        return None
+    core_pub = _non_boilerplate_class_methods(store, cls_row, cls_part)
+    return _match_fuzzy_class_method(core_pub, m_short) or cls_row
+
+
+def _format_unresolved_anchor_with_hint(store, anchor_str: str) -> str:
+    mod_part, sep, qual_part = anchor_str.rpartition(":")
+    if not sep or "." not in qual_part:
+        return anchor_str
+    cls_part, _, _ = qual_part.rpartition(".")
+    cls_row = _find_class_for_fallback(store, mod_part, cls_part)
+    if cls_row is None:
+        return anchor_str
+    core_pub = [
+        f"{cls_row['file_path']}:{m['qualname']}"
+        for m in _non_boilerplate_class_methods(store, cls_row, cls_part)
+    ][:6]
+    return f"{anchor_str} (available: {', '.join(core_pub)})" if core_pub else anchor_str
 
 
 def _expand_overload_siblings(store, chosen: dict, row: dict) -> None:
@@ -1433,26 +1619,26 @@ def _expand_overload_siblings(store, chosen: dict, row: dict) -> None:
         chosen[ov["symbol_id"]] = ov
 
 
+def _record_resolved_anchor(store, chosen: dict, row: dict, raw_anchor: str) -> None:
+    chosen[row["symbol_id"]] = row
+    if "#" not in raw_anchor:
+        _expand_overload_siblings(store, chosen, row)
+
+
 def _resolve_anchor_batch_with_status(store, anchors) -> tuple[dict, list[str]]:
     chosen = {}
     unresolved: list[str] = []
     first_err = None
     for a in anchors:
         try:
-            row = _anchor(store, a)
-            chosen[row["symbol_id"]] = row
-            if "#" not in a:
-                _expand_overload_siblings(store, chosen, row)
+            _record_resolved_anchor(store, chosen, _anchor(store, a), a)
         except AnchorNotFoundError as exc:
-            if first_err is None:
-                first_err = exc
+            first_err = first_err or exc
             fb = len(anchors) > 1 and _resolve_batch_method_fallback(store, a)
             if fb:
-                chosen[fb["symbol_id"]] = fb
-                if "#" not in a:
-                    _expand_overload_siblings(store, chosen, fb)
+                _record_resolved_anchor(store, chosen, fb, a)
             else:
-                unresolved.append(a)
+                unresolved.append(_format_unresolved_anchor_with_hint(store, a))
     if not chosen and first_err is not None:
         raise first_err
     return chosen, unresolved

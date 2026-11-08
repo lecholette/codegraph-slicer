@@ -1218,3 +1218,170 @@ export class GnuTarPackHelper {
         )
         type_symbols = {e["symbol"] for e in sliced_js["sections"]["types_and_schemas"]}
         assert "archive.tar_helper:ExistingPackSnapshot" in type_symbols
+
+
+def test_slice_method_preserves_preceding_class_and_method_doc_contracts(
+    tmp_path,
+) -> None:
+    """Verify slicing Class.method includes preceding class/method Javadoc/JSDoc and Python multi-line CONTRACT docstrings."""
+    root = tmp_path / "doc_contract_repo"
+    _write(
+        root,
+        {
+            "src/pkg/Runner.java": """package pkg;
+
+/**
+ * CONTRACT:
+ * - Must emit STARTED before walking files.
+ */
+public class Runner {
+    private final String mode;
+
+    public Runner(String mode) {
+        this.mode = mode;
+    }
+
+    /**
+     * Executes the job according to CONTRACT.
+     */
+    public String execute(String input) {
+        return this.mode + ":" + input;
+    }
+}
+""",
+            "src/pkg/py_runner.py": '''"""Runner module."""
+
+
+class Outcome:
+    """CONTRACT: Immutable outcome.
+    - total_size is None for verify.
+    """
+
+    def __init__(self, total_size: int | None = None) -> None:
+        self.total_size = total_size
+
+    def is_verify(self) -> bool:
+        return self.total_size is None
+
+
+class PyRunner:
+    def run(self, out: Outcome) -> bool:
+        return out.is_verify()
+''',
+        },
+    )
+    with GraphStore(":memory:") as store:
+        store.sync_workspace(root)
+        java_sliced = slice_context(store, ["Runner.execute"], max_tokens=4000)
+        java_target = java_sliced["sections"]["target_implementations"][0]["text"]
+        assert "Must emit STARTED before walking files." in java_target
+        assert "Executes the job according to CONTRACT." in java_target
+
+        py_sliced = slice_context(store, ["PyRunner.run"], max_tokens=4000)
+        py_types = "\n".join(e["text"] for e in py_sliced["sections"]["types_and_schemas"])
+        assert "total_size is None for verify" in py_types
+
+
+def test_batch_slice_fuzzy_method_and_package_stem_resolution(tmp_path) -> None:
+    """Verify batched slice resolves guessed method names (e.g. create_gnu_tar_archive -> build_deterministic_gnu_tar), package-stem paths, and unit boundaries."""
+    from codegraph_slicer.slicer import (
+        _append_line_span,
+        _extract_python_docstring_summary,
+        _format_unresolved_anchor_with_hint,
+        _is_non_boilerplate_public_method,
+        _match_fuzzy_class_method,
+        _preceding_doc_comment_start,
+        _resolve_batch_method_fallback,
+        _resolve_fuzzy_single_class_in_module,
+    )
+
+    # 1. Direct boundary checks for _preceding_doc_comment_start and _append_line_span
+    assert _preceding_doc_comment_start(["// Line 1 doc", "class A {"], 2) == 1
+    assert _preceding_doc_comment_start(["const x = 1;", "", "// Line 3 doc", "class A {"], 4) == 3
+    long_doc = [f"// doc {i}" for i in range(30)] + ["class A {"]
+    assert _preceding_doc_comment_start(long_doc, 31) == 9
+    h_lines: list[str] = []
+    added, h_end = _append_line_span(["a", "b", "c"], 1, 3, h_lines, 0)
+    assert added is True and h_end == 3 and h_lines == ["a", "b", "c"]
+    added_empty, h_end_empty = _append_line_span(["   "], 1, 1, h_lines, 3)
+    assert added_empty is False and h_end_empty == 3
+
+    # 2. Direct boundary checks for _extract_python_docstring_summary
+    assert _extract_python_docstring_summary("") is None
+    assert _extract_python_docstring_summary("def f():\n    return 1\n") is None
+    assert _extract_python_docstring_summary('def f():\n    """Single line."""\n    return 1\n') == "Single line."
+    bullet_doc = 'class C:\n    """Header line.\n    - bullet one\n    - bullet two\n    """\n    pass\n'
+    assert _extract_python_docstring_summary(bullet_doc) == "Header line.\n    # - bullet one\n    # - bullet two"
+    non_bullet_doc = 'class C:\n    """Header line.\n    Second prose line.\n    """\n    pass\n'
+    assert _extract_python_docstring_summary(non_bullet_doc) == "Header line."
+
+    # 3. Direct boundary checks for _is_non_boilerplate_public_method & _match_fuzzy_class_method
+    assert not _is_non_boilerplate_public_method({"qualname": "C.__enter__", "signature": "def __enter__(self)"}, {"__init__"})
+    assert not _is_non_boilerplate_public_method({"qualname": "C._priv", "signature": "def _priv(self)"}, {"__init__"})
+    assert not _is_non_boilerplate_public_method({"qualname": "C.audit_step_01", "signature": "def audit_step_01(self)"}, {"__init__"})
+    assert _is_non_boilerplate_public_method({"qualname": "C.execute_job", "signature": "def execute_job(self)"}, {"__init__"})
+    assert _match_fuzzy_class_method([], "foo") is None
+    single_m = [{"qualname": "C.only_method", "symbol_id": "m:C.only_method"}]
+    assert _match_fuzzy_class_method(single_m, "totally_different") == single_m[0]
+    two_m = [
+        {"qualname": "C.build_deterministic_gnu_tar", "symbol_id": "m:C.build_deterministic_gnu_tar"},
+        {"qualname": "C.inspect_existing_pack", "symbol_id": "m:C.inspect_existing_pack"},
+    ]
+    assert _match_fuzzy_class_method(two_m, "zzzz_unrelated") is None
+    assert _match_fuzzy_class_method(two_m, "create_gnu_tar_archive") == two_m[0]
+
+    decoy_methods = "\n".join(
+        f"    def audit_step_{i:02d}(self, x: int) -> int:\n        return x + {i}\n"
+        for i in range(1, 15)
+    )
+    root = tmp_path / "batch_fuzzy_repo"
+    _write(
+        root,
+        {
+            "src/enterprise/archive/gnu/gnu_tar_pack_helper.py": f'''"""Tar helper."""
+
+
+class GnuTarPackHelper:
+{decoy_methods}
+    def build_deterministic_gnu_tar(self, out_path: str) -> str:
+        return out_path
+
+    def inspect_existing_pack(self, tar_path: str) -> dict:
+        return {{"path": tar_path}}
+''',
+            "src/enterprise/config/validator/default_job_policy_validator.py": f'''"""Validator."""
+
+
+class DefaultJobPolicyValidator:
+{decoy_methods}
+    def validate_strategy_and_destination(self, kind: str) -> str:
+        return kind
+''',
+        },
+    )
+    with GraphStore(":memory:") as store:
+        store.sync_workspace(root)
+        assert _resolve_batch_method_fallback(store, "no_colon") is None
+        assert _resolve_fuzzy_single_class_in_module(store, "src/enterprise/archive/gnu/gnu_tar_pack_helper.py", "lowercase") is None
+        fuzzy_cls = _resolve_fuzzy_single_class_in_module(
+            store, "src/enterprise/archive/gnu/gnu_tar_pack_helper.py", "GnuTarPackHelper"
+        )
+        assert fuzzy_cls is not None and fuzzy_cls["qualname"] == "GnuTarPackHelper"
+        hint_str = _format_unresolved_anchor_with_hint(
+            store, "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:GnuTarPackHelper.unknown_xyz"
+        )
+        assert "available:" in hint_str and "build_deterministic_gnu_tar" in hint_str
+        sliced = slice_context(
+            store,
+            [
+                "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:GnuTarPackHelper.create_gnu_tar_archive",
+                "src/enterprise/config/validator.py:DefaultJobPolicyValidator.validate_job_strategy",
+            ],
+            max_tokens=4000,
+        )
+        target_symbols = {e["symbol"] for e in sliced["sections"]["target_implementations"]}
+        assert any(s.endswith(":GnuTarPackHelper.build_deterministic_gnu_tar") for s in target_symbols)
+        assert any(s.endswith(":DefaultJobPolicyValidator.validate_strategy_and_destination") for s in target_symbols)
+        assert not sliced.get("unresolved_anchors")
+
+
