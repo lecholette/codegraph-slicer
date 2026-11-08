@@ -1,4 +1,4 @@
-"""Regression & contract tests for the GPT-6.1-Sol Round-2 UB / State-Machine / Data-Model Review (R2-01..R2-12)."""
+"""Regression and contract tests for Round-2 static analysis review (R2-01..R2-12)."""
 
 import contextlib
 import hashlib
@@ -281,7 +281,7 @@ def test_round2_direct_helper_contracts(tmp_path):
         assert "unresolved_anchors" not in res
 
 
-def test_rrsi_stage1_js_ts_di_union_and_monorepo_aliases():
+def test_stage1_js_ts_di_union_and_monorepo_aliases():
     with workspace(
         {
             "svc.js": (
@@ -327,7 +327,7 @@ def test_rrsi_stage1_js_ts_di_union_and_monorepo_aliases():
         assert ("packages.web.src.app:boot", "packages.web.src.store:useStore", "CALLS") in edges
 
 
-def test_rrsi_stage2_python_context_manager_type_inference():
+def test_stage2_python_context_manager_type_inference():
     with workspace(
         {
             "ctx.py": (
@@ -354,7 +354,7 @@ def test_rrsi_stage2_python_context_manager_type_inference():
         assert ("ctx:run", "ctx:Store.sync", "CALLS") in edges
 
 
-def test_rrsi_stage3_java_overload_slicing_and_subtype_fanout():
+def test_stage3_java_overload_slicing_and_subtype_fanout():
     with workspace(
         {
             "src/main/java/demo/Handler.java": (

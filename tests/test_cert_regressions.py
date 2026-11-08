@@ -1,4 +1,4 @@
-"""Regression tests for the 11 findings (F01-F11) from the gpt-6-astra certification audit."""
+"""Regression tests for static analysis certification findings (F01-F11)."""
 import contextlib
 import io
 import json
@@ -198,7 +198,7 @@ def test_f12_to_f15_lambda_traversal_object_callbacks_import_precedence_and_same
         assert not any(item["symbol"] == "m:Other.stop" for item in result["sections"]["upstream_callers"])
 
 
-def test_astra_v033_ub_audit_regressions():
+def test_v033_static_audit_regressions():
     # F1: Python default fallback regression (import alias `as default` or `default = C` must not resolve missing symbol)
     for a_src in ("from other import C as default\n", "class C:\n    def work(self): pass\ndefault = C\n"):
         files = {"a.py": a_src, "b.py": "from a import work\ndef run():\n    work()\n"}

@@ -23,5 +23,9 @@ from .slicer import AnchorNotFoundError as AnchorNotFoundError
 from .slicer import InvalidBudgetError as InvalidBudgetError
 from .slicer import RequiredAnchorOverflow as RequiredAnchorOverflow
 from .slicer import slice_context as slice_context
+from .router import inspect_scale_structure as inspect_scale_structure
+from .router import route_prompt as route_prompt
 from .store import GraphStore as GraphStore
 from .store import InvalidRevisionError as InvalidRevisionError
+
+__version__ = "0.3.7"

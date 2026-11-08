@@ -295,21 +295,26 @@ def parse_tsconfig_paths(raw: bytes) -> dict[str, str]:
             lambda m: "" if m.group(1) else m.group(0),
             text,
         )
-        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
-        data = json.loads(cleaned)
-        compiler = data.get("compilerOptions") or {}
-        base_url = (compiler.get("baseUrl") or "").strip().strip("/").strip(".")
-        paths = compiler.get("paths") or {}
-        result: dict[str, str] = {}
-        for pattern, targets in paths.items():
-            if isinstance(targets, list) and targets and isinstance(targets[0], str):
-                target = targets[0].lstrip("./")
-                if base_url and not target.startswith(base_url + "/"):
-                    target = f"{base_url}/{target}"
-                result[str(pattern)] = target
-        return result
-    except Exception:
+        data = json.loads(re.sub(r",\s*([}\]])", r"\1", cleaned))
+    except (UnicodeDecodeError, ValueError, TypeError):
         return {}
+    if not isinstance(data, dict):
+        return {}
+    compiler = data.get("compilerOptions")
+    if not isinstance(compiler, dict):
+        return {}
+    base_url = str(compiler.get("baseUrl") or "").strip().strip("/").strip(".")
+    paths = compiler.get("paths")
+    if not isinstance(paths, dict):
+        return {}
+    result: dict[str, str] = {}
+    for pattern, targets in paths.items():
+        if isinstance(targets, list) and targets and isinstance(targets[0], str):
+            target = targets[0].lstrip("./")
+            if base_url and not target.startswith(base_url + "/"):
+                target = f"{base_url}/{target}"
+            result[str(pattern)] = target
+    return result
 
 
 def _resolve_ts_import(

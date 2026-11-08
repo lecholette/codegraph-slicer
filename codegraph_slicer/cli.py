@@ -378,11 +378,23 @@ def _file_language(path: str) -> str:
     return "javascript"
 
 
-def _classify_scale(files: int, loc: int, languages: list[str], skipped: object) -> tuple[str, bool, list[str], str]:
+def _classify_scale(
+    files: int,
+    loc: int,
+    languages: list[str],
+    skipped: object,
+    *,
+    has_monolith: bool = False,
+    cross_file_edges: int = 0,
+) -> tuple[str, bool, list[str], str]:
     if skipped:
         return "direct_read", True, ["slice", "delta"], "incomplete_index"
     if not files:
         return "direct_read", True, ["slice", "delta"], "empty_index"
+    if has_monolith:
+        return "slice_monoliths", False, [], "monolith_present"
+    if cross_file_edges >= 40:
+        return "graph_optional", False, [], "coupled_graph"
     if files < 30 and loc < 5000:
         return "map_then_read", True, ["slice", "delta"], "compact_scale"
     if languages == ["python"] and files < 50 and loc < 7500:
@@ -391,6 +403,8 @@ def _classify_scale(files: int, loc: int, languages: list[str], skipped: object)
 
 
 def _scale_recommendation(store: GraphStore):
+    from .router import inspect_scale_structure
+
     rows = store.rows("SELECT path,loc FROM files")
     production = [row for row in rows if not is_test_path(row["path"])]
     skipped_row = store.db.execute(
@@ -400,8 +414,16 @@ def _scale_recommendation(store: GraphStore):
     files = len(production)
     loc = sum(row["loc"] for row in production)
     languages = sorted({_file_language(row["path"]) for row in production})
-    mode, bypass, commands, reason = _classify_scale(files, loc, languages, skipped)
-    return {
+    structure = inspect_scale_structure(store, production)
+    mode, bypass, commands, reason = _classify_scale(
+        files,
+        loc,
+        languages,
+        skipped,
+        has_monolith=bool(structure.slice_targets),
+        cross_file_edges=structure.cross_file_edges,
+    )
+    rec = {
         "schema_version": 1,
         "scope": "indexed_non_test_sources",
         "source_files": files,
@@ -412,6 +434,9 @@ def _scale_recommendation(store: GraphStore):
         "skip_commands": commands,
         "reason": reason,
     }
+    if structure.slice_targets:
+        rec["slice_targets"] = structure.slice_targets
+    return rec
 
 
 def _scale_render_estimator(output_format, recommendation):
@@ -650,7 +675,7 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.6")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.7")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",
@@ -780,7 +805,19 @@ def main(argv=None):
     delta.add_argument("--edge-sample-limit", type=int, help="v2 projection: maximum added/removed edge samples per direction (minimum: 1; default: 20)")
     delta.add_argument("--max-tokens", type=int, default=8000, help="estimated compact JSON budget for the delta report (default: 8000)")
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
-    for command in (sync, mapping, slicing, impact, flow, delta):
+    routing = sub.add_parser(
+        "route",
+        help="compute 4-axis structural difficulty and recommend slicing workflow",
+        description=(
+            "Resolve prompt file and symbol anchors against an indexed snapshot and\n"
+            "compute D_loc, D_coupling, D_monolith, D_spec, and R_struct in <25 ms."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    routing.add_argument("--db", "--database", dest="db", required=True, help="existing indexed SQLite database")
+    routing.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
+    routing.add_argument("--prompt", required=True, help="task prompt to route against the indexed codegraph")
+    for command in (sync, mapping, slicing, impact, flow, delta, routing):
         command.add_argument("--format", choices=("json", "markdown", "xml"), default="json", help="output representation (default: json)")
     args = parser.parse_args(argv)
     if args.cmd == "delta" and args.edge_sample_limit is not None and args.edge_sample_limit < 1:
@@ -892,6 +929,12 @@ def main(argv=None):
                         max_tokens=args.max_tokens, database=args.db, output_format=args.format,
                         render_estimator=_render_budget_estimator(args.format),
                     )
+                elif args.cmd == "route":
+                    if not args.snapshot:
+                        store.assert_fresh()
+                    from .router import route_prompt
+
+                    result = route_prompt(store, args.prompt)
                 else:
                     if not args.snapshot:
                         store.assert_fresh()

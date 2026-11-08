@@ -163,6 +163,30 @@ def _resolve_unique_qualname_anchor(store, anchor: str):
     return q_rows[0] if len(q_rows) == 1 else None
 
 
+def _candidate_rows_for_nearest_anchors(store, path: str, target: str) -> list[dict]:
+    cnt_row = store.rows("SELECT COUNT(*) AS n FROM symbols")
+    total_syms = int(cnt_row[0]["n"]) if cnt_row else 0
+    if total_syms <= 1500:
+        return store.rows("SELECT file_path,module,qualname FROM symbols")
+    scoped: list[dict] = []
+    if path:
+        scoped.extend(
+            store.rows(
+                "SELECT file_path,module,qualname FROM symbols WHERE file_path=? OR module=? LIMIT 400",
+                (path, path),
+            )
+        )
+    tok = (target or path).rsplit(".", 1)[-1][:12]
+    if len(tok) >= 3:
+        scoped.extend(
+            store.rows(
+                "SELECT file_path,module,qualname FROM symbols WHERE qualname GLOB ? OR qualname GLOB ? LIMIT 400",
+                (f"{tok[:4]}*", f"*.{tok[:4]}*"),
+            )
+        )
+    return scoped if scoped else store.rows("SELECT file_path,module,qualname FROM symbols LIMIT 1200")
+
+
 def _anchor(store, anchor):
     exact = store.rows("SELECT * FROM symbols WHERE symbol_id=?", (anchor,))
     if exact:
@@ -253,7 +277,7 @@ def _anchor(store, anchor):
             return uniq_match
     error = AnchorNotFoundError(anchor)
     rows = sorted(
-        store.rows("SELECT file_path,module,qualname FROM symbols"),
+        _candidate_rows_for_nearest_anchors(store, path, target),
         key=lambda row: (row["file_path"], row["qualname"]),
     )
     aliases = {}

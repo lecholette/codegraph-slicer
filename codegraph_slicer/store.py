@@ -257,6 +257,7 @@ class GraphStore:
                 CREATE INDEX IF NOT EXISTS et ON edges(target_id,kind);
                 CREATE INDEX IF NOT EXISTS sm ON symbols(module);
                 CREATE INDEX IF NOT EXISTS sq ON symbols(qualname);
+                CREATE INDEX IF NOT EXISTS sf ON symbols(file_path,qualname,kind,cx);
             """)
 
     def __enter__(self):

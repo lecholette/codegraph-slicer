@@ -1,4 +1,4 @@
-"""Regression tests for the GPT-6-Astra Code & Service-Readiness Review findings (F1-F6 + P2s)."""
+"""Regression tests for service-readiness review findings (F1-F6)."""
 
 import contextlib
 import io
