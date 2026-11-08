@@ -1049,6 +1049,10 @@ class GraphStore:
         impls_of = self._load_subtype_impls(symbols, class_bases)
         if not impls_of:
             return
+        overload_siblings: dict[str, list[str]] = defaultdict(list)
+        for sid in symbols:
+            if "#" in sid:
+                overload_siblings[sid.partition("#")[0]].append(sid)
         for row in self.db.execute(
             "SELECT source_file,source_id,target_id,line FROM edges WHERE kind='CALLS'"
         ).fetchall():
@@ -1060,10 +1064,11 @@ class GraphStore:
             ]
             if 1 <= len(resolved) <= 4:
                 for mt in resolved:
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
-                        (row["source_file"], row["source_id"], mt, "CALLS", row["line"]),
-                    )
+                    for tgt in (mt, *overload_siblings.get(mt, ())):
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+                            (row["source_file"], row["source_id"], tgt, "CALLS", row["line"]),
+                        )
 
     def rows(self, sql, args=()):
         return [dict(row) for row in self.db.execute(sql, args)]

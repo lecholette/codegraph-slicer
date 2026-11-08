@@ -1422,6 +1422,17 @@ def _resolve_batch_method_fallback(store, anchor_str: str) -> dict | None:
     return m_rows[0] if len(m_rows) == 1 else None
 
 
+def _expand_overload_siblings(store, chosen: dict, row: dict) -> None:
+    if row["kind"] not in ("method", "function"):
+        return
+    sid = row["symbol_id"]
+    for ov in store.rows(
+        "SELECT * FROM symbols WHERE module=? AND kind=? AND symbol_id GLOB ? ORDER BY start_line, symbol_id",
+        (row["module"], row["kind"], f"{sid}#*"),
+    ):
+        chosen[ov["symbol_id"]] = ov
+
+
 def _resolve_anchor_batch_with_status(store, anchors) -> tuple[dict, list[str]]:
     chosen = {}
     unresolved: list[str] = []
@@ -1430,12 +1441,16 @@ def _resolve_anchor_batch_with_status(store, anchors) -> tuple[dict, list[str]]:
         try:
             row = _anchor(store, a)
             chosen[row["symbol_id"]] = row
+            if "#" not in a:
+                _expand_overload_siblings(store, chosen, row)
         except AnchorNotFoundError as exc:
             if first_err is None:
                 first_err = exc
             fb = len(anchors) > 1 and _resolve_batch_method_fallback(store, a)
             if fb:
                 chosen[fb["symbol_id"]] = fb
+                if "#" not in a:
+                    _expand_overload_siblings(store, chosen, fb)
             else:
                 unresolved.append(a)
     if not chosen and first_err is not None:

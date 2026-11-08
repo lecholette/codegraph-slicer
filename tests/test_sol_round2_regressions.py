@@ -354,5 +354,44 @@ def test_rrsi_stage2_python_context_manager_type_inference():
         assert ("ctx:run", "ctx:Store.sync", "CALLS") in edges
 
 
+def test_rrsi_stage3_java_overload_slicing_and_subtype_fanout():
+    with workspace(
+        {
+            "src/main/java/demo/Handler.java": (
+                "package demo;\n"
+                "public interface Handler {\n"
+                "    String exec(String x);\n"
+                "    String exec(String x, int y);\n"
+                "}\n"
+            ),
+            "src/main/java/demo/PackHandler.java": (
+                "package demo;\n"
+                "public class PackHandler implements Handler {\n"
+                "    public String helper() { return \"ok\"; }\n"
+                "    @Override public String exec(String x) { return exec(x, 1); }\n"
+                "    @Override public String exec(String x, int y) { return helper(); }\n"
+                "}\n"
+            ),
+            "src/main/java/demo/Runner.java": (
+                "package demo;\n"
+                "public class Runner {\n"
+                "    public String go(Handler h) { return h.exec(\"a\"); }\n"
+                "}\n"
+            ),
+        }
+    ) as (store, _, _):
+        edges = {(r["source_id"], r["target_id"], r["kind"]) for r in store.rows("SELECT * FROM edges")}
+        assert ("demo.Runner:Runner.go", "demo.PackHandler:PackHandler.exec", "CALLS") in edges
+        assert ("demo.Runner:Runner.go", "demo.PackHandler:PackHandler.exec#2", "CALLS") in edges
+
+        sl = slice_context(store, ["demo.PackHandler:PackHandler.exec"])
+        t_sids = {item["symbol"] for item in sl["sections"]["target_implementations"]}
+        d_sids = {item["symbol"] for item in sl["sections"]["downstream_dependencies"]}
+        assert "demo.PackHandler:PackHandler.exec" in t_sids
+        assert "demo.PackHandler:PackHandler.exec#2" in t_sids
+        assert "demo.PackHandler:PackHandler.helper" in d_sids
+
+
+
 
 
