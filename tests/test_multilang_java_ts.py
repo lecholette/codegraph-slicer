@@ -1286,14 +1286,25 @@ def test_batch_slice_fuzzy_method_and_package_stem_resolution(tmp_path) -> None:
     """Verify batched slice resolves guessed method names (e.g. create_gnu_tar_archive -> build_deterministic_gnu_tar), package-stem paths, and unit boundaries."""
     from codegraph_slicer.slicer import (
         _append_line_span,
+        _expand_comma_anchors,
         _extract_python_docstring_summary,
         _format_unresolved_anchor_with_hint,
+        _identifier_word_tokens,
         _is_non_boilerplate_public_method,
         _match_fuzzy_class_method,
+        _method_similarity_score,
         _preceding_doc_comment_start,
         _resolve_batch_method_fallback,
         _resolve_fuzzy_single_class_in_module,
+        _strip_leading_path_prefix,
     )
+
+    assert _strip_leading_path_prefix("/src/") == "src/"
+    assert _strip_leading_path_prefix("/src/pkg/a.py") == "pkg/a.py"
+    assert _strip_leading_path_prefix("lib/b.py") == "b.py"
+    assert _expand_comma_anchors([" a:x , , b:y ", "", "c:z"]) == ["a:x", "b:y", "c:z"]
+    assert _identifier_word_tokens("bus_jobs_burn_ab") == {"bus", "job", "burn"}
+    assert abs(_method_similarity_score("loadtarget", {"load", "target"}, "load_alpha_beta") - (0.45 + 1.0 / 30.0)) < 1e-6
 
     # 1. Direct boundary checks for _preceding_doc_comment_start and _append_line_span
     assert _preceding_doc_comment_start(["// Line 1 doc", "class A {"], 2) == 1
@@ -1322,13 +1333,31 @@ def test_batch_slice_fuzzy_method_and_package_stem_resolution(tmp_path) -> None:
     assert _is_non_boilerplate_public_method({"qualname": "C.execute_job", "signature": "def execute_job(self)"}, {"__init__"})
     assert _match_fuzzy_class_method([], "foo") is None
     single_m = [{"qualname": "C.only_method", "symbol_id": "m:C.only_method"}]
-    assert _match_fuzzy_class_method(single_m, "totally_different") == single_m[0]
+    assert _match_fuzzy_class_method(single_m, "totally_different") is None
+    assert _match_fuzzy_class_method(single_m, "only_method_runner") == single_m[0]
+    tied_m = [
+        {"qualname": "C.load_archive", "symbol_id": "m:C.load_archive"},
+        {"qualname": "C.load_manifest", "symbol_id": "m:C.load_manifest"},
+    ]
+    assert _match_fuzzy_class_method(tied_m, "load") is None
+    assert _match_fuzzy_class_method(list(reversed(tied_m)), "load") is None
+    tie_then_winner = [
+        {"qualname": "C.load_alpha", "symbol_id": "m:C.load_alpha"},
+        {"qualname": "C.load_beta", "symbol_id": "m:C.load_beta"},
+        {"qualname": "C.load_target", "symbol_id": "m:C.load_target"},
+    ]
+    assert _match_fuzzy_class_method(tie_then_winner, "load_target_data") == tie_then_winner[2]
+    short_m = [{"qualname": "C.ab", "symbol_id": "m:C.ab"}]
+    assert _match_fuzzy_class_method(short_m, "abc") == short_m[0]
+    assert _match_fuzzy_class_method(short_m, "xy") is None
     two_m = [
         {"qualname": "C.build_deterministic_gnu_tar", "symbol_id": "m:C.build_deterministic_gnu_tar"},
         {"qualname": "C.inspect_existing_pack", "symbol_id": "m:C.inspect_existing_pack"},
     ]
     assert _match_fuzzy_class_method(two_m, "zzzz_unrelated") is None
+    assert _match_fuzzy_class_method(two_m, "buildDeterministicGnuTar") == two_m[0]
     assert _match_fuzzy_class_method(two_m, "create_gnu_tar_archive") == two_m[0]
+    assert _match_fuzzy_class_method(two_m, "load_existing_packs") == two_m[1]
 
     decoy_methods = "\n".join(
         f"    def audit_step_{i:02d}(self, x: int) -> int:\n        return x + {i}\n"
@@ -1338,7 +1367,11 @@ def test_batch_slice_fuzzy_method_and_package_stem_resolution(tmp_path) -> None:
     _write(
         root,
         {
-            "src/enterprise/archive/gnu/gnu_tar_pack_helper.py": f'''"""Tar helper."""
+            "enterprise/archive/gnu/gnu_tar_pack_helper.py": f'''"""Tar helper."""
+
+
+def top_archive_helper(path: str) -> str:
+    return path
 
 
 class GnuTarPackHelper:
@@ -1349,7 +1382,7 @@ class GnuTarPackHelper:
     def inspect_existing_pack(self, tar_path: str) -> dict:
         return {{"path": tar_path}}
 ''',
-            "src/enterprise/config/validator/default_job_policy_validator.py": f'''"""Validator."""
+            "enterprise/config/validator/default_job_policy_validator.py": f'''"""Validator."""
 
 
 class DefaultJobPolicyValidator:
@@ -1362,9 +1395,9 @@ class DefaultJobPolicyValidator:
     with GraphStore(":memory:") as store:
         store.sync_workspace(root)
         assert _resolve_batch_method_fallback(store, "no_colon") is None
-        assert _resolve_fuzzy_single_class_in_module(store, "src/enterprise/archive/gnu/gnu_tar_pack_helper.py", "lowercase") is None
+        assert _resolve_fuzzy_single_class_in_module(store, "enterprise/archive/gnu/gnu_tar_pack_helper.py", "lowercase") is None
         fuzzy_cls = _resolve_fuzzy_single_class_in_module(
-            store, "src/enterprise/archive/gnu/gnu_tar_pack_helper.py", "GnuTarPackHelper"
+            store, "enterprise/archive/gnu/gnu_tar_pack_helper.py", "GnuTarPackHelper"
         )
         assert fuzzy_cls is not None and fuzzy_cls["qualname"] == "GnuTarPackHelper"
         hint_str = _format_unresolved_anchor_with_hint(
@@ -1374,14 +1407,38 @@ class DefaultJobPolicyValidator:
         sliced = slice_context(
             store,
             [
-                "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:GnuTarPackHelper.create_gnu_tar_archive",
-                "src/enterprise/config/validator.py:DefaultJobPolicyValidator.validate_job_strategy",
+                "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:GnuTarPackHelper.create_gnu_tar_archive,"
+                "src/enterprise/config/validator.py:DefaultJobPolicyValidator.validate_job_strategy,"
+                "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:top_archive_helper,"
+                "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:GnuTarPackHelper.zzzz_no_such_method",
             ],
             max_tokens=4000,
         )
         target_symbols = {e["symbol"] for e in sliced["sections"]["target_implementations"]}
         assert any(s.endswith(":GnuTarPackHelper.build_deterministic_gnu_tar") for s in target_symbols)
         assert any(s.endswith(":DefaultJobPolicyValidator.validate_strategy_and_destination") for s in target_symbols)
-        assert not sliced.get("unresolved_anchors")
+        assert any(s.endswith(":top_archive_helper") for s in target_symbols)
+        unres = sliced.get("unresolved_anchors", [])
+        assert len(unres) == 1 and "available:" in unres[0] and "build_deterministic_gnu_tar" in unres[0]
+
+    from codegraph_slicer.cli import main as cli_main
+
+    db_file = tmp_path / "cli_smoke.sqlite"
+    assert cli_main(["sync", str(root), "--database", str(db_file), "--format", "xml"]) == 0
+    assert (
+        cli_main(
+            [
+                "slice",
+                "--database",
+                str(db_file),
+                "src/enterprise/archive/gnu/gnu_tar_pack_helper.py:top_archive_helper,src/enterprise/archive/gnu/gnu_tar_pack_helper.py:GnuTarPackHelper.zzzz_unknown",
+                "--max-tokens",
+                "4000",
+                "--format",
+                "xml",
+            ]
+        )
+        == 0
+    )
 
 

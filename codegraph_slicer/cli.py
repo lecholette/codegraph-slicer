@@ -650,6 +650,7 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.6")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",
@@ -662,7 +663,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sync.add_argument("root", help="workspace directory or Git repository")
-    sync.add_argument("--db", required=True, help="SQLite database to create or replace")
+    sync.add_argument("--db", "--database", dest="db", required=True, help="SQLite database to create or replace")
     sync.add_argument("--revision", help="Git revision to index instead of workspace files (default: workspace)")
     sync.add_argument("--skip-unparseable", action="store_true", help="skip source files that fail syntax parsing instead of aborting")
     mapping = sub.add_parser(
@@ -676,7 +677,7 @@ def main(argv=None):
         epilog="Example: codegraph-slicer map --db /tmp/project.sqlite --seed package.module\nNext: codegraph-slicer slice --db /tmp/project.sqlite package.module:run",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    mapping.add_argument("--db", required=True, help="existing indexed SQLite database")
+    mapping.add_argument("--db", "--database", dest="db", required=True, help="existing indexed SQLite database")
     mapping.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     mapping.add_argument("--seed", action="append", default=[], help="module or source path to rank from; repeatable (default: whole repository)")
     mapping.add_argument("--max-tokens", type=int, default=2000, help="estimated context budget (default: 2000)")
@@ -694,7 +695,7 @@ def main(argv=None):
         epilog="Example: codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.module:helper\nNext: inspect the JSON, or add --format markdown or --format xml for readable context.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    slicing.add_argument("--db", required=True, help="existing indexed SQLite database")
+    slicing.add_argument("--db", "--database", dest="db", required=True, help="existing indexed SQLite database")
     slicing.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     slicing.add_argument("anchors", nargs="+", help="symbol, module, or path/line anchor")
     slicing.add_argument("--max-tokens", type=int, default=8000, help="estimated context budget (default: 8000)")
@@ -716,7 +717,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     impact.add_argument("anchor", help="observed function or method anchor")
-    impact.add_argument("--db", required=True, help="existing indexed SQLite snapshot, opened read-only")
+    impact.add_argument("--db", "--database", dest="db", required=True, help="existing indexed SQLite snapshot, opened read-only")
     impact.add_argument("--snapshot", action="store_true", help="query cached historical bytes without checking source freshness")
     impact.add_argument("--max-depth", type=int, default=3, help="maximum number of caller hops (default: 3)")
     impact.add_argument("--max-nodes", type=int, default=200, help="maximum returned caller nodes (default: 200)")
@@ -738,7 +739,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     flow.add_argument("anchor", help="observed function/method anchor (module/class anchors are refused)")
-    flow.add_argument("--db", required=True, help="existing indexed SQLite snapshot, opened read-only")
+    flow.add_argument("--db", "--database", dest="db", required=True, help="existing indexed SQLite snapshot, opened read-only")
     flow.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     flow.add_argument("--variable", help="local name or access path to seed")
     flow.add_argument("--line", type=int, help="source line to seed")

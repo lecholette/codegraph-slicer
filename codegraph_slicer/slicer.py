@@ -104,16 +104,38 @@ def _with_output_tokens(result, render_estimator=None):
         result["tokens"] = estimate
 
 
+_LEADING_PATH_PREFIXES = ("src/", "lib/", "app/")
+
+
+def _strip_leading_path_prefix(path: str) -> str:
+    clean = path.lstrip("/")
+    for pfx in _LEADING_PATH_PREFIXES:
+        if clean.startswith(pfx) and len(clean) > len(pfx):
+            return clean[len(pfx) :]
+    return clean
+
+
+def _find_unique_suffix_file(store, path: str) -> str | None:
+    clean = path.lstrip("/")
+    cand_files = store.rows(
+        "SELECT path FROM files WHERE path GLOB ? ORDER BY length(path), path",
+        (f"*/{clean}",),
+    )
+    stripped = _strip_leading_path_prefix(clean)
+    if not cand_files and stripped != clean:
+        cand_files = store.rows(
+            "SELECT path FROM files WHERE path=? OR path GLOB ? ORDER BY length(path), path",
+            (stripped, f"*/{stripped}"),
+        )
+    return cand_files[0]["path"] if len(cand_files) == 1 else None
+
+
 def _resolve_suffix_path_anchor(store, path: str, target: str):
     if not is_supported_source_path(path):
         return None
-    cand_files = store.rows(
-        "SELECT path FROM files WHERE path GLOB ? ORDER BY length(path), path",
-        (f"*/{path.lstrip('/')}",),
-    )
-    if len(cand_files) != 1:
+    fpath = _find_unique_suffix_file(store, path)
+    if fpath is None:
         return None
-    fpath = cand_files[0]["path"]
     rows = store.rows(
         "SELECT * FROM symbols WHERE file_path=? AND qualname=?",
         (fpath, target),
@@ -469,7 +491,10 @@ def _build_slice_outline_in_snapshot(
     allowed_kinds = ["CALLS", "USES_TYPE", "INHERITS", "DEFINES"]
     if include_imports:
         allowed_kinds.append("IMPORTS")
-    selected = {row["symbol_id"] for row in (_anchor(store, anchor) for anchor in anchors)}
+    selected = {
+        row["symbol_id"]
+        for row in (_anchor(store, anchor) for anchor in _expand_comma_anchors(anchors))
+    }
     roots = set(selected)
     for symbol_id in sorted(roots):
         for row in store.rows(
@@ -1514,10 +1539,11 @@ def _find_class_for_fallback(store, mod_part: str, cls_part: str) -> dict | None
         if suf_cls is not None and suf_cls["kind"] == "class":
             cls_rows = [suf_cls]
     if not cls_rows:
-        pkg_stem = mod_part[:-3] if mod_part.endswith(".py") else mod_part
+        raw_stem = mod_part[:-3] if mod_part.endswith(".py") else mod_part
+        pkg_stem = _strip_leading_path_prefix(raw_stem)
         cls_rows = store.rows(
             "SELECT * FROM symbols WHERE file_path GLOB ? AND kind='class' AND qualname=? ORDER BY start_line, symbol_id",
-            (f"*{pkg_stem.lstrip('/')}*/*", cls_part),
+            (f"*{pkg_stem}*/*", cls_part),
         )
     return cls_rows[0] if len(cls_rows) == 1 else None
 
@@ -1533,30 +1559,35 @@ def _non_boilerplate_class_methods(store, cls_row: dict, cls_part: str) -> list[
 
 
 def _identifier_word_tokens(name: str) -> set[str]:
-    return {t.lower() for t in re.findall(r"[A-Z]?[a-z0-9]+", name) if len(t) >= 3}
+    raw = (t.lower() for t in re.findall(r"[A-Z]?[a-z0-9]+", name) if len(t) >= 3)
+    return {t[:-1] if len(t) >= 4 and t.endswith("s") else t for t in raw}
+
+
+def _method_similarity_score(m_norm: str, m_tokens: set[str], c_short: str) -> float:
+    c_norm = c_short.lower().replace("_", "")
+    if m_norm == c_norm:
+        return 1.0
+    c_tokens = _identifier_word_tokens(c_short)
+    shared = len(m_tokens & c_tokens)
+    tok_overlap = 0.0
+    if shared:
+        min_n = min(len(m_tokens), len(c_tokens))
+        max_n = max(len(m_tokens), len(c_tokens))
+        tok_overlap = 0.9 * (shared / min_n) + 0.1 * (shared / max_n)
+    seq_ratio = difflib.SequenceMatcher(None, m_norm, c_norm).ratio()
+    return max(tok_overlap, seq_ratio if seq_ratio >= 0.65 else 0.0)
 
 
 def _match_fuzzy_class_method(core_pub: list[dict], m_short: str) -> dict | None:
-    if len(core_pub) == 1:
-        return core_pub[0]
     m_norm = m_short.lower().replace("_", "")
     m_tokens = _identifier_word_tokens(m_short)
-    best_m = None
-    best_score = 0.0
-    for cand in core_pub:
-        c_short = cand["qualname"].rpartition(".")[2]
-        c_norm = c_short.lower().replace("_", "")
-        c_tokens = _identifier_word_tokens(c_short)
-        tok_overlap = (
-            len(m_tokens & c_tokens) / max(1, min(len(m_tokens), len(c_tokens)))
-            if (m_tokens and c_tokens)
-            else 0.0
-        )
-        score = max(difflib.SequenceMatcher(None, m_norm, c_norm).ratio(), tok_overlap)
-        if score > best_score:
-            best_score = score
-            best_m = cand
-    return best_m if (best_m is not None and best_score >= 0.45) else None
+    scored = [(_method_similarity_score(m_norm, m_tokens, c["qualname"].rpartition(".")[2]), i, c) for i, c in enumerate(core_pub)]
+    scored.sort(key=lambda item: -item[0])
+    if not scored or scored[0][0] < 0.45:
+        return None
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][2]
 
 
 def _resolve_fuzzy_single_class_in_module(store, mod_part: str, qual_part: str) -> dict | None:
@@ -1590,7 +1621,9 @@ def _resolve_batch_method_fallback(store, anchor_str: str) -> dict | None:
     if cls_row is None:
         return None
     core_pub = _non_boilerplate_class_methods(store, cls_row, cls_part)
-    return _match_fuzzy_class_method(core_pub, m_short) or cls_row
+    if not core_pub:
+        return cls_row
+    return _match_fuzzy_class_method(core_pub, m_short)
 
 
 def _format_unresolved_anchor_with_hint(store, anchor_str: str) -> str:
@@ -1625,16 +1658,21 @@ def _record_resolved_anchor(store, chosen: dict, row: dict, raw_anchor: str) -> 
         _expand_overload_siblings(store, chosen, row)
 
 
+def _expand_comma_anchors(anchors) -> list[str]:
+    return [p.strip() for raw in anchors for p in str(raw).split(",") if p.strip()]
+
+
 def _resolve_anchor_batch_with_status(store, anchors) -> tuple[dict, list[str]]:
+    norm_anchors = _expand_comma_anchors(anchors)
     chosen = {}
     unresolved: list[str] = []
     first_err = None
-    for a in anchors:
+    for a in norm_anchors:
         try:
             _record_resolved_anchor(store, chosen, _anchor(store, a), a)
         except AnchorNotFoundError as exc:
             first_err = first_err or exc
-            fb = len(anchors) > 1 and _resolve_batch_method_fallback(store, a)
+            fb = len(norm_anchors) > 1 and _resolve_batch_method_fallback(store, a)
             if fb:
                 _record_resolved_anchor(store, chosen, fb, a)
             else:
