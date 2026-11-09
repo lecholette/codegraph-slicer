@@ -22,7 +22,7 @@ DOTTED_IDENT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*)\b
 CODE_IDENT_RE = re.compile(
     r"\b(?:[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+|[a-z_][a-z0-9]*_[a-z0-9_]+)\b"
 )
-PROMPT_WORD_RE = re.compile(r"[A-Za-z]{4,}")
+PROMPT_WORD_RE = re.compile(r"[A-Za-z]{3,}")
 BROAD_VERBS_RE = re.compile(
     r"\b(all|every|across|repository|codebase|migrate|refactor|audit|system-wide|global)\b",
     re.IGNORECASE,
@@ -34,7 +34,10 @@ CONSTRAINT_RE = re.compile(
 
 STOPWORDS = frozenset({
     "true", "false", "none", "null", "self", "this", "return", "class", "function",
-    "method", "module", "file", "files", "test", "tests", "error", "value", "string",
+    "method", "module", "modules", "file", "files", "test", "tests", "error", "value", "string",
+    "the", "and", "for", "with", "not", "all", "are", "can", "use", "add", "fix", "run",
+    "set", "get", "new", "old", "via", "into", "from", "that", "have", "must", "shall",
+    "never", "cannot", "without", "across", "every", "entire", "repository", "codebase",
 })
 
 
@@ -308,12 +311,69 @@ def _resolve_identifier_anchors(
     return list(dict.fromkeys(resolved_syms)), candidate_files
 
 
+def _is_deemphasized_path(path_low: str) -> bool:
+    return any(seg in path_low for seg in ("/legacy/", "/example/", "/examples/", "/sample/"))
+
+
+def _score_keyword_files(prod_loc: dict[str, int], keywords: tuple[str, ...]) -> list[str]:
+    scored: list[tuple[int, int, int, str]] = []
+    for path, loc in prod_loc.items():
+        p_low = path.lower()
+        hits = sum(1 for kw in keywords if _kw_matches_path(kw, p_low))
+        if hits > 0:
+            scored.append((-hits, 1 if _is_deemphasized_path(p_low) else 0, -loc, path))
+    scored.sort()
+    return [item[3] for item in scored[:10]]
+
+
+def _is_ctor_qualname(qual: str) -> bool:
+    parts = qual.split(".")
+    return "#" in qual or (len(parts) >= 2 and parts[0] == parts[1])
+
+
+def _resolve_keyword_anchors(
+    db: sqlite3.Connection,
+    prod_loc: dict[str, int],
+    keywords: tuple[str, ...],
+) -> tuple[list[str], list[str]]:
+    top_files = _score_keyword_files(prod_loc, keywords)
+    if not top_files:
+        return [], []
+    placeholders = ",".join("?" for _ in top_files)
+    rows = db.execute(
+        f"SELECT symbol_id, file_path, qualname, COALESCE(cx, 1) FROM symbols "
+        f"WHERE file_path IN ({placeholders}) AND kind IN ('class', 'function', 'method')",
+        tuple(top_files),
+    ).fetchall()
+    file_rank = {f: idx for idx, f in enumerate(top_files)}
+    scored_syms = sorted(
+        rows,
+        key=lambda r: (
+            -sum(1 for kw in keywords if _kw_matches_path(kw, str(r[2]).rsplit(".", 1)[-1].lower())),
+            -sum(1 for kw in keywords if _kw_matches_path(kw, f"{r[1]}:{r[2]}".lower())),
+            1 if _is_ctor_qualname(str(r[2])) else 0,
+            -int(r[3] or 1),
+            file_rank.get(str(r[1]), 99),
+            str(r[0]),
+        ),
+    )
+    chosen: list[str] = []
+    seen_files: set[str] = set()
+    for row in scored_syms:
+        f_str = str(row[1])
+        if f_str not in seen_files:
+            chosen.append(str(row[0]))
+            seen_files.add(f_str)
+    return chosen[:12], top_files[:10]
+
+
 def _resolve_symbols_for_signals(
     db: sqlite3.Connection,
-    prod_set: set[str],
+    prod_loc: dict[str, int],
     signals: PromptSignals,
     matched_paths: list[str],
 ) -> tuple[str, list[str], list[str], float]:
+    prod_set = set(prod_loc)
     resolved_syms, target_files = _resolve_qualified_anchors(
         db, prod_set, signals.qualified_anchors, matched_paths
     )
@@ -324,6 +384,11 @@ def _resolve_symbols_for_signals(
     if candidate_files:
         ambig = min(1.0, max(0.15, (len(candidate_files) - 1) / 8.0))
         return "identifier_inferred", inferred_syms[:16], candidate_files[:12], ambig
+
+    kw_syms, kw_files = _resolve_keyword_anchors(db, prod_loc, signals.keywords)
+    if kw_files:
+        ambig = min(1.0, max(0.25, (len(kw_files) - 1) / 10.0))
+        return "keyword_match", kw_syms[:12], kw_files[:10], ambig
     return "repository_fallback", [], [], 0.90
 
 
@@ -382,7 +447,7 @@ def _collect_metrics(store: GraphStore, signals: PromptSignals) -> StructuralMet
 
     matched_paths = _match_prompt_paths(prod_paths, signals.explicit_paths)
     mode, resolved_syms, target_files, ambig = _resolve_symbols_for_signals(
-        store.db, prod_set, signals, matched_paths
+        store.db, prod_loc, signals, matched_paths
     )
     if not target_files:
         scale = inspect_scale_structure(store, prod_rows)

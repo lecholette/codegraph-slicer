@@ -10,6 +10,81 @@ class UnknownSeedError(CodeGraphError):
     pass
 
 
+_TLD_PREFIXES = frozenset({"com", "org", "net", "io", "edu", "gov"})
+
+
+def _ns_and_subpkg(module: str) -> tuple[str, str]:
+    parts = module.split(".")
+    if len(parts) >= 2 and parts[0] in _TLD_PREFIXES:
+        ns = f"{parts[0]}.{parts[1]}"
+        sub = f"{ns}.{parts[2]}" if len(parts) >= 4 else ns
+        return ns, sub
+    ns = parts[0] if len(parts) >= 2 else ""
+    sub = f"{ns}.{parts[1]}" if len(parts) >= 3 else ns
+    return ns, sub
+
+
+def _unseeded_personalization(store, nodes: list[str]) -> dict[str, float]:
+    ns_nodes: dict[str, list[str]] = {}
+    ns_subs: dict[str, set[str]] = {}
+    for row in store.rows("SELECT symbol_id, module FROM symbols"):
+        ns, sub = _ns_and_subpkg(str(row["module"]))
+        ns_nodes.setdefault(ns, []).append(str(row["symbol_id"]))
+        ns_subs.setdefault(ns, set()).add(sub)
+    if len(ns_nodes) <= 1:
+        return {n: 1.0 / len(nodes) for n in nodes}
+    ns_weights = {ns: float(len(ns_subs[ns]) ** 2) for ns in ns_nodes}
+    total_w = sum(ns_weights.values())
+    pers: dict[str, float] = {}
+    for ns, sids in ns_nodes.items():
+        per_node = (ns_weights[ns] / total_w) / len(sids)
+        for sid in sids:
+            pers[sid] = per_node
+    return pers
+
+
+def _resolve_seed_nodes(store, all_seeds: tuple) -> set[str]:
+    seed_nodes: set[str] = set()
+    for seed in all_seeds:
+        found = store.rows(
+            "SELECT symbol_id FROM symbols WHERE module=? OR file_path=? OR symbol_id=?",
+            (seed, seed, seed),
+        )
+        if not found:
+            raise UnknownSeedError(seed)
+        seed_nodes.update(row["symbol_id"] for row in found)
+    return seed_nodes
+
+
+def _build_rank_graph(store, nodes: list[str]) -> dict[str, set[str]]:
+    graph: dict[str, set[str]] = {node: set() for node in nodes}
+    for edge in store.rows("""SELECT source_id,target_id FROM edges
+            WHERE kind IN ('CALLS','IMPORTS','USES_TYPE','INHERITS','DEFINES')"""):
+        if edge["source_id"] in graph and edge["target_id"] in graph:
+            graph[edge["source_id"]].add(edge["target_id"])
+    return graph
+
+
+def _iterate_pagerank(
+    nodes: list[str],
+    graph: dict[str, set[str]],
+    personalization: dict[str, float],
+    alpha: float,
+    iterations: int,
+) -> dict[str, float]:
+    scores = personalization.copy()
+    for _ in range(iterations):
+        dangling = sum(scores[n] for n in nodes if not graph[n])
+        new = {n: (1 - alpha + alpha * dangling) * personalization[n] for n in nodes}
+        for source in nodes:
+            for target in sorted(graph[source]):
+                new[target] += alpha * scores[source] / len(graph[source])
+        if max(abs(new[n] - scores[n]) for n in nodes) < 1e-7:
+            return new
+        scores = new
+    return scores
+
+
 def rank(
     store,
     seeds=(),
@@ -23,36 +98,16 @@ def rank(
     nodes = sorted(
         row["symbol_id"] for row in store.rows("SELECT symbol_id FROM symbols")
     )
-    graph = {node: set() for node in nodes}
-    for edge in store.rows("""SELECT source_id,target_id FROM edges
-            WHERE kind IN ('CALLS','IMPORTS','USES_TYPE','INHERITS','DEFINES')"""):
-        if edge["source_id"] in graph and edge["target_id"] in graph:
-            graph[edge["source_id"]].add(edge["target_id"])
-    seed_nodes = set()
-    for seed in (*seeds, *seed_paths, *seed_modules, *seed_symbols):
-        found = store.rows(
-            "SELECT symbol_id FROM symbols WHERE module=? OR file_path=? OR symbol_id=?",
-            (seed, seed, seed),
-        )
-        if not found:
-            raise UnknownSeedError(seed)
-        seed_nodes.update(row["symbol_id"] for row in found)
+    graph = _build_rank_graph(store, nodes)
+    seed_nodes = _resolve_seed_nodes(store, (*seeds, *seed_paths, *seed_modules, *seed_symbols))
     if not nodes:
         return {}
-    if not seed_nodes:
-        seed_nodes = set(nodes)
-    personalization = {n: 1 / len(seed_nodes) if n in seed_nodes else 0 for n in nodes}
-    scores = personalization.copy()
-    for _ in range(iterations):
-        dangling = sum(scores[n] for n in nodes if not graph[n])
-        new = {n: (1 - alpha + alpha * dangling) * personalization[n] for n in nodes}
-        for source in nodes:
-            for target in sorted(graph[source]):
-                new[target] += alpha * scores[source] / len(graph[source])
-        if max(abs(new[n] - scores[n]) for n in nodes) < 1e-7:
-            scores = new
-            break
-        scores = new
+    personalization = (
+        {n: 1 / len(seed_nodes) if n in seed_nodes else 0 for n in nodes}
+        if seed_nodes
+        else _unseeded_personalization(store, nodes)
+    )
+    scores = _iterate_pagerank(nodes, graph, personalization, alpha, iterations)
     return dict(sorted(scores.items(), key=lambda pair: (-pair[1], pair[0])))
 
 

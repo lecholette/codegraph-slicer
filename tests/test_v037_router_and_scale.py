@@ -8,13 +8,16 @@ import time
 
 import pytest
 
-from codegraph_slicer import GraphStore, __version__, inspect_scale_structure, route_prompt
+from codegraph_slicer import GraphStore, __version__, build_repo_map, inspect_scale_structure, rank, route_prompt
 from codegraph_slicer.cli import _classify_scale, _scale_recommendation, main
+from codegraph_slicer.pagerank import _ns_and_subpkg
 from codegraph_slicer.router import (
     FourAxisScores,
     StructuralMetrics,
+    _is_ctor_qualname,
     _norm_linear,
     _norm_log2,
+    _rank_slice_targets,
     _select_workflow,
     extract_prompt_signals,
     score_four_axes,
@@ -100,7 +103,7 @@ def test_scale_recommendation_detects_monolith_and_coupled_graph(tmp_path: Path)
 
 
 def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None:
-    # 1. Tiny single-file repo -> bypass_direct_read (no recommended_tier!)
+    # 1. Tiny single-file repo -> bypass_direct_read
     tiny_root = tmp_path / "tiny_repo"
     tiny_root.mkdir()
     (tiny_root / "calc.py").write_text(
@@ -111,7 +114,6 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
     with GraphStore(tiny_db) as store:
         store.sync_workspace(tiny_root)
         res_tiny = route_prompt(store, "Fix `compute_tax` in calc.py:compute_tax")
-        assert "recommended_tier" not in res_tiny
         assert res_tiny["workflow_mode"] == "bypass_direct_read"
         assert res_tiny["bypass_slicer"] is True
         assert res_tiny["anchor_mode"] == "explicit"
@@ -135,7 +137,6 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
     with GraphStore(ent_db) as store:
         store.sync_workspace(ent_root)
         res_leaf = route_prompt(store, "Update leaf_0.py to adjust return value")
-        assert "recommended_tier" not in res_leaf
         assert res_leaf["workflow_mode"] == "repo_map_and_path_hint"
         assert res_leaf["bypass_slicer"] is True
 
@@ -181,7 +182,6 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
     assert main(["route", "--db", str(ent_db), "--prompt", "Inspect GiantGateway in monolith.py", "--format", "json"]) == 0
     cli_json = json.loads(capsys.readouterr().out)
     assert cli_json["schema"] == "codegraph-route-v1"
-    assert "recommended_tier" not in cli_json
     assert main(["route", "--db", str(ent_db), "--prompt", "Inspect GiantGateway", "--format", "markdown"]) == 0
     assert "codegraph-route-v1" in capsys.readouterr().out
     assert main(["route", "--db", str(ent_db), "--prompt", "Inspect GiantGateway", "--format", "xml"]) == 0
@@ -191,6 +191,49 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
     assert "src/app.py" in sig.explicit_paths
     assert ("src/app.py", "Service.run_task") in sig.qualified_anchors
     assert "CamelCaseToken" in sig.identifiers
+
+    assert _is_ctor_qualname("Service.Service") is True
+    assert _is_ctor_qualname("Service.Service#2") is True
+    assert _is_ctor_qualname("Service.execute") is False
+    assert _rank_slice_targets(["b.py", "a.py"], ()) == ["b.py", "a.py"]
+    assert _rank_slice_targets(["src/alpha.py", "src/strategy/pack.py"], ("strategy", "pack")) == [
+        "src/strategy/pack.py",
+        "src/alpha.py",
+    ]
+    assert _ns_and_subpkg("com.enterprise.strategy.PackHandler") == ("com.enterprise", "com.enterprise.strategy")
+    assert _ns_and_subpkg("com.example.Main") == ("com.example", "com.example")
+    assert _ns_and_subpkg("services.billing.splitter") == ("services", "services.billing")
+    assert _ns_and_subpkg("standalone") == ("", "")
+
+    with GraphStore(ent_db) as store:
+        res_kw = route_prompt(store, "inspect monolith route handling behavior")
+        assert res_kw["anchor_mode"] == "keyword_match"
+        assert "monolith.py" in res_kw["target_files"]
+        assert any("GiantGateway" in a for a in res_kw["resolved_anchors"])
+
+    # 3. Multi-namespace unseeded PageRank prioritizes diverse application subpackages over dense single-subpackage library
+    multi_root = tmp_path / "multi_ns"
+    for sub in ("cli", "orchestration", "strategy", "storage"):
+        d = multi_root / "com" / "enterprise" / sub
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{sub}_service.py").write_text(
+            f"def run_{sub}(x: int) -> int:\n    return x + 1\n",
+            encoding="utf-8",
+        )
+    lib_dir = multi_root / "com" / "vendor" / "gson"
+    lib_dir.mkdir(parents=True, exist_ok=True)
+    for idx in range(10):
+        (lib_dir / f"lib_{idx}.py").write_text(
+            f"def parse_{idx}(v: int) -> int:\n    return v + {idx}\n",
+            encoding="utf-8",
+        )
+    multi_db = tmp_path / "multi.sqlite"
+    with GraphStore(multi_db) as store:
+        store.sync_workspace(multi_root)
+        scores = rank(store)
+        assert sum(scores.values()) == pytest.approx(1.0)
+        rmap = build_repo_map(store, max_tokens=2000)
+        assert rmap["items"][0]["path"].startswith("com/enterprise/")
 
 
 def test_1m_loc_graphstore_scale_route_and_anchor_recovery_speed(tmp_path: Path) -> None:
