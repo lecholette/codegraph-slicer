@@ -145,7 +145,7 @@ codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
 
 # Or route a specific task prompt directly to resolved anchors and monolith slice targets:
 codegraph-slicer route --db "$GRAPH" \
-  --prompt "Update PackBackupStrategyHandler.executeJob and inspect its callers" \
+  --prompt "Update CheckoutHandler.processOrder and inspect its callers" \
   --format json
 ```
 
@@ -164,9 +164,9 @@ Batch 3–8 target anchors into a single call so shared types and callers are de
 
 ```sh
 codegraph-slicer slice --db "$GRAPH" --max-tokens 8000 --format xml \
-  src/main/java/com/enterprise/orchestration/pipeline/JobExecutionEngine.java:JobExecutionEngine.executeDueJobs \
-  src/main/java/com/enterprise/strategy/pack/PackBackupStrategyHandler.java:PackBackupStrategyHandler \
-  src/main/java/com/enterprise/config/validator/DefaultJobPolicyValidator.java:DefaultJobPolicyValidator
+  src/main/java/com/acme/orders/OrderPipeline.java:OrderPipeline.dispatchDueOrders \
+  src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler \
+  src/main/java/com/acme/validation/OrderPolicyValidator.java:OrderPolicyValidator
 ```
 
 The XML slice organizes structural context into four deterministic sections:
@@ -250,7 +250,7 @@ Evaluated across the same five coding models on a 12-package enterprise Java rep
 - **If you want to query the pre-edit snapshot without re-syncing:** Pass `--snapshot` (`codegraph-slicer slice --snapshot --db "$GRAPH" ...`).
 
 ### `AnchorNotFoundError` (Exit Code `2`)
-When a requested symbol or file anchor cannot be resolved, `codegraph-slicer` returns nearest-match `candidates` in copy-pasteable `path/file.ext:Class.method` format (for example, `src/main/java/com/enterprise/strategy/pack/PackBackupStrategyHandler.java:PackBackupStrategyHandler.executeJob`) in `< seconds` even on million-line indices.
+When a requested symbol or file anchor cannot be resolved, `codegraph-slicer` returns nearest-match `candidates` in copy-pasteable `path/file.ext:Class.method` format (for example, `src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler.processOrder`) in `< seconds` even on million-line indices.
 - Copy the exact candidate anchor from the error diagnostic instead of guessing method names.
 - If a class's method names are unknown, pass the class anchor directly (`path/file.ext:ClassName`).
 
