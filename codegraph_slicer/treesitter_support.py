@@ -185,7 +185,7 @@ def _fold_brace_private_methods(text: str) -> str:
         return text
     out_lines: list[str] = []
     for i, ln in enumerate(lines):
-        if i in drop_set:
+        if i in drop_set or (i - 1 in drop_set and not ln.strip()):
             continue
         out_lines.append(ln)
         if i in kept_tail_counts:

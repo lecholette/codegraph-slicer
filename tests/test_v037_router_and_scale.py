@@ -23,6 +23,7 @@ from codegraph_slicer.router import (
     score_four_axes,
 )
 from codegraph_slicer.slicer import AnchorNotFoundError, _anchor
+from codegraph_slicer.treesitter_support import _fold_brace_private_methods
 from codegraph_slicer.ts_extractor import parse_tsconfig_paths
 
 
@@ -234,6 +235,12 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
         assert sum(scores.values()) == pytest.approx(1.0)
         rmap = build_repo_map(store, max_tokens=2000)
         assert rmap["items"][0]["path"].startswith("com/enterprise/")
+
+    folded = _fold_brace_private_methods(
+        "class C {\n  _p1() { ... }\n\n  _p2() { ... }\n\n  _p3() { ... }\n\n  _p4() { ... }\n\n  _p5() { ... }\n\n  pub() { ... }\n}\n"
+    )
+    assert "// ... (+2 private methods)\n\n  pub() { ... }" in folded
+    assert "\n\n\n" not in folded
 
 
 def test_1m_loc_graphstore_scale_route_and_anchor_recovery_speed(tmp_path: Path) -> None:

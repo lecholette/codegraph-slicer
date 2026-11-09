@@ -200,9 +200,20 @@ codegraph-slicer delta --base-db "$GRAPH" --head-db /tmp/head.sqlite \
 
 ## Benchmark Results (`v0.3.7`)
 
-### 1. Enterprise Java Hard Monorepo (`295` `.java` Files, `64,080` LOC, `89` Tests + `6` Cross-Package Contracts)
+### 1. Enterprise JavaScript Hard Monorepo (`289` `.js` Files, `44,219` LOC, `89` Tests + `6` Cross-Package Contracts)
 
-Evaluated across four coding models on a 12-package enterprise Java repository containing `500–640`-line monolithic handlers and `279` decoy classes (zero post-hoc fixups):
+Evaluated across four coding models on a 12-package enterprise CommonJS JavaScript repository containing `400–520`-line monolithic strategy/orchestration classes, barrel `index.js` re-exports, and `273` decoy modules (zero post-hoc fixups):
+
+| Model | Baseline (No Slicer) | With `codegraph-slicer v0.3.7` | Delta |
+| :--- | :--- | :--- | :--- |
+| **`gpt-6-luna`** | `69/89 (77.5%)`, `6/6` Contracts (`CP2: 14/18`, `CP4: 7/21`), `38` exec calls, `123,745` tokens | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`, `CP2: 18/18`, `CP4: 19/21`)**, `38` exec calls, `127,642` tokens | **`+19.1%` accuracy (`+17` tests), `100%` on CP1 & CP2, `+57.1%` on CP4** |
+| **`claude-haiku-5-5`** | `70/89 (78.7%)`, `2/6` Contracts (`CP2: 10/18`, `CP3: 12/18`), `53` turns, `7.03M` cache read (`86.3k` out), `399.1s`, `$0.54` | **`80/89 (89.9%)`**, `2/6` Contracts (**`CP2: 15/18`, `CP3: 17/18`**), `53` turns, **`4.50M` cache read** (`86.2k` out), **`378.2s`**, **`$0.52`** | **`+11.2%` accuracy (`+10` tests), `-36.1%` cache read tokens, `-5.2%` wall time, `-4.3%` cost** |
+| **Cursor Composer (`composer-2.5`)** | `87/89 (97.8%)`, `6/6` Contracts (`CP3: 16/18`), `21` turns, `1.30M` cache read (`73.4k` in / `13.3k` out), `87.6s` | **`89/89 (100.0%)`**, `5/6` Contracts (**`CP1–CP4: 100%`**), `46` turns, `3.25M` cache read (`290.0k` in / `24.6k` out), `204.8s` | **`+2.2%` accuracy (`89/89 = 100.0%` across all 4 checkpoints)** |
+| **`deepseek-v4.1-flash-1017`** | `86/89 (96.6%)`, `6/6` Contracts, `97` turns, `7.68M` cache read (`114.2k` in / `96.3k` out), `828.3s` | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`, `CP1: 32/32`, `CP2: 18/18`)**, `111` turns, `8.11M` cache read (`113.7k` in / `131.4k` out), `1172.0s` | **`96.6%` accuracy (`86/89`) & `6/6` cross-package contracts (`-0.5%` input tokens)** |
+
+### 2. Enterprise Java Hard Monorepo (`295` `.java` Files, `64,080` LOC, `89` Tests + `6` Cross-Package Contracts)
+
+Evaluated across the same four coding models on a 12-package enterprise Java repository containing `500–640`-line monolithic handlers and `279` decoy classes (zero post-hoc fixups):
 
 | Model | Baseline (No Slicer) | With `codegraph-slicer v0.3.7` | Delta |
 | :--- | :--- | :--- | :--- |
@@ -211,7 +222,7 @@ Evaluated across four coding models on a 12-package enterprise Java repository c
 | **`gpt-6-luna`** | `86/89 (96.6%)`, `6/6` Contracts, `63` exec calls, `143,489` tokens | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`)**, **`26` exec calls**, **`127,302` tokens** | **`-58.7%` exec calls (`63 -> 26`), `-11.3%` tokens** |
 | **`claude-haiku-5-5`** | `89/89 (100.0%)`, `6/6` Contracts, `58` turns, `6.52M` cache read (`89.0k` out), `408.1s`, `$0.64` | **`89/89 (100.0%)`**, **`6/6` Contracts (`100%`)**, **`49` turns**, **`4.81M` cache read** (**`75.0k` out**), **`337.6s`**, **`$0.42`** | **`-15.5%` turns, `-26.2%` cache read tokens, `-17.3%` wall time, `-34.4%` cost** |
 
-### 2. Cross-Language Highlights (`Python`, `Java`, `TypeScript`, `JavaScript`)
+### 3. Additional Cross-Language Highlights (`Python`, `TypeScript`, `JavaScript`)
 
 - **Enterprise JavaScript Monorepo (`289` `.js` files, `44,213` LOC, `89` tests + `6` contracts):**
   - **`deepseek-v4.1-flash-1017`:** **`84/89 (94.4%) -> 86/89 (96.6%, +2.2%)`**, **`5/6 -> 6/6` contracts (`100%`)**, **`-20.2%` turns** (`84 -> 67`).
