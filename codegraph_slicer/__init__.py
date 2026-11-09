@@ -28,4 +28,4 @@ from .router import route_prompt as route_prompt
 from .store import GraphStore as GraphStore
 from .store import InvalidRevisionError as InvalidRevisionError
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"

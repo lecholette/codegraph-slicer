@@ -18,7 +18,7 @@ from codegraph_slicer.router import (
     _norm_linear,
     _norm_log2,
     _rank_slice_targets,
-    _select_workflow,
+    _select_tier_and_workflow,
     extract_prompt_signals,
     score_four_axes,
 )
@@ -41,7 +41,7 @@ class _NoDBStore:
 
 
 def test_version_and_scale_guard_helpers() -> None:
-    assert __version__ == "0.3.7"
+    assert __version__ == "0.3.8"
     assert parse_tsconfig_paths(b"not-json") == {}
     assert parse_tsconfig_paths(b"[]") == {}
     assert parse_tsconfig_paths(b'{"compilerOptions": {"baseUrl": "src", "paths": {"@/*": ["app/*"]}}}') == {"@/*": "src/app/*"}
@@ -115,6 +115,7 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
     with GraphStore(tiny_db) as store:
         store.sync_workspace(tiny_root)
         res_tiny = route_prompt(store, "Fix `compute_tax` in calc.py:compute_tax")
+        assert res_tiny["recommended_tier"] == "low"
         assert res_tiny["workflow_mode"] == "bypass_direct_read"
         assert res_tiny["bypass_slicer"] is True
         assert res_tiny["anchor_mode"] == "explicit"
@@ -138,6 +139,7 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
     with GraphStore(ent_db) as store:
         store.sync_workspace(ent_root)
         res_leaf = route_prompt(store, "Update leaf_0.py to adjust return value")
+        assert res_leaf["recommended_tier"] == "low"
         assert res_leaf["workflow_mode"] == "repo_map_and_path_hint"
         assert res_leaf["bypass_slicer"] is True
 
@@ -146,6 +148,7 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
             "Update `GiantGateway.handle_route_1` so it must preserve backward-compatible behavior",
         )
         assert res_mono["anchor_mode"] == "identifier_inferred"
+        assert res_mono["recommended_tier"] in ("mid", "high")
         assert res_mono["bypass_slicer"] is False
         assert res_mono["workflow_mode"] == "mandatory_symbol_slice"
         assert res_mono["slice_targets"] == ["monolith.py"]
@@ -155,6 +158,7 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
             "Audit and refactor all modules across the entire repository to strictly enforce global invariants",
         )
         assert res_broad["anchor_mode"] == "repository_fallback"
+        assert res_broad["recommended_tier"] in ("mid", "high")
         assert res_broad["bypass_slicer"] is False
         assert res_broad["workflow_mode"] == "mandatory_symbol_slice"
 
@@ -176,13 +180,14 @@ def test_router_workflows_model_agnostic_and_cli(tmp_path: Path, capsys) -> None
         constraint_count=0,
     )
     low_scores = score_four_axes(low_slice_metrics)
-    assert _select_workflow(low_slice_metrics, low_scores) == ("targeted_symbol_slice", False)
+    assert _select_tier_and_workflow(low_slice_metrics, low_scores) == ("low", "targeted_symbol_slice", False)
     high_scores = FourAxisScores(0.8, 0.8, 0.8, 0.8, 0.75)
-    assert _select_workflow(low_slice_metrics, high_scores) == ("mandatory_symbol_slice", False)
+    assert _select_tier_and_workflow(low_slice_metrics, high_scores) == ("high", "mandatory_symbol_slice", False)
 
     assert main(["route", "--db", str(ent_db), "--prompt", "Inspect GiantGateway in monolith.py", "--format", "json"]) == 0
     cli_json = json.loads(capsys.readouterr().out)
     assert cli_json["schema"] == "codegraph-route-v1"
+    assert cli_json["recommended_tier"] in ("mid", "high")
     assert main(["route", "--db", str(ent_db), "--prompt", "Inspect GiantGateway", "--format", "markdown"]) == 0
     assert "codegraph-route-v1" in capsys.readouterr().out
     assert main(["route", "--db", str(ent_db), "--prompt", "Inspect GiantGateway", "--format", "xml"]) == 0

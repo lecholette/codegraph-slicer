@@ -528,7 +528,7 @@ def score_four_axes(m: StructuralMetrics) -> FourAxisScores:
     )
 
 
-def _is_compact_direct_read(m: StructuralMetrics) -> bool:
+def _is_tiny_single_file(m: StructuralMetrics) -> bool:
     return m.source_files <= 3 and m.source_loc < 400 and m.max_file_loc < 250 and m.max_cc < 12
 
 
@@ -536,33 +536,36 @@ def _has_monolith_or_hub(m: StructuralMetrics) -> bool:
     return _is_slice_monolith(m.max_file_loc, m.max_file_defs, m.max_cc) or m.cross_file_edges >= 40
 
 
-def _is_localized_compact_target(m: StructuralMetrics, s: FourAxisScores, has_mono_hub: bool) -> bool:
+def _is_small_modular_task(m: StructuralMetrics, s: FourAxisScores, has_mono_hub: bool) -> bool:
     if m.anchor_mode == "repository_fallback" or has_mono_hub:
         return False
     return 1 <= len(m.target_files) <= 2 and m.target_loc < 300 and s.d_coupling < 0.30
 
 
-def _select_workflow(m: StructuralMetrics, s: FourAxisScores) -> tuple[str, bool]:
-    if _is_compact_direct_read(m):
-        return "bypass_direct_read", True
+def _select_tier_and_workflow(m: StructuralMetrics, s: FourAxisScores) -> tuple[str, str, bool]:
+    if _is_tiny_single_file(m):
+        return "low", "bypass_direct_read", True
     has_mono_hub = _has_monolith_or_hub(m)
-    if _is_localized_compact_target(m, s, has_mono_hub):
-        return "repo_map_and_path_hint", True
-    if s.r_struct >= 0.30 or has_mono_hub or (m.anchor_mode == "repository_fallback" and m.source_loc >= 2500):
-        return "mandatory_symbol_slice", False
-    return "targeted_symbol_slice", False
+    if _is_small_modular_task(m, s, has_mono_hub):
+        return "low", "repo_map_and_path_hint", True
+    if s.r_struct >= 0.58 or s.d_coupling >= 0.65 or (m.anchor_mode == "repository_fallback" and m.source_loc >= 2500):
+        return "high", "mandatory_symbol_slice", False
+    if s.r_struct >= 0.30 or has_mono_hub:
+        return "mid", "mandatory_symbol_slice", False
+    return "low", "targeted_symbol_slice", False
 
 
 def route_prompt(store: GraphStore, prompt: str) -> dict[str, object]:
-    """Plan slicing workflow and localize target symbols/monoliths in <25 ms (model-agnostic)."""
+    """Route a task prompt in <25 ms using the 4-axis structural graph profile."""
     t0 = time.perf_counter()
     signals = extract_prompt_signals(prompt)
     metrics = _collect_metrics(store, signals)
     scores = score_four_axes(metrics)
-    workflow, bypass = _select_workflow(metrics, scores)
+    tier, workflow, bypass = _select_tier_and_workflow(metrics, scores)
     elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
     return {
         "schema": "codegraph-route-v1",
+        "recommended_tier": tier,
         "workflow_mode": workflow,
         "bypass_slicer": bypass,
         "anchor_mode": metrics.anchor_mode,

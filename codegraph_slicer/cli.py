@@ -809,7 +809,7 @@ def main(argv=None):
     delta.add_argument("--full", action="store_true", help="include the complete raw delta payload, refusing if it exceeds the budget")
     routing = sub.add_parser(
         "route",
-        help="compute 4-axis structural difficulty and recommend slicing workflow",
+        help="compute 4-axis structural difficulty and recommend model tier + slicing workflow",
         description=(
             "Resolve prompt file and symbol anchors against an indexed snapshot and\n"
             "compute D_loc, D_coupling, D_monolith, D_spec, and R_struct in <25 ms."
