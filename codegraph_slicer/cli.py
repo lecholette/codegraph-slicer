@@ -649,8 +649,10 @@ def render_markdown_report(result):
             mapped["retrieve_details"] = result["retrieve_details"]
         rendered = render_markdown_report(mapped)
         if "scale_recommendation" in result:
-            rendered = f"Estimated context tokens: {result['tokens']}\n\n" + rendered
-            rendered += "\n\nScaleRecommendation: " + json.dumps(result["scale_recommendation"], ensure_ascii=False, separators=(",", ":"))
+            rec_line = "ScaleRecommendation: " + json.dumps(
+                result["scale_recommendation"], ensure_ascii=False, separators=(",", ":")
+            )
+            rendered = f"{rec_line}\n\n{rendered}"
         return rendered
     return (
         "# Code graph report\n\n```json\n"

@@ -22,6 +22,7 @@ DOTTED_IDENT_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*)\b
 CODE_IDENT_RE = re.compile(
     r"\b(?:[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+|[a-z_][a-z0-9]*_[a-z0-9_]+)\b"
 )
+PROMPT_WORD_RE = re.compile(r"[A-Za-z]{4,}")
 BROAD_VERBS_RE = re.compile(
     r"\b(all|every|across|repository|codebase|migrate|refactor|audit|system-wide|global)\b",
     re.IGNORECASE,
@@ -57,6 +58,7 @@ class PromptSignals:
     identifiers: list[str]
     broad_count: int
     constraint_count: int
+    keywords: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -221,7 +223,10 @@ def extract_prompt_signals(prompt: str) -> PromptSignals:
     dedup_idents = list(dict.fromkeys(idents))[:32]
     broad = len(BROAD_VERBS_RE.findall(prompt))
     constraints = len(CONSTRAINT_RE.findall(prompt))
-    return PromptSignals(paths, qual_matches, dedup_idents, broad, constraints)
+    words = tuple(
+        dict.fromkeys(w.lower() for w in PROMPT_WORD_RE.findall(prompt) if w.lower() not in STOPWORDS)
+    )[:24]
+    return PromptSignals(paths, qual_matches, dedup_idents, broad, constraints, words)
 
 
 def _path_matches_suffix(candidate: str, norm_token: str) -> bool:
@@ -354,6 +359,20 @@ def _summarize_target_edges(
     return sum(pair_counts.values()), len(caller_set)
 
 
+def _kw_matches_path(kw: str, path_low: str) -> bool:
+    return kw in path_low or (len(kw) >= 6 and kw[:6] in path_low)
+
+
+def _rank_slice_targets(slice_targets: list[str], keywords: tuple[str, ...]) -> list[str]:
+    if not keywords:
+        return slice_targets[:12]
+    scored = sorted(
+        slice_targets,
+        key=lambda p: (-sum(1 for kw in keywords if _kw_matches_path(kw, p.lower())), p),
+    )
+    return scored[:12]
+
+
 def _collect_metrics(store: GraphStore, signals: PromptSignals) -> StructuralMetrics:
     rows = store.rows("SELECT path, loc FROM files")
     prod_rows = [dict(r) for r in rows if not is_test_path(str(r["path"]))]
@@ -371,7 +390,7 @@ def _collect_metrics(store: GraphStore, signals: PromptSignals) -> StructuralMet
             anchor_mode=mode,
             resolved_anchors=[],
             target_files=[],
-            slice_targets=scale.slice_targets[:10],
+            slice_targets=_rank_slice_targets(scale.slice_targets, signals.keywords),
             source_files=len(prod_paths),
             source_loc=sum(prod_loc.values()),
             target_loc=sum(prod_loc.values()),
