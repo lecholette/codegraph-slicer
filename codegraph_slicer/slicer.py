@@ -934,9 +934,103 @@ def _first_code_line_offset(body: str) -> int:
 
 
 _BOUNDARY_TOKENS = (".split(", ".rsplit(", ".partition(", ".rpartition(", ".strip(")
+_CALLER_SLICE_IGNORE = frozenset({
+    "if", "else", "elif", "for", "while", "switch", "case", "try", "catch", "finally",
+    "return", "new", "null", "None", "true", "false", "True", "False", "self", "this",
+    "let", "const", "var", "final", "int", "long", "double", "float", "boolean", "bool",
+    "String", "List", "Map", "Set", "Path", "Optional", "Object", "void", "async", "await",
+})
+_CALL_SITE_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
+_CALLEE_NAME_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+_MUTATION_CALL_PATS = ("add", "append", "extend", "put", "push", "set", "update", "remove", "clear", "pop", "insert")
+_CTRL_HEADER_PREFIXES = ("for ", "for(", "while ", "while(", "if ", "if(", "} else", "else:", "else ", "elif ", "switch ", "switch(")
 
 
-def _caller_boundary_lines(body_lines: list[str], code_start: int, window_start: int) -> list[tuple[int, str]]:
+def _extract_non_callee_vars(line: str) -> set[str]:
+    callees = set(_CALLEE_NAME_RE.findall(line))
+    return {
+        v for v in _CALL_SITE_IDENT_RE.findall(line)
+        if v not in _CALLER_SLICE_IGNORE and v not in callees and len(v) > 1
+    }
+
+
+def _extract_call_window_vars(body_lines: list[str], window_start: int, window_end: int) -> set[str]:
+    found: set[str] = set()
+    for k in range(max(0, window_start), min(len(body_lines), window_end + 1)):
+        line = body_lines[k].strip()
+        if line and not line.startswith(("#", "//", "/*", "*")):
+            found.update(_extract_non_callee_vars(line))
+    return found
+
+
+def _has_mutation_call(line: str) -> bool:
+    return any(f".{m}(" in line for m in _MUTATION_CALL_PATS)
+
+
+def _line_defines_var(line: str, tracked_vars: set[str]) -> bool:
+    return any(re.search(rf"\b{re.escape(v)}\b[^=;()]*=(?!=)", line) for v in tracked_vars)
+
+
+def _line_mutates_var(line: str, tracked_vars: set[str]) -> bool:
+    return any(
+        re.search(rf"\b{re.escape(v)}\.{m}\s*\(", line)
+        for v in tracked_vars
+        for m in _MUTATION_CALL_PATS
+    )
+
+
+def _is_ctrl_header(stripped: str) -> bool:
+    return stripped.startswith(_CTRL_HEADER_PREFIXES)
+
+
+def _is_skippable_caller_line(s: str) -> bool:
+    return not s or s == "}" or s.startswith(("#", '"""', "'''", "//", "/*", "*", "*/"))
+
+
+def _walk_backward_caller_slice(
+    body_lines: list[str],
+    code_start: int,
+    window_start: int,
+    tracked: set[str],
+) -> list[tuple[int, str]]:
+    selected: list[tuple[int, str]] = []
+    min_indent: int | None = None
+    hops = 0
+    for k in range(window_start - 1, code_start - 1, -1):
+        raw = body_lines[k]
+        s = raw.strip()
+        if _is_skippable_caller_line(s):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        is_def = _line_defines_var(s, tracked)
+        is_mut = not is_def and _line_mutates_var(s, tracked)
+        if is_def or is_mut:
+            selected.append((k, s))
+            min_indent = indent if min_indent is None else min(min_indent, indent)
+            if is_def and hops < 2 and "new ArrayList" not in s and not s.endswith(("= []", "= {}")):
+                tracked.update(_extract_non_callee_vars(s))
+                hops += 1
+        elif min_indent is not None and indent <= min_indent and _is_ctrl_header(s):
+            selected.append((k, s))
+            min_indent = indent
+    selected.reverse()
+    return selected[-8:]
+
+
+def _caller_boundary_lines(
+    body_lines: list[str],
+    code_start: int,
+    window_start: int,
+    call_idx: int | None = None,
+) -> list[tuple[int, str]]:
+    if window_start <= code_start:
+        return []
+    win_end = min(len(body_lines) - 1, (call_idx if call_idx is not None else window_start) + 1)
+    tracked = _extract_call_window_vars(body_lines, window_start, win_end)
+    if tracked:
+        sliced = _walk_backward_caller_slice(body_lines, code_start, window_start, tracked)
+        if sliced:
+            return sliced
     return [
         (k, body_lines[k].strip())
         for k in range(code_start, window_start)
@@ -959,7 +1053,7 @@ def _caller_item(row, call_lines):
         if 0 < idx < len(body_lines):
             window_start = max(code_start, idx - 5)
             window_end = min(len(body_lines) - 1, idx + 1)
-            for k, cl in _caller_boundary_lines(body_lines, code_start, window_start):
+            for k, cl in _caller_boundary_lines(body_lines, code_start, window_start, idx):
                 if k not in seen_idxs:
                     seen_idxs.add(k)
                     snippets.append(f"    {comment_pfx} L{sym.start_line + k}: {cl}")
@@ -1326,13 +1420,33 @@ def _build_type_summaries(
     return summaries, compact_summaries, auto_summarize_ids
 
 
+def _is_loop_or_mutation_line(s: str) -> bool:
+    return not _is_skippable_caller_line(s) and (
+        s.startswith(("for ", "for(", "while ", "while(")) or _has_mutation_call(s)
+    )
+
+
+def _extract_mid_spine_lines(mid_lines: list[str], comment_pfx: str) -> list[str]:
+    cleaned = [raw.strip() for raw in mid_lines if not _is_skippable_caller_line(raw.strip())]
+    if not any(_is_loop_or_mutation_line(s) for s in cleaned):
+        return []
+    return [
+        f"        {comment_pfx} spine: {s}"
+        for s in cleaned
+        if _is_ctrl_header(s) or _has_mutation_call(s)
+    ][:6]
+
+
 def _format_condensed_method_body(body: str, comment_pfx: str) -> str:
     m_lines = body.splitlines()
     if len(m_lines) <= 45:
         return body
+    mid_lines = m_lines[20:-8]
+    spine = _extract_mid_spine_lines(mid_lines, comment_pfx)
+    spine_block = ("\n" + "\n".join(spine)) if spine else ""
     return (
         "\n".join(m_lines[:20])
-        + f"\n        {comment_pfx} ... ({len(m_lines) - 28} lines condensed)\n"
+        + f"\n        {comment_pfx} ... ({len(m_lines) - 28} lines condensed){spine_block}\n"
         + "\n".join(m_lines[-8:])
     )
 
@@ -1365,8 +1479,13 @@ def _condense_class_public_methods(
         f"{sym.file_path}:{sym.start_line}-{sym.end_line}; "
         f"use Read offset={sym.start_line} limit={span_len} or --max-tokens {expand_budget})"
     )
+    condense_each_pub = min_internal < 5 or len(pub_methods) > 3 or max_tokens < 4000
     for m in pub_methods:
-        kept_parts.append(_format_condensed_method_body(m["body"], comment_pfx))
+        kept_parts.append(
+            _format_condensed_method_body(m["body"], comment_pfx)
+            if condense_each_pub
+            else m["body"]
+        )
     if sym.file_path.endswith(_BRACE_LANG_EXTS):
         kept_parts.append("}")
     return "\n".join(kept_parts)

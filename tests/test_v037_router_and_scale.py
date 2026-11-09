@@ -344,3 +344,58 @@ def test_1m_loc_graphstore_scale_route_and_anchor_recovery_speed(tmp_path: Path)
         with pytest.raises(AnchorNotFoundError) as exc_bare:
             _anchor(store, "ChargeSplitter.split_charges")
         assert "services/billing/charge_splitter.py:ChargeSplitter.split_charge" in exc_bare.value.nearest_anchors
+
+
+def test_caller_argument_and_control_flow_spine_slicing():
+    from codegraph_slicer.slicer import _caller_boundary_lines, _format_condensed_method_body
+
+    caller_lines = [
+        "    public List<String> runBatch(List<String> items, Handler handler) {",
+        "        List<String> events = new ArrayList<>();",
+        "        List<String> selected = new ArrayList<>();",
+        "        for (String item : items) {",
+        "            if (item.startsWith(\"skip\")) {",
+        "                events.add(\"SKIP:\" + item);",
+        "            } else {",
+        "                selected.add(item);",
+        "            }",
+        "        }",
+        "        int d1 = 1;",
+        "        int d2 = 2;",
+        "        int d3 = 3;",
+        "        int d4 = 4;",
+        "        int d5 = 5;",
+        "        int d6 = 6;",
+        "        handler.process(selected, events);",
+        "        return events;",
+        "    }",
+    ]
+    # Call is at index 16; window_start is 11 (idx - 5)
+    b_res = _caller_boundary_lines(caller_lines, 1, 11, 16)
+    b_texts = [t for _, t in b_res]
+    assert any("for (String item : items)" in t for t in b_texts)
+    assert any("events.add(" in t for t in b_texts)
+    assert any("selected.add(" in t for t in b_texts)
+
+    # Control-flow spine preservation inside condensed method body (> 45 lines)
+    long_method = (
+        ["    public void orchestrate(List<String> items) {"]
+        + [f"        int pre{i} = {i};" for i in range(1, 20)]
+        + [
+            "        for (String item : items) {",
+            "            if (item.isEmpty()) {",
+            "                events.add(\"EMPTY\");",
+            "            } else {",
+            "                records.add(item);",
+            "            }",
+            "        }",
+        ]
+        + [f"        int mid{i} = {i};" for i in range(1, 20)]
+        + [f"        int tail{i} = {i};" for i in range(1, 9)]
+        + ["    }"]
+    )
+    condensed = _format_condensed_method_body("\n".join(long_method), "//")
+    assert "lines condensed)" in condensed
+    assert "// spine: for (String item : items) {" in condensed
+    assert "// spine: events.add(\"EMPTY\");" in condensed
+    assert "// spine: records.add(item);" in condensed
