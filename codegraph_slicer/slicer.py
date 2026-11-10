@@ -987,6 +987,16 @@ def _is_skippable_caller_line(s: str) -> bool:
     return not s or s == "}" or s.startswith(("#", '"""', "'''", "//", "/*", "*", "*/"))
 
 
+def _should_expand_caller_hop(is_def: bool, hops: int, s: str) -> bool:
+    if not is_def or hops >= 2:
+        return False
+    return "new ArrayList" not in s and not s.endswith(("= []", "= {}"))
+
+
+def _is_enclosing_ctrl_line(min_indent: int | None, indent: int, s: str) -> bool:
+    return min_indent is not None and indent <= min_indent and _is_ctrl_header(s)
+
+
 def _walk_backward_caller_slice(
     body_lines: list[str],
     code_start: int,
@@ -1003,14 +1013,13 @@ def _walk_backward_caller_slice(
             continue
         indent = len(raw) - len(raw.lstrip())
         is_def = _line_defines_var(s, tracked)
-        is_mut = not is_def and _line_mutates_var(s, tracked)
-        if is_def or is_mut:
+        if is_def or _line_mutates_var(s, tracked):
             selected.append((k, s))
             min_indent = indent if min_indent is None else min(min_indent, indent)
-            if is_def and hops < 2 and "new ArrayList" not in s and not s.endswith(("= []", "= {}")):
+            if _should_expand_caller_hop(is_def, hops, s):
                 tracked.update(_extract_non_callee_vars(s))
                 hops += 1
-        elif min_indent is not None and indent <= min_indent and _is_ctrl_header(s):
+        elif _is_enclosing_ctrl_line(min_indent, indent, s):
             selected.append((k, s))
             min_indent = indent
     selected.reverse()
@@ -1437,9 +1446,11 @@ def _extract_mid_spine_lines(mid_lines: list[str], comment_pfx: str) -> list[str
     ][:6]
 
 
-def _format_condensed_method_body(body: str, comment_pfx: str) -> str:
+def _format_condensed_method_body(
+    body: str, comment_pfx: str, max_method_lines: int = 45
+) -> str:
     m_lines = body.splitlines()
-    if len(m_lines) <= 45:
+    if len(m_lines) <= max_method_lines:
         return body
     mid_lines = m_lines[20:-8]
     spine = _extract_mid_spine_lines(mid_lines, comment_pfx)
@@ -1479,12 +1490,10 @@ def _condense_class_public_methods(
         f"{sym.file_path}:{sym.start_line}-{sym.end_line}; "
         f"use Read offset={sym.start_line} limit={span_len} or --max-tokens {expand_budget})"
     )
-    condense_each_pub = min_internal < 5 or len(pub_methods) > 3 or max_tokens < 4000
+    max_m_lines = 65 if min_internal >= 5 and max_tokens >= 4000 else 45
     for m in pub_methods:
         kept_parts.append(
-            _format_condensed_method_body(m["body"], comment_pfx)
-            if condense_each_pub
-            else m["body"]
+            _format_condensed_method_body(m["body"], comment_pfx, max_m_lines)
         )
     if sym.file_path.endswith(_BRACE_LANG_EXTS):
         kept_parts.append("}")
@@ -1612,26 +1621,18 @@ def _apply_session_dedup(sections: dict, database, dedup_session=True) -> set[st
     return deduped
 
 
-def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database, max_tokens):
-    required = result_fn()
-    if required["tokens"] <= max_tokens or max_tokens < 1000:
-        return required
-    db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
-    sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
-    for sid, row in sorted_targets:
-        if required["tokens"] <= max_tokens:
-            break
-        pub_condensed = _condense_class_public_methods(store, sid, row, db_arg, max_tokens)
-        if pub_condensed is not None and len(pub_condensed) < len(row["body"]):
-            condensed_item = {
-                "symbol": sid,
-                "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{pub_condensed}",
-            }
-            sections["target_implementations"] = [
-                condensed_item if entry["symbol"] == sid else entry
-                for entry in sections["target_implementations"]
-            ]
-            required = result_fn()
+def _replace_target_section_entry(sections: dict, sid: str, row: dict, body_text: str) -> None:
+    condensed_item = {
+        "symbol": sid,
+        "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{body_text}",
+    }
+    sections["target_implementations"] = [
+        condensed_item if entry["symbol"] == sid else entry
+        for entry in sections["target_implementations"]
+    ]
+
+
+def _condense_targets_by_head_tail(sorted_targets, sections, result_fn, required, max_tokens):
     for sid, row in sorted_targets:
         if required["tokens"] <= max_tokens:
             break
@@ -1648,16 +1649,28 @@ def _condense_multi_anchor_targets(store, chosen, sections, result_fn, database,
             + f"use Read offset={omitted_start} limit={omitted_count})\n"
             + "\n".join(body_lines[-8:])
         )
-        condensed_item = {
-            "symbol": sid,
-            "text": f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n{condensed_body}",
-        }
-        sections["target_implementations"] = [
-            condensed_item if entry["symbol"] == sid else entry
-            for entry in sections["target_implementations"]
-        ]
+        _replace_target_section_entry(sections, sid, row, condensed_body)
         required = result_fn()
     return required
+
+
+def _condense_multi_anchor_targets(
+    store, chosen, sections, result_fn, database, max_tokens, soft_target_cap: int | None = None
+):
+    required = result_fn()
+    pub_cap = soft_target_cap if soft_target_cap is not None else max_tokens
+    if required["tokens"] <= pub_cap or max_tokens < 1000:
+        return required
+    db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
+    sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
+    for sid, row in sorted_targets:
+        if required["tokens"] <= pub_cap:
+            break
+        pub_condensed = _condense_class_public_methods(store, sid, row, db_arg, max_tokens)
+        if pub_condensed is not None and len(pub_condensed) < len(row["body"]):
+            _replace_target_section_entry(sections, sid, row, pub_condensed)
+            required = result_fn()
+    return _condense_targets_by_head_tail(sorted_targets, sections, result_fn, required, max_tokens)
 
 
 _BOILERPLATE_METHOD_RE = re.compile(r"(?:_[0-9]{2}$|Step[0-9]{2}$|^_helper[0-9]+$)")
@@ -1699,6 +1712,39 @@ def _non_boilerplate_class_methods(store, cls_row: dict, cls_part: str) -> list[
     )
     ctor_names = {"__init__", "__new__", "constructor", cls_part.rsplit(".", 1)[-1]}
     return [m for m in all_methods if _is_non_boilerplate_public_method(m, ctor_names)]
+
+
+def _collect_interface_method_seeds(store, sid: str, pub_short_names: set[str]) -> list[str]:
+    if not pub_short_names:
+        return []
+    iface_methods: list[str] = []
+    for irow in store.rows(
+        "SELECT target_id FROM edges WHERE source_id=? AND kind='INHERITS'", (sid,)
+    ):
+        parent_id = irow["target_id"]
+        fanin = store.rows(
+            "SELECT COUNT(*) AS cnt FROM edges WHERE target_id=? AND kind='INHERITS'",
+            (parent_id,),
+        )
+        if fanin and int(fanin[0]["cnt"] or 0) <= 8:
+            for drow in store.rows(
+                "SELECT target_id FROM edges WHERE source_id=? AND kind='DEFINES'",
+                (parent_id,),
+            ):
+                m_sid = drow["target_id"]
+                if m_sid.rpartition(".")[2] in pub_short_names:
+                    iface_methods.append(m_sid)
+    return iface_methods
+
+
+def _collect_class_call_seeds(store, sid: str, row: dict) -> tuple[list[str], list[str]]:
+    if row["kind"] != "class":
+        return [sid], [sid]
+    pub_methods = _non_boilerplate_class_methods(store, row, row["qualname"])
+    pub_sids = [m["symbol_id"] for m in pub_methods]
+    pub_short = {m["qualname"].rpartition(".")[2] for m in pub_methods}
+    iface_sids = _collect_interface_method_seeds(store, sid, pub_short)
+    return [sid, *pub_sids, *iface_sids], [sid, *pub_sids]
 
 
 def _identifier_word_tokens(name: str) -> set[str]:
@@ -1944,25 +1990,28 @@ def _slice_context_in_snapshot(
                     and related["symbol_id"] not in chosen_enclosing_classes
                 ):
                     types[related["symbol_id"]] = related
-        for related in store.rows(
-            """SELECT s.*, e.line AS call_line FROM symbols s JOIN edges e
-                ON s.symbol_id=e.source_id WHERE e.target_id=? AND e.kind='CALLS'
-                ORDER BY e.line""",
-            (sid,),
-        ):
-            csid = related["symbol_id"]
-            if csid not in chosen and (all_target_in_test or not _is_test_symbol(related)):
-                callers[csid] = related
-                caller_lines.setdefault(csid, set()).add(related["call_line"])
+        caller_seeds, callee_seeds = _collect_class_call_seeds(store, sid, row)
+        for c_seed in caller_seeds:
+            for related in store.rows(
+                """SELECT s.*, e.line AS call_line FROM symbols s JOIN edges e
+                    ON s.symbol_id=e.source_id WHERE e.target_id=? AND e.kind='CALLS'
+                    ORDER BY e.line""",
+                (c_seed,),
+            ):
+                csid = related["symbol_id"]
+                if csid not in chosen and (all_target_in_test or not _is_test_symbol(related)):
+                    callers[csid] = related
+                    caller_lines.setdefault(csid, set()).add(related["call_line"])
         _recover_chained_callers(store, row, chosen, all_target_in_test, callers, caller_lines)
-        for related in store.rows(
-            """SELECT DISTINCT s.* FROM symbols s JOIN edges e
-                ON s.symbol_id=e.target_id WHERE e.source_id=? AND e.kind='CALLS'
-                ORDER BY s.symbol_id""",
-            (sid,),
-        ):
-            if related["symbol_id"] not in chosen and related["symbol_id"] not in types:
-                callees[related["symbol_id"]] = related
+        for d_seed in callee_seeds:
+            for related in store.rows(
+                """SELECT DISTINCT s.* FROM symbols s JOIN edges e
+                    ON s.symbol_id=e.target_id WHERE e.source_id=? AND e.kind='CALLS'
+                    ORDER BY s.symbol_id""",
+                (d_seed,),
+            ):
+                if related["symbol_id"] not in chosen and related["symbol_id"] not in types:
+                    callees[related["symbol_id"]] = related
 
     def _is_enclosed_by_chosen(cand_row) -> bool:
         if f"{cand_row['module']}:" in chosen:
@@ -2177,12 +2226,26 @@ def _slice_context_in_snapshot(
                 for entry in sections["types_and_schemas"]
             ]
         required = result()
-    required = _condense_multi_anchor_targets(store, chosen, sections, result, database, max_tokens)
+    soft_cap = (
+        int(max_tokens * 0.72)
+        if len(chosen) > 1 and (callers or callees) and max_tokens >= 2000
+        else max_tokens
+    )
+    required = _condense_multi_anchor_targets(
+        store, chosen, sections, result, database, max_tokens, soft_target_cap=soft_cap
+    )
     if required["tokens"] > max_tokens and target_mode != "skeleton":
         sections["target_implementations"] = [
             item(row, True) for _, row in sorted(chosen.items())
         ]
-        required = _condense_multi_anchor_targets(store, chosen, sections, result, database, max_tokens)
+        soft_cap = (
+        int(max_tokens * 0.72)
+        if len(chosen) > 1 and (callers or callees) and max_tokens >= 2000
+        else max_tokens
+    )
+    required = _condense_multi_anchor_targets(
+        store, chosen, sections, result, database, max_tokens, soft_target_cap=soft_cap
+    )
     if required["tokens"] > max_tokens and any(
         totals[name] > len(sections[name])
         for name in ("upstream_callers", "downstream_dependencies")

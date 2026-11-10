@@ -138,7 +138,24 @@ def _query_symbol_file_stats(
     return defs_by_file, cc_by_file
 
 
-def _query_cross_file_edges(db: sqlite3.Connection, prod_paths: set[str]) -> int:
+def _accumulate_edge_degrees(
+    rows: list[tuple[object, ...]], prod_paths: set[str], weighted: bool
+) -> tuple[int, dict[str, int]]:
+    total = 0
+    deg: dict[str, int] = {}
+    for row in rows:
+        s_str, d_str = str(row[0]), str(row[1])
+        if s_str in prod_paths and d_str in prod_paths:
+            w = int(row[2] or 0) if weighted else 1
+            total += w
+            deg[s_str] = deg.get(s_str, 0) + w
+            deg[d_str] = deg.get(d_str, 0) + w
+    return total, deg
+
+
+def _query_cross_file_edges(
+    db: sqlite3.Connection, prod_paths: set[str]
+) -> tuple[int, dict[str, int]]:
     if len(prod_paths) > 60:
         cur = db.execute(
             "SELECT e.source_file, t.file_path "
@@ -147,9 +164,7 @@ def _query_cross_file_edges(db: sqlite3.Connection, prod_paths: set[str]) -> int
             "JOIN symbols t ON t.symbol_id = e.target_id "
             "WHERE e.source_file != t.file_path"
         )
-        return sum(
-            1 for r in cur.fetchall() if str(r[0]) in prod_paths and str(r[1]) in prod_paths
-        )
+        return _accumulate_edge_degrees(cur.fetchall(), prod_paths, False)
     cur = db.execute(
         "SELECT e.source_file, t.file_path, COUNT(*) "
         "FROM edges e "
@@ -157,11 +172,7 @@ def _query_cross_file_edges(db: sqlite3.Connection, prod_paths: set[str]) -> int
         "WHERE e.kind IN ('CALLS', 'USES_TYPE', 'INHERITS') AND e.source_file != t.file_path "
         "GROUP BY e.source_file, t.file_path"
     )
-    total = 0
-    for row in cur.fetchall():
-        if str(row[0]) in prod_paths and str(row[1]) in prod_paths:
-            total += int(row[2] or 0)
-    return total
+    return _accumulate_edge_degrees(cur.fetchall(), prod_paths, True)
 
 
 def _is_slice_monolith(loc: int, defs: int, cc: int) -> bool:
@@ -184,15 +195,20 @@ def inspect_scale_structure(store: object, production_rows: list[dict[str, objec
         return ScaleStructure([], max_loc, 0, 0, 1)
     try:
         defs_by_file, cc_by_file = _query_symbol_file_stats(db, prod_paths)
-        xfile_edges = _query_cross_file_edges(db, prod_paths)
+        xfile_edges, file_deg = _query_cross_file_edges(db, prod_paths)
     except (sqlite3.Error, AttributeError, TypeError, ValueError):
         return ScaleStructure([], max_loc, 0, 0, 1)
 
-    slice_targets = sorted(
+    raw_targets = [
         path
         for path, loc in loc_by_file.items()
         if _is_slice_monolith(loc, defs_by_file.get(path, 0), cc_by_file.get(path, 1))
-    )
+    ]
+    has_coupled = any(file_deg.get(p, 0) > 0 for p in raw_targets)
+    slice_targets = sorted(
+        raw_targets,
+        key=lambda p: (0 if file_deg.get(p, 0) > 0 else 1, p) if has_coupled else (0, p),
+    )[:16]
     max_defs = max(defs_by_file.values(), default=0)
     max_cc = max(cc_by_file.values(), default=1)
     return ScaleStructure(slice_targets, max_loc, max_defs, xfile_edges, max_cc)
@@ -312,16 +328,40 @@ def _resolve_identifier_anchors(
 
 
 def _is_deemphasized_path(path_low: str) -> bool:
-    return any(seg in path_low for seg in ("/legacy/", "/example/", "/examples/", "/sample/"))
+    return any(
+        seg in path_low
+        for seg in ("/legacy/", "/example/", "/examples/", "/sample/", "/vendor/", "/third_party/")
+    )
+
+
+def _stem_kw(kw: str) -> str:
+    for suf in ("ators", "ator", "ations", "ation", "ers", "er", "ies", "es", "s", "y"):
+        if len(kw) >= len(suf) + 4 and kw.endswith(suf):
+            return kw[: -len(suf)]
+    return kw
+
+
+def _kw_idf_weights(prod_loc: dict[str, int], keywords: tuple[str, ...]) -> dict[str, float]:
+    n_files = max(1, len(prod_loc))
+    low_paths = [p.lower() for p in prod_loc]
+    weights: dict[str, float] = {}
+    for kw in keywords:
+        df = sum(1 for p_low in low_paths if _kw_matches_path(kw, p_low))
+        weights[kw] = math.log((n_files + 1.0) / (df + 1.0)) + 1.0
+    return weights
 
 
 def _score_keyword_files(prod_loc: dict[str, int], keywords: tuple[str, ...]) -> list[str]:
-    scored: list[tuple[int, int, int, str]] = []
+    if not keywords:
+        return []
+    dedup_kws = tuple({_stem_kw(kw): kw for kw in keywords}.values())
+    weights = _kw_idf_weights(prod_loc, dedup_kws)
+    scored: list[tuple[float, int, int, str]] = []
     for path, loc in prod_loc.items():
         p_low = path.lower()
-        hits = sum(1 for kw in keywords if _kw_matches_path(kw, p_low))
-        if hits > 0:
-            scored.append((-hits, 1 if _is_deemphasized_path(p_low) else 0, -loc, path))
+        score = sum(weights[kw] for kw in dedup_kws if _kw_matches_path(kw, p_low))
+        if score > 0:
+            scored.append((-round(score, 4), 1 if _is_deemphasized_path(p_low) else 0, -loc, path))
     scored.sort()
     return [item[3] for item in scored[:10]]
 
@@ -425,7 +465,8 @@ def _summarize_target_edges(
 
 
 def _kw_matches_path(kw: str, path_low: str) -> bool:
-    return kw in path_low or (len(kw) >= 6 and kw[:6] in path_low)
+    stem = _stem_kw(kw)
+    return kw in path_low or stem in path_low or (len(kw) >= 6 and kw[:6] in path_low)
 
 
 def _rank_slice_targets(slice_targets: list[str], keywords: tuple[str, ...]) -> list[str]:

@@ -399,3 +399,134 @@ def test_caller_argument_and_control_flow_spine_slicing():
     assert "// spine: for (String item : items) {" in condensed
     assert "// spine: events.add(\"EMPTY\");" in condensed
     assert "// spine: records.add(item);" in condensed
+
+
+def test_class_anchor_calls_projection_and_budget_condensation(tmp_path):
+    from codegraph_slicer.slicer import slice_context
+
+    src = tmp_path / "src" / "pkg"
+    src.mkdir(parents=True)
+    (src / "Strategy.java").write_text(
+        "package pkg;\n"
+        "public interface Strategy {\n"
+        "    String execute(String item);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (src / "TarHelper.java").write_text(
+        "package pkg;\n"
+        "public class TarHelper {\n"
+        "    public static String buildArchive(String item) {\n"
+        "        return \"TAR:\" + item;\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    priv_helpers = "\n".join(
+        f"    private int _helper{i:02d}(int x) {{\n"
+        f"        int a = x + {i};\n"
+        f"        int b = a * 2;\n"
+        f"        return b - {i};\n"
+        f"    }}"
+        for i in range(1, 8)
+    )
+    pub_padding = "\n".join(f"        int step{i} = {i};" for i in range(1, 65))
+    (src / "ArchiveStrategy.java").write_text(
+        "package pkg;\n"
+        "public class ArchiveStrategy implements Strategy {\n"
+        f"{priv_helpers}\n"
+        "    public String execute(String item) {\n"
+        f"{pub_padding}\n"
+        "        for (int k = 0; k < 3; k++) {\n"
+        "            if (k == 1) {\n"
+        "                step1 += k;\n"
+        "            }\n"
+        "        }\n"
+        "        return TarHelper.buildArchive(item);\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (src / "PipelineEngine.java").write_text(
+        "package pkg;\n"
+        "public class PipelineEngine {\n"
+        "    private final Strategy strategy;\n"
+        "    public PipelineEngine(Strategy strategy) {\n"
+        "        this.strategy = strategy;\n"
+        "    }\n"
+        "    public String runDue(String item) {\n"
+        "        return this.strategy.execute(item);\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "graph.sqlite"
+    with GraphStore(db_path) as store:
+        store.sync_workspace(tmp_path)
+        res = slice_context(store, ["src/pkg/ArchiveStrategy.java:ArchiveStrategy"], max_tokens=6000)
+        target_text = "\n".join(e["text"] for e in res["sections"]["target_implementations"])
+        caller_syms = {e["symbol"] for e in res["sections"]["upstream_callers"]}
+        callee_syms = {e["symbol"] for e in res["sections"]["downstream_dependencies"]}
+
+        assert "lines condensed)" in target_text
+        assert "pkg.PipelineEngine:PipelineEngine.runDue" in caller_syms
+        assert "pkg.TarHelper:TarHelper.buildArchive" in callee_syms
+
+
+def test_router_stemming_idf_and_coupled_slice_targets(tmp_path):
+    (tmp_path / "core").mkdir()
+    (tmp_path / "config").mkdir()
+    (tmp_path / "vendor" / "gson").mkdir(parents=True)
+
+    (tmp_path / "config" / "policy_validator.py").write_text(
+        "class DefaultPolicyValidator:\n"
+        "    def validate_policy(self, data: dict) -> bool:\n"
+        "        return bool(data)\n",
+        encoding="utf-8",
+    )
+    monolith_lines = "\n".join(
+        f"    def _step_{i:02d}(self, x: int) -> int:\n"
+        + "\n".join(f"        v{k} = x + {k}" for k in range(8))
+        + f"\n        return v0 + {i}\n"
+        for i in range(22)
+    )
+    (tmp_path / "core" / "orchestration_engine.py").write_text(
+        "from config.policy_validator import DefaultPolicyValidator\n\n"
+        "class OrchestrationEngine:\n"
+        "    def run_pipeline(self, payload: dict) -> bool:\n"
+        "        v = DefaultPolicyValidator()\n"
+        "        return v.validate_policy(payload)\n\n"
+        f"{monolith_lines}\n",
+        encoding="utf-8",
+    )
+    for name in ("exclusion_strategy", "field_strategy", "number_strategy"):
+        cls_name = "".join(p.capitalize() for p in name.split("_"))
+        (tmp_path / "vendor" / "gson" / f"{name}.py").write_text(
+            f"class {cls_name}:\n"
+            f"{monolith_lines}\n",
+            encoding="utf-8",
+        )
+
+    db_path = tmp_path / "graph.sqlite"
+    with GraphStore(db_path) as store:
+        store.sync_workspace(tmp_path)
+        r = route_prompt(store, "Implement rules across validators and orchestrator strategy")
+        assert "config/policy_validator.py" in r["target_files"][:3]
+        assert "core/orchestration_engine.py" in r["target_files"][:3]
+        assert r["slice_targets"][0] == "core/orchestration_engine.py"
+
+
+def test_no_benchmark_identifiers_overfitting_guard():
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    banned = ("PackBackup", "JobExecutionEngine", "executeJob", "gson")
+    targets = [
+        *sorted((repo_root / "codegraph_slicer").glob("*.py")),
+        repo_root / ".claude" / "skills" / "codegraph-slicer" / "SKILL.md",
+    ]
+    for path in targets:
+        text = path.read_text(encoding="utf-8")
+        for token in banned:
+            assert token not in text, f"Banned benchmark token {token!r} found in {path.name}"
+
