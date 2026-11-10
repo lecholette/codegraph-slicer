@@ -1459,7 +1459,7 @@ def _format_condensed_method_body(
         return body
     if max_method_lines <= 0 and signature:
         return f"    {signature}"
-    head_n, tail_n = 20, 8
+    head_n, tail_n = (12, 5) if max_method_lines < 28 else (20, 8)
     mid_lines = m_lines[head_n:-tail_n]
     spine = _extract_mid_spine_lines(mid_lines, comment_pfx)
     spine_block = ("\n" + "\n".join(spine)) if spine else ""
@@ -1726,12 +1726,10 @@ def _condense_multi_anchor_targets(
         return required
     db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
     sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
-    required = _condense_targets_at_cap(
-        store, sorted_targets, sections, result_fn, required, db_arg, max_tokens, pub_cap, None
-    )
-    required = _condense_targets_at_cap(
-        store, sorted_targets, sections, result_fn, required, db_arg, max_tokens, max_tokens, 0
-    )
+    for budget_cap, cap_lines in ((pub_cap, None), (max_tokens, 0), (max_tokens, 22)):
+        required = _condense_targets_at_cap(
+            store, sorted_targets, sections, result_fn, required, db_arg, max_tokens, budget_cap, cap_lines
+        )
     return _condense_targets_by_head_tail(sorted_targets, sections, result_fn, required, max_tokens)
 
 

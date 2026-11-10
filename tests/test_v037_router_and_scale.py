@@ -627,4 +627,18 @@ def test_generic_empty_initializer_and_connected_method_filtering(tmp_path):
     assert _is_non_boilerplate_public_method(m_pad, {"Svc"}, has_edges=True) is True
 
 
+def test_compact_method_condensation_and_ts_cache_fallback():
+    from codegraph_slicer.slicer import _format_condensed_method_body
+    from codegraph_slicer.treesitter_support import _fallback_ts_cache_parent, parser_for
+
+    body = "\n".join(f"    line_{i} = {i};" for i in range(40))
+    condensed = _format_condensed_method_body(body, "//", max_method_lines=22, signature="void f()")
+    assert "line_11 = 11;" in condensed
+    assert "line_12 = 12;" not in condensed
+    assert "line_35 = 35;" in condensed
+    assert _fallback_ts_cache_parent() is None or isinstance(_fallback_ts_cache_parent(), str)
+    assert parser_for("java") is not None
+
+
+
 

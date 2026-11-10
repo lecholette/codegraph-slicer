@@ -1,19 +1,41 @@
 """Shared Tree-sitter parsing and AST utilities for Java and TypeScript."""
 
 from functools import lru_cache
+import os
+from pathlib import Path
+import pwd
+
+
+def _fallback_ts_cache_parent() -> str | None:
+    try:
+        pw_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError):
+        return None
+    for rel in ("Library/Caches", ".cache"):
+        cand = pw_home / rel
+        if (cand / "tree-sitter-language-pack").is_dir():
+            return str(cand)
+    return None
 
 
 @lru_cache(maxsize=None)
 def parser_for(grammar: str):
     try:
-        from tree_sitter_language_pack import get_parser
+        from tree_sitter_language_pack import PackConfig, configure, get_parser
     except ImportError as exc:
         from .ast_extractor import CodeGraphError
 
         raise CodeGraphError(
             f"tree-sitter-language-pack is required to parse {grammar} files"
         ) from exc
-    return get_parser(grammar)
+    try:
+        return get_parser(grammar)
+    except Exception:
+        fallback_dir = _fallback_ts_cache_parent()
+        if fallback_dir is not None:
+            configure(PackConfig(cache_dir=fallback_dir))
+            return get_parser(grammar)
+        raise
 
 
 def _has_non_jsx_syntax_error(root, data: bytes) -> bool:
