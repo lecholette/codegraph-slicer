@@ -530,3 +530,83 @@ def test_no_benchmark_identifiers_overfitting_guard():
         for token in banned:
             assert token not in text, f"Banned benchmark token {token!r} found in {path.name}"
 
+
+def test_router_root_vendor_deemphasis_and_rank_tie_preservation():
+    from codegraph_slicer.router import _is_deemphasized_path, _rank_slice_targets
+
+    assert _is_deemphasized_path("vendor/pkg/helper.py") is True
+    assert _is_deemphasized_path("third_party/lib/mod.py") is True
+    assert _is_deemphasized_path("src/core/service.py") is False
+
+    coupled_ordered = [
+        "src/zebra/orchestrator.py:ZebraOrchestrator",
+        "src/alpha/isolated.py:AlphaIsolated",
+        "src/beta/handler.py:BetaHandler",
+    ]
+    ranked = _rank_slice_targets(coupled_ordered, ("handler",))
+    assert ranked == [
+        "src/beta/handler.py:BetaHandler",
+        "src/zebra/orchestrator.py:ZebraOrchestrator",
+        "src/alpha/isolated.py:AlphaIsolated",
+    ]
+
+
+def test_multi_anchor_pass2_preserves_56_line_method_and_formatter_signatures(tmp_path):
+    from codegraph_slicer.slicer import slice_context
+
+    src = tmp_path / "src" / "pkg"
+    src.mkdir(parents=True)
+    priv_helpers = "\n".join(
+        f"    private String _helper{i:02d}(String x) {{\n"
+        + "\n".join(f"        String s{k} = x + {k};" for k in range(10))
+        + f"\n        return s0 + {i};\n    }}"
+        for i in range(18)
+    )
+    mid_loop = "\n".join(f"        items.add(String.valueOf({k}));" for k in range(48))
+    (src / "CoreCoordinator.java").write_text(
+        "package pkg;\nimport java.util.*;\n"
+        "public class CoreCoordinator {\n"
+        f"{priv_helpers}\n"
+        "    public List<String> dispatchBatch(List<String> inputs) {\n"
+        "        List<String> items = new ArrayList<>();\n"
+        f"{mid_loop}\n"
+        "        String marker = \"BATCH_LOOP_END_MARKER\";\n"
+        "        items.add(marker);\n"
+        "        return items;\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    fmt_methods = "\n".join(
+        f"    public String formatEvent{i:02d}(String id, int count) {{\n"
+        + "\n".join(f"        String p{k} = id + \":\" + {k};" for k in range(14))
+        + f"\n        return p0 + count + \"_EVT_{i:02d}\";\n    }}"
+        for i in range(14)
+    )
+    (src / "TelemetryFormatter.java").write_text(
+        "package pkg;\n"
+        "public class TelemetryFormatter {\n"
+        f"{priv_helpers}\n"
+        f"{fmt_methods}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "graph.sqlite"
+    with GraphStore(db_path) as store:
+        store.sync_workspace(tmp_path)
+        res = slice_context(
+            store,
+            [
+                "src/pkg/CoreCoordinator.java:CoreCoordinator",
+                "src/pkg/TelemetryFormatter.java:TelemetryFormatter",
+            ],
+            max_tokens=2200,
+        )
+        by_sym = {e["symbol"]: e["text"] for e in res["sections"]["target_implementations"]}
+        coord_text = by_sym["pkg.CoreCoordinator:CoreCoordinator"]
+        fmt_text = by_sym["pkg.TelemetryFormatter:TelemetryFormatter"]
+        assert "items.add(String.valueOf(25));" in coord_text
+        assert "formatEvent00(" in fmt_text
+        assert "formatEvent13(" in fmt_text
+
+

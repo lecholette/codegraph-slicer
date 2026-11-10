@@ -1446,37 +1446,75 @@ def _extract_mid_spine_lines(mid_lines: list[str], comment_pfx: str) -> list[str
     ][:6]
 
 
+def _condense_bounds(max_method_lines: int) -> tuple[int, int]:
+    if max_method_lines <= 4:
+        return 2, 1
+    if max_method_lines < 28:
+        return 6, 3
+    return 20, 8
+
+
 def _format_condensed_method_body(
-    body: str, comment_pfx: str, max_method_lines: int = 45
+    body: str, comment_pfx: str, max_method_lines: int = 45, signature: str = ""
 ) -> str:
     m_lines = body.splitlines()
     if len(m_lines) <= max_method_lines:
         return body
-    mid_lines = m_lines[20:-8]
+    if max_method_lines <= 0 and signature:
+        return f"    {signature}"
+    head_n, tail_n = _condense_bounds(max_method_lines)
+    mid_lines = m_lines[head_n:-tail_n]
     spine = _extract_mid_spine_lines(mid_lines, comment_pfx)
     spine_block = ("\n" + "\n".join(spine)) if spine else ""
     return (
-        "\n".join(m_lines[:20])
-        + f"\n        {comment_pfx} ... ({len(m_lines) - 28} lines condensed){spine_block}\n"
-        + "\n".join(m_lines[-8:])
+        "\n".join(m_lines[:head_n])
+        + f"\n        {comment_pfx} ... ({len(m_lines) - head_n - tail_n} lines condensed){spine_block}\n"
+        + "\n".join(m_lines[-tail_n:])
     )
 
 
+def _select_public_method_line_cap(
+    max_tokens: int, max_method_lines: int | None
+) -> int:
+    if max_method_lines is not None:
+        return max_method_lines
+    return 65 if max_tokens >= 2200 else 45
+
+
+def _can_condense_class_methods(
+    pub_methods: list[dict],
+    int_methods: list[dict],
+    min_internal: int,
+    max_method_lines: int | None,
+) -> bool:
+    if not pub_methods or len(int_methods) < min_internal:
+        return False
+    return not (max_method_lines is not None and max_method_lines <= 10 and len(pub_methods) < 5)
+
+
 def _condense_class_public_methods(
-    store, sid: str, row: dict, db_arg: str, max_tokens: int, min_internal: int = 1
+    store,
+    sid: str,
+    row: dict,
+    db_arg: str,
+    max_tokens: int,
+    min_internal: int = 1,
+    max_method_lines: int | None = None,
 ) -> str | None:
     sym = IndexedSymbol.from_row(row)
     if sym.kind not in {"class", "module"}:
         return None
-    methods = store.rows(
+    raw_methods = store.rows(
         """SELECT * FROM symbols WHERE file_path=? AND kind='method'
            AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
         (sym.file_path, sym.start_line, sym.end_line),
     )
+    direct = [m for m in raw_methods if m["qualname"].rpartition(".")[0] == sym.qualname]
+    methods = direct or raw_methods
     ctor_names = {"__init__", "__new__", "constructor", sym.qualname.rsplit(".", 1)[-1]}
     pub_methods = [m for m in methods if not _is_internal_method(m, ctor_names)]
     int_methods = [m for m in methods if _is_internal_method(m, ctor_names)]
-    if not pub_methods or len(int_methods) < min_internal:
+    if not _can_condense_class_methods(pub_methods, int_methods, min_internal, max_method_lines):
         return None
     body_lines = sym.body.splitlines()
     first_m_offset = max(1, methods[0]["start_line"] - sym.start_line)
@@ -1490,10 +1528,12 @@ def _condense_class_public_methods(
         f"{sym.file_path}:{sym.start_line}-{sym.end_line}; "
         f"use Read offset={sym.start_line} limit={span_len} or --max-tokens {expand_budget})"
     )
-    max_m_lines = 65 if min_internal >= 5 and max_tokens >= 4000 else 45
+    max_m_lines = _select_public_method_line_cap(max_tokens, max_method_lines)
     for m in pub_methods:
         kept_parts.append(
-            _format_condensed_method_body(m["body"], comment_pfx, max_m_lines)
+            _format_condensed_method_body(
+                m["body"], comment_pfx, max_m_lines, m["signature"]
+            )
         )
     if sym.file_path.endswith(_BRACE_LANG_EXTS):
         kept_parts.append("}")
@@ -1654,6 +1694,29 @@ def _condense_targets_by_head_tail(sorted_targets, sections, result_fn, required
     return required
 
 
+def _condense_targets_at_cap(
+    store,
+    sorted_targets: list[tuple[str, dict]],
+    sections: dict,
+    result_fn,
+    required: dict,
+    db_arg: str,
+    max_tokens: int,
+    budget_cap: int,
+    cap_lines: int | None,
+) -> dict:
+    for sid, row in sorted_targets:
+        if required["tokens"] <= budget_cap:
+            break
+        pub_condensed = _condense_class_public_methods(
+            store, sid, row, db_arg, max_tokens, max_method_lines=cap_lines
+        )
+        if pub_condensed is not None and len(pub_condensed) < len(row["body"]):
+            _replace_target_section_entry(sections, sid, row, pub_condensed)
+            required = result_fn()
+    return required
+
+
 def _condense_multi_anchor_targets(
     store, chosen, sections, result_fn, database, max_tokens, soft_target_cap: int | None = None
 ):
@@ -1663,13 +1726,12 @@ def _condense_multi_anchor_targets(
         return required
     db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
     sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
-    for sid, row in sorted_targets:
-        if required["tokens"] <= pub_cap:
-            break
-        pub_condensed = _condense_class_public_methods(store, sid, row, db_arg, max_tokens)
-        if pub_condensed is not None and len(pub_condensed) < len(row["body"]):
-            _replace_target_section_entry(sections, sid, row, pub_condensed)
-            required = result_fn()
+    required = _condense_targets_at_cap(
+        store, sorted_targets, sections, result_fn, required, db_arg, max_tokens, pub_cap, None
+    )
+    required = _condense_targets_at_cap(
+        store, sorted_targets, sections, result_fn, required, db_arg, max_tokens, max_tokens, 0
+    )
     return _condense_targets_by_head_tail(sorted_targets, sections, result_fn, required, max_tokens)
 
 
@@ -1732,7 +1794,7 @@ def _collect_interface_method_seeds(store, sid: str, pub_short_names: set[str]) 
                 (parent_id,),
             ):
                 m_sid = drow["target_id"]
-                if m_sid.rpartition(".")[2] in pub_short_names:
+                if m_sid.rpartition(".")[2].split("#", 1)[0] in pub_short_names:
                     iface_methods.append(m_sid)
     return iface_methods
 
@@ -1742,7 +1804,7 @@ def _collect_class_call_seeds(store, sid: str, row: dict) -> tuple[list[str], li
         return [sid], [sid]
     pub_methods = _non_boilerplate_class_methods(store, row, row["qualname"])
     pub_sids = [m["symbol_id"] for m in pub_methods]
-    pub_short = {m["qualname"].rpartition(".")[2] for m in pub_methods}
+    pub_short = {m["qualname"].rpartition(".")[2].split("#", 1)[0] for m in pub_methods}
     iface_sids = _collect_interface_method_seeds(store, sid, pub_short)
     return [sid, *pub_sids, *iface_sids], [sid, *pub_sids]
 
@@ -2216,6 +2278,10 @@ def _slice_context_in_snapshot(
     ]
     for name in ("upstream_callers", "downstream_dependencies"):
         sections[name].clear()
+    if len(chosen) > 1 and any(
+        totals[name] > 0 for name in ("upstream_callers", "downstream_dependencies")
+    ):
+        omitted_detail_limit = 2
     required = result()
     if required["tokens"] > max_tokens and compact_summaries:
         for sid, c_summary in compact_summaries.items():

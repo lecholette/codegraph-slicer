@@ -328,8 +328,9 @@ def _resolve_identifier_anchors(
 
 
 def _is_deemphasized_path(path_low: str) -> bool:
+    norm = f"/{path_low.lstrip('/')}"
     return any(
-        seg in path_low
+        seg in norm
         for seg in ("/legacy/", "/example/", "/examples/", "/sample/", "/vendor/", "/third_party/")
     )
 
@@ -473,10 +474,10 @@ def _rank_slice_targets(slice_targets: list[str], keywords: tuple[str, ...]) -> 
     if not keywords:
         return slice_targets[:12]
     scored = sorted(
-        slice_targets,
-        key=lambda p: (-sum(1 for kw in keywords if _kw_matches_path(kw, p.lower())), p),
+        enumerate(slice_targets),
+        key=lambda iv: (-sum(1 for kw in keywords if _kw_matches_path(kw, iv[1].lower())), iv[0]),
     )
-    return scored[:12]
+    return [p for _, p in scored[:12]]
 
 
 def _collect_metrics(store: GraphStore, signals: PromptSignals) -> StructuralMetrics:
