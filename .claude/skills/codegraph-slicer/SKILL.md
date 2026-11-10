@@ -10,8 +10,24 @@ description: >-
 # codegraph-slicer
 
 Requires `codegraph-slicer` on `PATH` and Python 3.12+. Do not run `pip install` to reinstall `codegraph-slicer`.
-Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, .`jsx`, `.mjs`, `.cjs`) source trees.
+Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees.
 Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`.
+
+## Quick Start
+
+```bash
+# 1. Index the workspace (or reuse existing .codegraph/graph.sqlite)
+GRAPH="${CODEGRAPH_DB:-.codegraph/graph.sqlite}"
+codegraph-slicer sync . --db "$GRAPH"
+
+# 2. Orient & check scale/monolith routing before reading source files
+codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
+
+# 3. When bypass_slicer is false, front-load one batched XML slice for 3–8 target anchors
+codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml \
+  path/to/FileA.ext:ClassA.methodA \
+  path/to/FileB.ext:ClassB
+```
 
 ## Routing Precedence (When to Slice vs. Read Directly)
 

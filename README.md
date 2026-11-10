@@ -12,22 +12,13 @@ Install the CLI and bundled skill, and your agent automatically checks repositor
 
 ---
 
-## How It Works
-
-From the moment you install the CLI and skill, your agent has a structural workflow before reading large source files:
-
-1. **Index (`sync`)**: Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees into a local SQLite graph (`~1s` on ~300-file repositories).
-2. **Orient & Route (`map --recommend-workflow` or `route`)**: Evaluates repository scale, coupling, and monoliths (`>= 300` lines, `>= 15` definitions, or `CC >= 25`). Compact scopes automatically bypass slicing (`map_then_read`); monolithic or coupled scopes surface exact `slice_targets`.
-3. **Front-Load Bounded Context (`slice --format xml`)**: Extracts 3–8 target symbols in a single deduplicated, token-budgeted XML envelope (`<types_and_schemas>`, `<upstream_callers>`, `<downstream_dependencies>`, `<target_implementations>`).
-4. **Read Only What Remains**: Uses line-bounded reads only where condensed blocks or signature stubs need inspection, avoiding the double-context tax of loading both full files and slices.
-5. **Verify Impact & Boundaries (`impact`, `flow`, `delta`)**: Traces caller blast radius, intraprocedural Python control/data flow, and base-vs-head import or cycle regressions alongside your test suite.
-
----
-
 ## Table of Contents
 
-- [Installation](#installation)
-- [The Basic Workflow](#the-basic-workflow)
+- [60-Second Quick Start](#60-second-quick-start)
+- [How It Works](#how-it-works)
+- [Installation & Agent Skill Setup](#installation--agent-skill-setup)
+- [How Your Agent Uses the Skill](#how-your-agent-uses-the-skill)
+- [The Basic CLI Workflow](#the-basic-cli-workflow)
 - [Benchmark Results (`v0.3.8`)](#benchmark-results-v038)
 - [When Something Goes Wrong](#when-something-goes-wrong)
 - [What's Inside](#whats-inside)
@@ -36,7 +27,68 @@ From the moment you install the CLI and skill, your agent has a structural workf
 
 ---
 
-## Installation
+## 60-Second Quick Start
+
+### Step 1: Install the CLI (Python 3.12+)
+
+```sh
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.8"
+```
+
+### Step 2: Install the Agent Skill (Pick Your Harness)
+
+```sh
+# Claude Code:
+mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
+
+# Cursor (Global):
+mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
+
+# Codex (User):
+mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
+```
+
+*(See [Installation & Agent Skill Setup](#installation--agent-skill-setup) below for Gemini CLI, Antigravity, OpenCode, and repo-scoped paths.)*
+
+### Step 3: Index a Repo & Slice Your First Target
+
+```sh
+cd /path/to/your/repo
+
+# 1. Index the workspace into a local SQLite graph (~1s for ~300 files)
+codegraph-slicer sync . --db .codegraph/graph.sqlite
+
+# 2. Check repo map + scale recommendation (tells you whether to slice or read directly)
+codegraph-slicer map --db .codegraph/graph.sqlite --recommend-workflow --format markdown
+
+# 3. Route a task prompt to exact symbols and monolith slice targets
+codegraph-slicer route --db .codegraph/graph.sqlite \
+  --prompt "Fix validation in CheckoutHandler and update callers" --format json
+```
+
+Once the skill is installed, **you don't need to run these commands manually**—just prompt your coding agent as usual, and it will automatically sync, route, and slice when working in multi-package or monolithic repositories.
+
+---
+
+## How It Works
+
+From the moment you install the CLI and skill, your agent has a structural workflow before reading large source files:
+
+1. **Index (`sync`)**: Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees into a local SQLite graph (`~1s` on ~300-file repositories).
+2. **Orient & Route (`map --recommend-workflow` or `route`)**: Evaluates repository scale, coupling, and monoliths (`>= 300` lines, `>= 15` definitions, or `CC >= 25`). Compact scopes automatically bypass slicing (`map_then_read`); monolithic or coupled scopes surface exact `slice_targets`.
+3. **Front-Load Bounded Context (`slice --format xml`)**: Extracts 3–8 target symbols in a single deduplicated, token-budgeted XML envelope (`<types_and_schemas>`, `<upstream_callers>`, `<downstream_dependencies>`, `<target_implementations>`), including class/method Javadoc/JSDoc preambles and field declarations.
+4. **Read Only What Remains**: Uses line-bounded reads only where condensed blocks or signature stubs need inspection, avoiding the double-context tax of loading both full files and slices.
+5. **Verify Impact & Boundaries (`impact`, `flow`, `delta`)**: Traces caller blast radius, intraprocedural Python control/data flow, and base-vs-head import or cycle regressions alongside your test suite.
+
+---
+
+## Installation & Agent Skill Setup
 
 ### 1. Install the CLI
 
@@ -59,67 +111,89 @@ codegraph-slicer --help
 
 ### 2. Add the Skill to Your Coding Harness
 
-The bundled [`SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md) works across major agent harnesses. Set the skill URL once, then run the block for your harness:
-
-```sh
-SKILL_URL="https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md"
-```
+The bundled [`SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md) teaches your coding agent **when to slice** (multi-package repos and `>= 300`-line monoliths) and **when to bypass slicing** (compact repos where direct file reads are faster). Each snippet below is self-contained:
 
 #### Claude Code
 
 ```sh
-mkdir -p "$HOME/.claude/skills/codegraph-slicer"
-curl -fsSL "$SKILL_URL" -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
+mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 ```
 
 #### Cursor
 
 ```sh
 # Global user skill:
-mkdir -p "$HOME/.cursor/skills/codegraph-slicer"
-curl -fsSL "$SKILL_URL" -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
+mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
-mkdir -p .cursor/skills/codegraph-slicer
-curl -fsSL "$SKILL_URL" -o .cursor/skills/codegraph-slicer/SKILL.md
+mkdir -p .cursor/skills/codegraph-slicer && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o .cursor/skills/codegraph-slicer/SKILL.md
 ```
 
 #### Codex
 
 ```sh
-# Repository-scoped skill:
-mkdir -p .agents/skills/codegraph-slicer
-curl -fsSL "$SKILL_URL" -o .agents/skills/codegraph-slicer/SKILL.md
+# User-scoped skill:
+mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 
-# Or user-scoped skill:
-mkdir -p "$HOME/.codex/skills/codegraph-slicer"
-curl -fsSL "$SKILL_URL" -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
+# Or repository-scoped skill:
+mkdir -p .agents/skills/codegraph-slicer && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o .agents/skills/codegraph-slicer/SKILL.md
 ```
 
 #### Gemini CLI
 
 ```sh
-mkdir -p "$HOME/.gemini/skills/codegraph-slicer"
-curl -fsSL "$SKILL_URL" -o "$HOME/.gemini/skills/codegraph-slicer/SKILL.md"
+mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.gemini/skills/codegraph-slicer/SKILL.md"
 ```
 
 #### Antigravity
 
 ```sh
-mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer"
-curl -fsSL "$SKILL_URL" -o "$HOME/.gemini/config/skills/codegraph-slicer/SKILL.md"
+mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.gemini/config/skills/codegraph-slicer/SKILL.md"
 ```
 
 #### OpenCode
 
 ```sh
-mkdir -p "$HOME/.config/opencode/skills/codegraph-slicer"
-curl -fsSL "$SKILL_URL" -o "$HOME/.config/opencode/skills/codegraph-slicer/SKILL.md"
+mkdir -p "$HOME/.config/opencode/skills/codegraph-slicer" && \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  -o "$HOME/.config/opencode/skills/codegraph-slicer/SKILL.md"
 ```
 
 ---
 
-## The Basic Workflow
+## How Your Agent Uses the Skill
+
+Once `codegraph-slicer` is on your `PATH` and `SKILL.md` is placed in your harness's skill directory:
+
+1. **Zero-Config Automatic Triggering**:
+   - Your agent reads the `SKILL.md` description at session start and automatically invokes `codegraph-slicer` when you ask structural questions (*"who calls X"*, *"what breaks if I change Y"*) or assign multi-file engineering tasks in Python, Java, TypeScript, or JavaScript repositories.
+2. **Explicit Invocation (Optional)**:
+   - In **Claude Code / Cursor / Antigravity / Gemini CLI**, you can also invoke the skill explicitly via `/codegraph-slicer` or mention it in your prompt (e.g., *"Use codegraph-slicer to slice the checkout handlers before editing"*).
+3. **Optional Team Repo Rule (`AGENTS.md` or `CLAUDE.md`)**:
+   - If you want every agent session in a repository to maintain a persistent index in `.codegraph/graph.sqlite` (git-ignored), add these 3 lines to your project's `AGENTS.md` or `CLAUDE.md`:
+     ```markdown
+     ## Code Graph Indexing (`codegraph-slicer`)
+     - Before reading large source files (`>= 300` lines) or grepping across packages, run `codegraph-slicer sync . --db .codegraph/graph.sqlite` and `codegraph-slicer map --db .codegraph/graph.sqlite --recommend-workflow --format markdown`.
+     - When `bypass_slicer: false`, front-load one batched `codegraph-slicer slice --snapshot --db .codegraph/graph.sqlite --max-tokens 8000 --format xml <anchors...>` call for your target symbols before editing.
+     ```
+
+---
+
+## The Basic CLI Workflow
 
 ### 1. Sync the Repository (`sync`)
 
