@@ -610,3 +610,21 @@ def test_multi_anchor_pass2_preserves_56_line_method_and_formatter_signatures(tm
         assert "formatEvent13(" in fmt_text
 
 
+def test_generic_empty_initializer_and_connected_method_filtering(tmp_path):
+    from codegraph_slicer.slicer import (
+        _is_non_boilerplate_public_method,
+        _should_expand_caller_hop,
+    )
+
+    assert _should_expand_caller_hop(True, 0, "List<String> x = new ArrayList<>();") is False
+    assert _should_expand_caller_hop(True, 0, "Map<String, Object> m = new HashMap<>();") is False
+    assert _should_expand_caller_hop(True, 0, "const s = new Set()") is False
+    assert _should_expand_caller_hop(True, 0, "items = []") is False
+    assert _should_expand_caller_hop(True, 0, "List<String> x = computeItems(input);") is True
+
+    m_pad = {"qualname": "Svc.runStep01", "signature": "public void runStep01()"}
+    assert _is_non_boilerplate_public_method(m_pad, {"Svc"}, has_edges=False) is False
+    assert _is_non_boilerplate_public_method(m_pad, {"Svc"}, has_edges=True) is True
+
+
+

@@ -987,10 +987,15 @@ def _is_skippable_caller_line(s: str) -> bool:
     return not s or s == "}" or s.startswith(("#", '"""', "'''", "//", "/*", "*", "*/"))
 
 
+_EMPTY_COLLECTION_INIT_RE = re.compile(
+    r"=\s*(?:new\s+[A-Za-z_]\w*(?:<[^>]*>)?\s*\(\s*\)|\[\s*\]|\{\s*\})\s*;?$"
+)
+
+
 def _should_expand_caller_hop(is_def: bool, hops: int, s: str) -> bool:
     if not is_def or hops >= 2:
         return False
-    return "new ArrayList" not in s and not s.endswith(("= []", "= {}"))
+    return not bool(_EMPTY_COLLECTION_INIT_RE.search(s))
 
 
 def _is_enclosing_ctrl_line(min_indent: int | None, indent: int, s: str) -> bool:
@@ -1446,14 +1451,6 @@ def _extract_mid_spine_lines(mid_lines: list[str], comment_pfx: str) -> list[str
     ][:6]
 
 
-def _condense_bounds(max_method_lines: int) -> tuple[int, int]:
-    if max_method_lines <= 4:
-        return 2, 1
-    if max_method_lines < 28:
-        return 6, 3
-    return 20, 8
-
-
 def _format_condensed_method_body(
     body: str, comment_pfx: str, max_method_lines: int = 45, signature: str = ""
 ) -> str:
@@ -1462,7 +1459,7 @@ def _format_condensed_method_body(
         return body
     if max_method_lines <= 0 and signature:
         return f"    {signature}"
-    head_n, tail_n = _condense_bounds(max_method_lines)
+    head_n, tail_n = 20, 8
     mid_lines = m_lines[head_n:-tail_n]
     spine = _extract_mid_spine_lines(mid_lines, comment_pfx)
     spine_block = ("\n" + "\n".join(spine)) if spine else ""
@@ -1474,11 +1471,12 @@ def _format_condensed_method_body(
 
 
 def _select_public_method_line_cap(
-    max_tokens: int, max_method_lines: int | None
+    max_tokens: int, pub_count: int, max_method_lines: int | None
 ) -> int:
     if max_method_lines is not None:
         return max_method_lines
-    return 65 if max_tokens >= 2200 else 45
+    budget_per_method = (max_tokens * 2) // max(60, pub_count * 15)
+    return min(65, max(45, budget_per_method))
 
 
 def _can_condense_class_methods(
@@ -1528,7 +1526,9 @@ def _condense_class_public_methods(
         f"{sym.file_path}:{sym.start_line}-{sym.end_line}; "
         f"use Read offset={sym.start_line} limit={span_len} or --max-tokens {expand_budget})"
     )
-    max_m_lines = _select_public_method_line_cap(max_tokens, max_method_lines)
+    max_m_lines = _select_public_method_line_cap(
+        max_tokens, len(pub_methods), max_method_lines
+    )
     for m in pub_methods:
         kept_parts.append(
             _format_condensed_method_body(
@@ -1738,13 +1738,27 @@ def _condense_multi_anchor_targets(
 _BOILERPLATE_METHOD_RE = re.compile(r"(?:_[0-9]{2}$|Step[0-9]{2}$|^_helper[0-9]+$)")
 
 
-def _is_non_boilerplate_public_method(m: dict, ctor_names: set[str]) -> bool:
+def _is_non_boilerplate_public_method(
+    m: dict, ctor_names: set[str], has_edges: bool = False
+) -> bool:
     if _is_internal_method(m, ctor_names):
         return False
     m_short = m["qualname"].rpartition(".")[2]
     if m_short in ctor_names or m_short in ("__enter__", "__exit__"):
         return False
-    return not bool(_BOILERPLATE_METHOD_RE.search(m_short))
+    return has_edges or not bool(_BOILERPLATE_METHOD_RE.search(m_short))
+
+
+def _connected_method_sids(store, file_path: str, cls_prefix: str) -> set[str]:
+    rows = store.rows(
+        """SELECT DISTINCT source_id AS sid FROM edges
+           WHERE source_file=? AND kind IN ('CALLS', 'USES_TYPE')
+           UNION
+           SELECT DISTINCT target_id AS sid FROM edges
+           WHERE target_id GLOB ? AND kind='CALLS'""",
+        (file_path, f"{cls_prefix}.*"),
+    )
+    return {r["sid"] for r in rows}
 
 
 def _find_class_for_fallback(store, mod_part: str, cls_part: str) -> dict | None:
@@ -1767,13 +1781,19 @@ def _find_class_for_fallback(store, mod_part: str, cls_part: str) -> dict | None
 
 
 def _non_boilerplate_class_methods(store, cls_row: dict, cls_part: str) -> list[dict]:
+    sym = IndexedSymbol.from_row(cls_row)
     all_methods = store.rows(
         """SELECT * FROM symbols WHERE file_path=? AND kind='method'
            AND start_line>=? AND end_line<=? ORDER BY start_line, symbol_id""",
-        (cls_row["file_path"], cls_row["start_line"], cls_row["end_line"]),
+        (sym.file_path, sym.start_line, sym.end_line),
     )
+    connected = _connected_method_sids(store, sym.file_path, sym.symbol_id)
     ctor_names = {"__init__", "__new__", "constructor", cls_part.rsplit(".", 1)[-1]}
-    return [m for m in all_methods if _is_non_boilerplate_public_method(m, ctor_names)]
+    return [
+        m
+        for m in all_methods
+        if _is_non_boilerplate_public_method(m, ctor_names, m["symbol_id"] in connected)
+    ]
 
 
 def _collect_interface_method_seeds(store, sid: str, pub_short_names: set[str]) -> list[str]:
@@ -2304,14 +2324,9 @@ def _slice_context_in_snapshot(
         sections["target_implementations"] = [
             item(row, True) for _, row in sorted(chosen.items())
         ]
-        soft_cap = (
-        int(max_tokens * 0.72)
-        if len(chosen) > 1 and (callers or callees) and max_tokens >= 2000
-        else max_tokens
-    )
-    required = _condense_multi_anchor_targets(
-        store, chosen, sections, result, database, max_tokens, soft_target_cap=soft_cap
-    )
+        required = _condense_multi_anchor_targets(
+            store, chosen, sections, result, database, max_tokens, soft_target_cap=soft_cap
+        )
     if required["tokens"] > max_tokens and any(
         totals[name] > len(sections[name])
         for name in ("upstream_callers", "downstream_dependencies")
