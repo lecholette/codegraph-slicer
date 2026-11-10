@@ -230,7 +230,7 @@ Evaluated across the same five coding models on a 12-package enterprise Java rep
   - **`deepseek-v4.1-flash-1017`:** **`84/89 (94.4%) -> 86/89 (96.6%, +2.2%)`**, **`5/6 -> 6/6` contracts (`100%`)**, **`-20.2%` turns** (`84 -> 67`).
   - **`gpt-6.1-terra`:** **`70/89 (78.7%) -> 85/89 (95.5%, +16.8%)`**, **`-25.0%` exec calls** (`20 -> 15`).
   - **`claude-sonnet-5-5`:** `84/89 (94.4%)`, **`6/6` contracts (`100%`)**, **`-21.4%` turns** (`14 -> 11`), **`-44.3%` cache read tokens** (`1.05M -> 582k`), **`-40.9%` cost** (`$0.68 -> $0.40`).
-  - **`gpt-6-luna`:** **`60/89 (67.4%) -> 68/89 (76.4%, +9.0%)`**, **`5/6 -> 6/6` contracts (`100%`)**, **`-17.4%` exec calls** (`23 -> 19`), **`-21.7%` tokens** (`116.3k -> 91.1k`).
+  - **`gpt-6-luna`:** **`69/89 (77.5%) -> 85/89 (95.5%, +18.0%)`**, **`6/6` contracts (`100%`)**, **`-23.7%` exec calls** (`38 -> 29`), **`-13.8%` tokens** (`123.7k -> 106.7k`).
 - **Python Multi-File Services & Libraries:**
   - **`claude-sonnet-5-5` (`dynamic_config_service_api`, `76` tests / `26` CP3 tests):** **`72/76 (94.7%)`** overall (**`13/26 -> 24/26 (+42.3%)`** on CP3 subset), **`-47.8%` turns** (`23 -> 12`), **`-48.7%` cache read tokens** (`972k -> 499k`).
   - **`gpt-6.1-terra` (`dynamic_config_service_api`, `76` tests / `26` CP3 tests):** **`24/26 -> 26/26 (100.0%)`** on CP3 subset, **`-27.8%` exec calls** (`18 -> 13`), **`-19.2%` tokens** (`91.6k -> 74.1k`).
