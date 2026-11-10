@@ -56,19 +56,20 @@ mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
 
 *(See [Installation & Agent Skill Setup](#installation--agent-skill-setup) below for Gemini CLI, Antigravity, OpenCode, and repo-scoped paths.)*
 
-### Step 3: Index a Repo & Slice Your First Target
+### Step 3: Index a Local Repo & Slice Your First Target
 
 ```sh
 cd /path/to/your/repo
 
-# 1. Index the workspace into a local SQLite graph (~1s for ~300 files)
-codegraph-slicer sync . --db .codegraph/graph.sqlite
+# 1. Index the local workspace into a temporary SQLite graph (~1s for ~300 files; keeps git status clean)
+GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
+codegraph-slicer sync . --db "$GRAPH"
 
 # 2. Check repo map + scale recommendation (tells you whether to slice or read directly)
-codegraph-slicer map --db .codegraph/graph.sqlite --recommend-workflow --format markdown
+codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
 
 # 3. Route a task prompt to exact symbols and monolith slice targets
-codegraph-slicer route --db .codegraph/graph.sqlite \
+codegraph-slicer route --db "$GRAPH" \
   --prompt "Fix validation in CheckoutHandler and update callers" --format json
 ```
 
@@ -92,7 +93,7 @@ From the moment you install the CLI and skill, your agent has a structural workf
 
 ### 1. Install the CLI
 
-Requires **Python 3.12+** and Git.
+Requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and **Git** (to install from GitHub). Only two Python packages are installed alongside standard library modules (`sqlite3`, `ast`): `tree-sitter>=0.24` and `tree-sitter-language-pack>=0.7`.
 
 ```sh
 # With uv (recommended):
@@ -108,6 +109,11 @@ Verify installation:
 codegraph-slicer --version
 codegraph-slicer --help
 ```
+
+#### Local Code & Git Behavior
+- **Operates on local source trees (`sync .`)**: `codegraph-slicer` indexes local files on disk (`Python`, `Java`, `TypeScript`, `JavaScript`). No code ever leaves your machine, and the target directory **does not even need to be a Git repository** for normal workspace indexing (`sync`), `map`, `route`, `slice`, `impact`, or `flow`.
+- **When Git is used at runtime**: `git` is only invoked when you explicitly pass `--revision <git-ref>` (for example, `codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite` before running `delta`). In `--revision` mode, blobs are read directly from local `.git` objects (`git ls-tree` / `git cat-file`) without modifying or checking out your working tree.
+- **Keeping `git status` clean**: Writing `--db` to a temp path (`$(mktemp -d)/graph.sqlite` or `/tmp/graph.sqlite`) keeps your repository working tree 100% clean without needing `.gitignore` changes. If you prefer a repo-local database (such as `.codegraph/graph.sqlite`), run `mkdir -p .codegraph` first and add `.codegraph/` to `.gitignore` (hidden dot-directories are automatically skipped during indexing).
 
 ### 2. Add the Skill to Your Coding Harness
 
@@ -187,7 +193,7 @@ Once `codegraph-slicer` is on your `PATH` and `SKILL.md` is placed in your harne
    - If you want every agent session in a repository to maintain a persistent index in `.codegraph/graph.sqlite` (git-ignored), add these 3 lines to your project's `AGENTS.md` or `CLAUDE.md`:
      ```markdown
      ## Code Graph Indexing (`codegraph-slicer`)
-     - Before reading large source files (`>= 300` lines) or grepping across packages, run `codegraph-slicer sync . --db .codegraph/graph.sqlite` and `codegraph-slicer map --db .codegraph/graph.sqlite --recommend-workflow --format markdown`.
+     - Before reading large source files (`>= 300` lines) or grepping across packages, run `mkdir -p .codegraph && codegraph-slicer sync . --db .codegraph/graph.sqlite` and `codegraph-slicer map --db .codegraph/graph.sqlite --recommend-workflow --format markdown`.
      - When `bypass_slicer: false`, front-load one batched `codegraph-slicer slice --snapshot --db .codegraph/graph.sqlite --max-tokens 8000 --format xml <anchors...>` call for your target symbols before editing.
      ```
 

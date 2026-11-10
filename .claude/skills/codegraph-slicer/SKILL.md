@@ -16,8 +16,8 @@ Full cookbook: `codegraph-slicer --help` and `codegraph-slicer <command> --help`
 ## Quick Start
 
 ```bash
-# 1. Index the workspace (or reuse existing .codegraph/graph.sqlite)
-GRAPH="${CODEGRAPH_DB:-.codegraph/graph.sqlite}"
+# 1. Index the local workspace into a temp SQLite DB (or existing .codegraph/graph.sqlite)
+GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
 codegraph-slicer sync . --db "$GRAPH"
 
 # 2. Orient & check scale/monolith routing before reading source files
