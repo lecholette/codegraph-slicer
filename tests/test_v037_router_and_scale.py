@@ -629,7 +629,11 @@ def test_generic_empty_initializer_and_connected_method_filtering(tmp_path):
 
 def test_compact_method_condensation_and_ts_cache_fallback():
     from codegraph_slicer.slicer import _format_condensed_method_body
-    from codegraph_slicer.treesitter_support import _fallback_ts_cache_parent, parser_for
+    from codegraph_slicer.treesitter_support import (
+        _bundled_wheel_parser,
+        _fallback_ts_cache_parent,
+        parser_for,
+    )
 
     body = "\n".join(f"    line_{i} = {i};" for i in range(40))
     condensed = _format_condensed_method_body(body, "//", max_method_lines=22, signature="void f()")
@@ -637,7 +641,10 @@ def test_compact_method_condensation_and_ts_cache_fallback():
     assert "line_12 = 12;" not in condensed
     assert "line_35 = 35;" in condensed
     assert _fallback_ts_cache_parent() is None or isinstance(_fallback_ts_cache_parent(), str)
-    assert parser_for("java") is not None
+    for g in ("java", "typescript", "tsx", "javascript"):
+        assert _bundled_wheel_parser(g) is not None
+        assert parser_for(g) is not None
+    assert _bundled_wheel_parser("unknown") is None
 
 
 

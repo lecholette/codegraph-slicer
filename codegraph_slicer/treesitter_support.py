@@ -18,8 +18,36 @@ def _fallback_ts_cache_parent() -> str | None:
     return None
 
 
+def _bundled_wheel_parser(grammar: str):
+    try:
+        from tree_sitter import Language, Parser
+
+        if grammar == "java":
+            import tree_sitter_java
+
+            return Parser(Language(tree_sitter_java.language()))
+        if grammar == "typescript":
+            import tree_sitter_typescript
+
+            return Parser(Language(tree_sitter_typescript.language_typescript()))
+        if grammar == "tsx":
+            import tree_sitter_typescript
+
+            return Parser(Language(tree_sitter_typescript.language_tsx()))
+        if grammar == "javascript":
+            import tree_sitter_javascript
+
+            return Parser(Language(tree_sitter_javascript.language()))
+    except Exception:
+        return None
+    return None
+
+
 @lru_cache(maxsize=None)
 def parser_for(grammar: str):
+    bundled = _bundled_wheel_parser(grammar)
+    if bundled is not None:
+        return bundled
     try:
         from tree_sitter_language_pack import PackConfig, configure, get_parser
     except ImportError as exc:

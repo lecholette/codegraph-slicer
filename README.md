@@ -93,7 +93,7 @@ From the moment you install the CLI and skill, your agent has a structural workf
 
 ### 1. Install the CLI
 
-Requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and **Git** (to install from GitHub). Only two Python packages are installed alongside standard library modules (`sqlite3`, `ast`): `tree-sitter>=0.24` and `tree-sitter-language-pack>=0.7`.
+Requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and **Git** (to install from GitHub). Prebuilt grammar wheels for Java, TypeScript/TSX, and JavaScript (`tree-sitter`, `tree-sitter-java`, `tree-sitter-typescript`, `tree-sitter-javascript`) are installed automatically alongside standard library modules (`sqlite3`, `ast`), so parsing works 100% offline with zero runtime downloads or cache writes.
 
 ```sh
 # With uv (recommended):
