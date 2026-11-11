@@ -402,7 +402,13 @@ class GraphStore:
                 base_digest.update(source_path.read_bytes())
                 base_digest.update(b"\0")
         base_digest.update(f"{sys.version_info.major}.{sys.version_info.minor}".encode())
-        for pkg_name in ("tree-sitter", "tree-sitter-language-pack"):
+        for pkg_name in (
+            "tree-sitter",
+            "tree-sitter-java",
+            "tree-sitter-typescript",
+            "tree-sitter-javascript",
+            "tree-sitter-language-pack",
+        ):
             try:
                 ver = importlib.metadata.version(pkg_name)
             except importlib.metadata.PackageNotFoundError:

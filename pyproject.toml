@@ -14,7 +14,6 @@ dependencies = [
     "tree-sitter-java>=0.23",
     "tree-sitter-typescript>=0.23",
     "tree-sitter-javascript>=0.23",
-    "tree-sitter-language-pack>=0.7",
 ]
 authors = [{name = "Chris Cholette"}]
 license-files = ["LICENSE", "NOTICE"]
