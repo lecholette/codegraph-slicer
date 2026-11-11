@@ -62,8 +62,14 @@ The parser cache is keyed by the actual `ast_extractor.py` and `store.py` bytes
 plus the Python major/minor version. Missing or stale identity triggers a full
 parse even if source blobs are unchanged; another sync with the same identity
 and unchanged source takes the normal cache path. Sync takes an immediate
-SQLite transaction before reading old hashes, parsing, and writing. A competing
-writer can receive `database is locked` and exit 2 rather than mix snapshots.
+SQLite transaction on a temporary copy of the database beside it, and replaces
+`DATABASE` atomically only when the sync succeeds, holding the old database's write lock for the swap (a writer mid-transaction makes the sync exit 2 with `database is locked`, old database intact). A query that runs during a
+sync sees the previous complete database, or a "no completed sync exists yet"
+error if there is none. A failed sync leaves the previous database untouched.
+Concurrent syncs into one database each build their own copy; the last to
+finish wins.
+Sync is the only supported writer: a foreign connection that stays open across
+a sync keeps writing to the replaced file, and those writes are not kept.
 
 Map, slice, and flow check the recorded source root before ordinary queries.
 They refuse when Python source has changed, the Git HEAD moved, metadata is

@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import re
+import shlex
+import sys
 import sqlite3
 import stat
 from collections import Counter
@@ -18,6 +20,7 @@ from .flow_query import query_flow
 from .pagerank import build_repo_map, build_repo_outline
 from .slicer import (
     AnchorNotFoundError,
+    RequiredAnchorOverflow,
     build_slice_outline,
     query_call_impact,
     rendered_tokens,
@@ -25,7 +28,7 @@ from .slicer import (
     slice_context,
     tokens_for_length,
 )
-from .store import GraphStore, StaleSnapshotError
+from .store import GraphStore, StaleSnapshotError, sync_atomically
 
 _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
@@ -677,7 +680,7 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.8")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.9")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",
@@ -866,16 +869,16 @@ def main(argv=None):
                     )
             else:
                 opening_db_path = str(Path(args.db).resolve())
-                store = stack.enter_context(GraphStore(args.db, readonly=args.cmd != "sync"))
-                opening_db = False
                 if args.cmd != "sync":
+                    store = stack.enter_context(GraphStore(args.db, readonly=True))
                     stack.enter_context(store.read_snapshot())
+                opening_db = False
                 if args.cmd == "sync":
-                    result = (
+                    result = sync_atomically(args.db, lambda store: (
                         store.sync_git_tree(args.root, args.revision, skip_unparseable=args.skip_unparseable)
                         if args.revision is not None
                         else store.sync_workspace(args.root, skip_unparseable=args.skip_unparseable)
-                    )
+                    ))
                 elif args.cmd == "map":
                     if not args.snapshot:
                         store.assert_fresh()
@@ -1002,6 +1005,18 @@ def main(argv=None):
                     hints.append(
                         f"hint: a symbol added on a branch is absent from a base-commit DB (recorded commit: {revision}); query a snapshot containing that symbol"
                     )
+        elif isinstance(exc, RequiredAnchorOverflow) and (
+                needed := re.search(r"needs? (\d+) tokens", str(exc))):
+            rerun = []
+            skip = False
+            for token in sys.argv[1:] if argv is None else argv:
+                if skip:
+                    skip = False
+                elif token == "--max-tokens":
+                    skip = True
+                elif not token.startswith("--max-tokens="):
+                    rerun.append(token)
+            hints.append("rerun: " + shlex.join(["codegraph-slicer", *rerun, "--max-tokens", needed[1]]))
         elif isinstance(exc, FlowQueryError) and getattr(exc, "observed_lines", []):
             hints.append("hint: observed def/use lines for this variable in the selected function: " + ", ".join(map(str, exc.observed_lines)))
         elif isinstance(exc, UnsupportedFlowError) and args.cmd == "flow":

@@ -1,6 +1,5 @@
 import pytest
 
-from codegraph_slicer import GraphStore
 from codegraph_slicer.cli import main
 
 
@@ -15,5 +14,4 @@ def test_empty_git_revision_is_rejected_without_indexing_workspace(tmp_path, cap
 
     assert error.value.code == 2
     assert "invalid revision" in capsys.readouterr().err
-    with GraphStore(db, readonly=True) as store:
-        assert store.rows("SELECT path FROM files") == []
+    assert not db.exists()

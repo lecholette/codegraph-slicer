@@ -41,7 +41,7 @@ class _NoDBStore:
 
 
 def test_version_and_scale_guard_helpers() -> None:
-    assert __version__ == "0.3.8"
+    assert __version__ == "0.3.9"
     assert parse_tsconfig_paths(b"not-json") == {}
     assert parse_tsconfig_paths(b"[]") == {}
     assert parse_tsconfig_paths(b'{"compilerOptions": {"baseUrl": "src", "paths": {"@/*": ["app/*"]}}}') == {"@/*": "src/app/*"}

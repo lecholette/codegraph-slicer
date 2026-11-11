@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import contextlib
+import glob
 from dataclasses import dataclass
 import hashlib
 import importlib.metadata
@@ -10,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePosixPath
 from time import monotonic
 from urllib.parse import quote
@@ -216,9 +218,72 @@ def _satisfies_protocol(
     )
 
 
+def _sync_running(db_path: Path) -> bool:
+    """True if a live process is building a temp DB for db_path (see sync_atomically)."""
+    for tmp in glob.glob(glob.escape(str(db_path)) + ".sync-*.tmp"):
+        try:
+            os.kill(int(Path(tmp).name.rsplit(".sync-", 1)[1].split("-", 1)[0]), 0)
+        except ValueError:
+            continue
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass
+        return True
+    return False
+
+
+_REPLACE_LOCK_TIMEOUT = 5.0
+
+
+def sync_atomically(path, run):
+    """Run run(store) on a temp copy of the DB, then os.replace it over path.
+
+    Queries see the previous complete DB, or no file at all, never a partial one.
+    Concurrent syncs each build their own temp file; the last to finish wins.
+    """
+    final = Path(path).resolve()
+    fd, tmp_name = tempfile.mkstemp(
+        dir=final.parent, prefix=f"{final.name}.sync-{os.getpid()}-", suffix=".tmp"
+    )
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        if final.exists():
+            src = sqlite3.connect("file:" + quote(str(final), safe="/") + "?mode=rw", uri=True)
+            dst = sqlite3.connect(tmp)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+                src.close()
+        with GraphStore(tmp) as store:
+            result = run(store)
+        # Hold the old DB's write lock across the swap: a writer mid-transaction makes this sync
+        # fail with "database is locked" (old DB intact) instead of committing into the orphaned inode.
+        guard = sqlite3.connect(final, timeout=_REPLACE_LOCK_TIMEOUT) if final.exists() else None
+        try:
+            if guard:
+                guard.execute("BEGIN EXCLUSIVE")
+            os.replace(tmp, final)
+            for suffix in ("-wal", "-shm", "-journal"):
+                Path(str(final) + suffix).unlink(missing_ok=True)
+        finally:
+            if guard:
+                guard.close()
+    finally:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            Path(str(tmp) + suffix).unlink(missing_ok=True)
+    return result
+
+
 class GraphStore:
     def __init__(self, path, *, readonly=False):
         if readonly:
+            if not Path(path).exists() and _sync_running(Path(path).resolve()):
+                raise CodeGraphError(
+                    f"no completed sync exists yet for {path}; wait for the running sync to finish, then retry"
+                )
             uri = "file:" + quote(str(Path(path).resolve()), safe="/") + "?mode=ro"
             self.db = sqlite3.connect(uri, uri=True)
         else:

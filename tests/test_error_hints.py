@@ -198,8 +198,32 @@ def test_moved_git_head_stale_snapshot_has_no_additional_hint(tmp_path, capsys):
     assert hints == []
 
 
-def test_required_anchor_overflow_has_no_additional_hint(tmp_path, capsys):
+def test_required_anchor_overflow_prints_exact_rerun_replacing_max_tokens(tmp_path, capsys):
     _, db = _indexed(tmp_path, 'def calculate():\n    return "' + "x" * 100 + '"\n')
     hints = _error(capsys, ["slice", "--db", str(db), "sample:calculate", "--max-tokens", "2"],
                    "RequiredAnchorOverflow", "required definitions need 80 tokens including omission metadata, budget is 2")
-    assert hints == []
+    assert hints == [f"rerun: codegraph-slicer slice --db {db} sample:calculate --max-tokens 80"]
+
+
+def test_required_anchor_overflow_rerun_replaces_equals_form_and_quotes(tmp_path, capsys):
+    _, db = _indexed(tmp_path, 'def calculate():\n    return "' + "x" * 100 + '"\n')
+    hints = _error(capsys, ["slice", "--max-tokens=2", "--db", str(db), "sample:calculate"],
+                   "RequiredAnchorOverflow", "required definitions need 80 tokens including omission metadata, budget is 2")
+    assert hints == [f"rerun: codegraph-slicer slice --db {db} sample:calculate --max-tokens 80"]
+
+
+def test_required_anchor_overflow_rerun_adds_flag_when_absent(tmp_path, capsys):
+    _, db = _indexed(tmp_path, "def calculate():\n    return '" + "x" * 40000 + "'\n")
+    hints = _error(capsys, ["slice", "--db", str(db), "sample:calculate"],
+                   "RequiredAnchorOverflow", "required definitions need 10055 tokens including omission metadata, budget is 8000")
+    assert hints == [f"rerun: codegraph-slicer slice --db {db} sample:calculate --max-tokens 10055"]
+
+
+def test_required_anchor_overflow_rerun_for_slice_outline(tmp_path, capsys):
+    _, db = _indexed(tmp_path, 'def calculate():\n    return 1\n')
+    with pytest.raises(SystemExit):
+        main(["slice", "--outline", "--db", str(db), "sample:calculate", "--max-tokens", "1"])
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0].startswith("codegraph-slicer: RequiredAnchorOverflow: required slice outline needs ")
+    needed = lines[0].split(" needs ")[1].split(" tokens")[0]
+    assert lines[1:] == [f"rerun: codegraph-slicer slice --outline --db {db} sample:calculate --max-tokens {needed}"]
