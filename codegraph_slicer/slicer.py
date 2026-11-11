@@ -176,7 +176,15 @@ def _candidate_rows_for_nearest_anchors(store, path: str, target: str) -> list[d
                 (path, path),
             )
         )
-    tok = (target or path).rsplit(".", 1)[-1][:12]
+    leaf = (target or path).rsplit(".", 1)[-1]
+    if leaf and not leaf.isdigit():
+        scoped.extend(
+            store.rows(
+                "SELECT file_path,module,qualname FROM symbols WHERE qualname=? OR qualname GLOB ? LIMIT 100",
+                (leaf, f"*.{leaf}"),
+            )
+        )
+    tok = leaf[:12]
     if len(tok) >= 3:
         scoped.extend(
             store.rows(
@@ -276,8 +284,12 @@ def _anchor(store, anchor):
         if uniq_match is not None:
             return uniq_match
     error = AnchorNotFoundError(anchor)
+    dedup_rows = {
+        (row["file_path"], row["qualname"]): row
+        for row in _candidate_rows_for_nearest_anchors(store, path, target)
+    }
     rows = sorted(
-        _candidate_rows_for_nearest_anchors(store, path, target),
+        dedup_rows.values(),
         key=lambda row: (row["file_path"], row["qualname"]),
     )
     aliases = {}
@@ -286,7 +298,55 @@ def _anchor(store, anchor):
         aliases[copyable] = copyable
         aliases[f"{row['module']}:{row['qualname']}"] = copyable
     matches = difflib.get_close_matches(anchor, sorted(aliases), n=6, cutoff=0.25)
-    error.nearest_anchors = list(dict.fromkeys(aliases[item] for item in matches))[:3]
+    nearest = list(dict.fromkeys(aliases[item] for item in matches))[:3]
+
+    raw_leaf = target if separator else ("" if is_supported_source_path(anchor) else anchor)
+    leaf = raw_leaf.rsplit(".", 1)[-1] if raw_leaf and not raw_leaf.isdigit() else ""
+    exact_leaf_match = ""
+    missing_symbol_name = ""
+    if leaf:
+        exact_rows = [
+            row
+            for row in rows
+            if row["qualname"] == leaf or row["qualname"].endswith("." + leaf)
+        ]
+        if exact_rows:
+            norm_path = path.replace("\\", "/").lstrip("./") if path else ""
+            exact_rows.sort(
+                key=lambda row: (
+                    0
+                    if norm_path
+                    and (
+                        row["file_path"] == norm_path
+                        or row["module"] == path
+                        or row["file_path"].endswith("/" + norm_path)
+                    )
+                    else 1,
+                    1 if _is_test_symbol(row) else 0,
+                    len(row["qualname"]),
+                    row["file_path"],
+                    row["qualname"],
+                )
+            )
+            exact_copyables = [
+                f"{row['file_path']}:{row['qualname']}" for row in exact_rows
+            ]
+            exact_leaf_match = exact_copyables[0]
+            nearest = list(dict.fromkeys([*exact_copyables, *nearest]))[:3]
+        else:
+            candidate_leaves = sorted(
+                {
+                    row["qualname"].rsplit(".", 1)[-1]
+                    for row in rows
+                    if row["qualname"]
+                }
+            )
+            if not difflib.get_close_matches(leaf, candidate_leaves, n=1, cutoff=0.85):
+                missing_symbol_name = leaf
+
+    error.nearest_anchors = nearest
+    error.exact_leaf_match = exact_leaf_match
+    error.missing_symbol_name = missing_symbol_name
     revision = store.rows("SELECT value FROM metadata WHERE key='snapshot_revision'")
     error.snapshot_revision = revision[0]["value"] if revision else ""
     raise error

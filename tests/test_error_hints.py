@@ -75,6 +75,62 @@ def test_anchor_error_has_three_nearest_anchors_and_snapshot_guidance(
                      f"hint: a symbol added on a branch is absent from a base-commit DB (recorded commit: {revision}); query a snapshot containing that symbol"]
 
 
+def test_anchor_error_promotes_exact_leaf_match_and_drops_branch_hint(tmp_path, capsys):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "colab_controller.py").write_text(
+        "class ColabController:\n"
+        "    def execute(self):\n"
+        "        return _verify_receipt()\n\n"
+        "def _verify_receipt():\n"
+        "    return True\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "hints@example.invalid"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Hint Fixture"], cwd=root, check=True)
+    subprocess.run(["git", "add", "colab_controller.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_git_tree(root, "HEAD")
+
+    hints = _error(
+        capsys,
+        ["slice", "--db", str(db), "colab_controller.py:ColabController._verify_receipt"],
+        "AnchorNotFoundError",
+        "colab_controller.py:ColabController._verify_receipt",
+    )
+    assert hints[0] == "hint: did you mean: colab_controller.py:_verify_receipt"
+    assert not any("added on a branch" in line for line in hints)
+
+
+def test_anchor_error_reports_no_symbol_named_in_any_module_for_guessed_name(tmp_path, capsys):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "gpu_orchestration.py").write_text(
+        "def _file_sha256():\n    return 1\n"
+        "def _offer_sha256():\n    return 2\n"
+        "def _canonical_sha256():\n    return 3\n"
+    )
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "hints@example.invalid"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "Hint Fixture"], cwd=root, check=True)
+    subprocess.run(["git", "add", "gpu_orchestration.py"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_git_tree(root, "HEAD")
+
+    hints = _error(
+        capsys,
+        ["slice", "--db", str(db), "gpu_orchestration:_bundle_sha256"],
+        "AnchorNotFoundError",
+        "gpu_orchestration:_bundle_sha256",
+    )
+    assert "hint: no symbol named _bundle_sha256 in any module" in hints
+    assert not any("added on a branch" in line for line in hints)
+
+
 def test_flow_query_error_lists_observed_lines_for_variable(tmp_path, capsys):
     _, db = _indexed(tmp_path, "@decorate\ndef calculate(amount):\n    total = (\n        amount * 2\n    )\n    total = (\n        total + 1\n    )\n    total = (\n        total + 1\n    )\n    total = (\n        total + 1\n    )\n    total = (\n        total + 1\n    )\n    return total\n")
     hints = _error(capsys, ["flow", "sample:calculate", "--db", str(db),

@@ -93,5 +93,6 @@ Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`,
 - `flow` is function-local. Calls are opaque. Aliases and implicit exceptions are not modelled.
 - `flow` models `try`/`except`/`finally`, `with`, `async with` and comprehensions conservatively. It refuses `await`, `yield`, lambdas, nested definitions and imports with a source location. Use `slice` for those.
 - `delta` never runs tests. Run them separately.
-- Do not pick a budget below the default up front. If a command refuses for size, rerun once with `--max-tokens` at the N the error prints.
-- Errors print `hint:` lines (nearest anchors, snapshot commit). Use them before retrying.
+- Do not pick a budget below the default up front. If a command refuses for size (`RequiredAnchorOverflow`), rerun once with `--max-tokens` above the N the error prints; a multi-anchor `--outline` (3+ anchors) may need `--max-tokens 20000`.
+- Errors print `hint:` lines (`did you mean`, `nearest anchor`, `no symbol named ... in any module`, snapshot commit, DB path state). Use them before retrying: copy `hint: did you mean:` or the first matching `hint: nearest anchor:` verbatim; if `no symbol named ... in any module` appears, run `map --seed <module>` to list the module's real symbols rather than guessing names.
+- `sync` takes the repository root as a positional (`codegraph-slicer sync . --db "$GRAPH"`), not a subdirectory (syncing a subdirectory fails with `relative import escapes package`).

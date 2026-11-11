@@ -983,10 +983,25 @@ def main(argv=None):
                 "re-run sync for symbols you edited"
             )
         elif isinstance(exc, AnchorNotFoundError):
-            hints.extend(f"hint: nearest anchor: {anchor}" for anchor in getattr(exc, "nearest_anchors", []))
-            revision = getattr(exc, "snapshot_revision", "")
-            if revision:
-                hints.append(f"hint: a symbol added on a branch is absent from a base-commit DB (recorded commit: {revision}); query a snapshot containing that symbol")
+            exact_leaf = getattr(exc, "exact_leaf_match", "")
+            missing_sym = getattr(exc, "missing_symbol_name", "")
+            nearest = list(getattr(exc, "nearest_anchors", []))
+            if exact_leaf:
+                hints.append(f"hint: did you mean: {exact_leaf}")
+                hints.extend(
+                    f"hint: nearest anchor: {anchor}"
+                    for anchor in nearest
+                    if anchor != exact_leaf
+                )
+            else:
+                hints.extend(f"hint: nearest anchor: {anchor}" for anchor in nearest)
+                if missing_sym:
+                    hints.append(f"hint: no symbol named {missing_sym} in any module")
+                revision = getattr(exc, "snapshot_revision", "")
+                if revision and not missing_sym:
+                    hints.append(
+                        f"hint: a symbol added on a branch is absent from a base-commit DB (recorded commit: {revision}); query a snapshot containing that symbol"
+                    )
         elif isinstance(exc, FlowQueryError) and getattr(exc, "observed_lines", []):
             hints.append("hint: observed def/use lines for this variable in the selected function: " + ", ".join(map(str, exc.observed_lines)))
         elif isinstance(exc, UnsupportedFlowError) and args.cmd == "flow":
