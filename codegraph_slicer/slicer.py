@@ -678,7 +678,7 @@ def _slice_item(row, full):
 
 
 def _preceding_doc_comment_start(file_lines: list[str], decl_line: int) -> int:
-    idx = decl_line - 2
+    idx = min(decl_line - 2, len(file_lines) - 1)
     while idx >= 0 and not file_lines[idx].strip():
         idx -= 1
     start_ln = decl_line
