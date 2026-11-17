@@ -1765,21 +1765,14 @@ def _condense_targets_at_cap(
     budget_cap: int,
     cap_lines: int | None,
 ) -> dict:
-    current_lengths = {
-        entry["symbol"]: len(entry["text"])
-        for entry in sections["target_implementations"]
-    }
     for sid, row in sorted_targets:
         if required["tokens"] <= budget_cap:
             break
         pub_condensed = _condense_class_public_methods(
             store, sid, row, db_arg, max_tokens, max_method_lines=cap_lines
         )
-        header_len = len(f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n")
-        cur_len = current_lengths.get(sid, header_len + len(row["body"]))
-        if pub_condensed is not None and header_len + len(pub_condensed) < cur_len:
+        if pub_condensed is not None and len(pub_condensed) < len(row["body"]):
             _replace_target_section_entry(sections, sid, row, pub_condensed)
-            current_lengths[sid] = header_len + len(pub_condensed)
             required = result_fn()
     return required
 
@@ -1793,12 +1786,7 @@ def _condense_multi_anchor_targets(
         return required
     db_arg = shlex.quote(str(database)) if database is not None else "GRAPH"
     sorted_targets = sorted(chosen.items(), key=lambda kv: -len(kv[1]["body"]))
-    for budget_cap, cap_lines in (
-        (pub_cap, None),
-        (max_tokens, 0),
-        (max_tokens, 40),
-        (max_tokens, 22),
-    ):
+    for budget_cap, cap_lines in ((pub_cap, None), (max_tokens, 0), (max_tokens, 22)):
         required = _condense_targets_at_cap(
             store, sorted_targets, sections, result_fn, required, db_arg, max_tokens, budget_cap, cap_lines
         )
