@@ -227,3 +227,46 @@ def test_required_anchor_overflow_rerun_for_slice_outline(tmp_path, capsys):
     assert lines[0].startswith("codegraph-slicer: RequiredAnchorOverflow: required slice outline needs ")
     needed = lines[0].split(" needs ")[1].split(" tokens")[0]
     assert lines[1:] == [f"rerun: codegraph-slicer slice --outline --db {db} sample:calculate --max-tokens {needed}"]
+
+
+def test_required_anchor_overflow_rerun_succeeds_when_budget_digit_length_grows(tmp_path, capsys):
+    import shlex
+
+    root = tmp_path / "repo"
+    pkg = root / "src/main/java/com/acme/reporting"
+    pkg.mkdir(parents=True)
+
+    num_dtos = 66
+    for i in range(num_dtos):
+        fields = "\n".join(f'    public String field_{i}_{j} = "value_{j}";' for j in range(10))
+        (pkg / f"ReportFilterDto{i:02d}.java").write_text(
+            f"package com.acme.reporting;\npublic class ReportFilterDto{i:02d} {{\n{fields}\n}}\n",
+            encoding="utf-8",
+        )
+
+    for c in range(3):
+        imports = "\n".join(f"import com.acme.reporting.ReportFilterDto{i:02d};" for i in range(num_dtos))
+        type_params = ", ".join(f"ReportFilterDto{i:02d} dto{i}" for i in range(c * 22, (c + 1) * 22))
+        body = "\n".join(f'        String step_{k} = "{k}";' for k in range(40))
+        (pkg / f"ReportingComponent{c}.java").write_text(
+            f"package com.acme.reporting;\n{imports}\npublic class ReportingComponent{c} {{\n"
+            f"    public String build({type_params}) {{\n{body}\n        return step_0;\n    }}\n}}\n",
+            encoding="utf-8",
+        )
+
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(root)
+
+    anchors = [
+        f"src/main/java/com/acme/reporting/ReportingComponent{c}.java:ReportingComponent{c}"
+        for c in range(3)
+    ]
+    with pytest.raises(SystemExit, match="2"):
+        main(["slice", "--db", str(db), "--max-tokens", "8000", "--format", "xml", *anchors])
+    err_lines = capsys.readouterr().err.splitlines()
+    rerun_line = next(line for line in err_lines if line.startswith("rerun: "))
+    rerun_argv = shlex.split(rerun_line.removeprefix("rerun: "))[1:]
+    assert main(rerun_argv) == 0
+    out = capsys.readouterr().out
+    assert "<context tokens=" in out

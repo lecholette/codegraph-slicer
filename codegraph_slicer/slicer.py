@@ -2043,6 +2043,39 @@ def slice_context(
         )
 
 
+def _verified_overflow_budget(
+    store,
+    anchors,
+    needed: int,
+    include_callee_bodies: bool,
+    database,
+    render_estimator,
+    target_mode: str,
+    dedup_session,
+) -> int:
+    for _ in range(4):
+        try:
+            _slice_context_in_snapshot(
+                store,
+                anchors,
+                max_tokens=needed,
+                include_callee_bodies=include_callee_bodies,
+                render_estimator=render_estimator,
+                database=database,
+                target_mode=target_mode,
+                dedup_session=dedup_session,
+                _probing_overflow=True,
+            )
+            return needed
+        except RequiredAnchorOverflow as probe_exc:
+            m = re.search(r"need (\d+) tokens", str(probe_exc))
+            if not m:
+                return needed
+            next_needed = int(m.group(1))
+            needed = next_needed if next_needed > needed else needed + 1
+    return needed
+
+
 def _slice_context_in_snapshot(
     store,
     anchors,
@@ -2053,6 +2086,7 @@ def _slice_context_in_snapshot(
     database=None,
     target_mode="full",
     dedup_session=False,
+    _probing_overflow: bool = False,
 ):
     chosen, unresolved_anchors = _resolve_anchor_batch_with_status(store, anchors)
     sections = {
@@ -2328,7 +2362,8 @@ def _slice_context_in_snapshot(
     auto_summarize_ids.update(deduped_ids)
     complete = result()
     if complete["tokens"] <= max_tokens:
-        _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
+        if not _probing_overflow:
+            _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
         return complete
     for sid, summary in summaries.items():
         if sid in auto_summarize_ids:
@@ -2348,7 +2383,8 @@ def _slice_context_in_snapshot(
                 for entry in sections["types_and_schemas"]
             ]
     if complete["tokens"] <= max_tokens:
-        _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
+        if not _probing_overflow:
+            _commit_session_dedup(cache_path, sess_scope, all_sessions, staged_seen)
         return complete
     sections["types_and_schemas"] = [
         pre_dedup_map[entry["symbol"]] if entry["symbol"] in deduped_ids else entry
@@ -2395,8 +2431,22 @@ def _slice_context_in_snapshot(
             if required["tokens"] > max_tokens:
                 omitted_detail_limit -= 1
     if required["tokens"] > max_tokens:
+        needed_budget = (
+            required["tokens"]
+            if _probing_overflow
+            else _verified_overflow_budget(
+                store,
+                anchors,
+                required["tokens"],
+                include_callee_bodies,
+                database,
+                render_estimator,
+                target_mode,
+                dedup_session,
+            )
+        )
         raise RequiredAnchorOverflow(
-            f"required definitions need {required['tokens']} tokens including omission metadata, budget is {max_tokens}"
+            f"required definitions need {needed_budget} tokens including omission metadata, budget is {max_tokens}"
         )
     for name, candidates in (
         ("downstream_dependencies", callees),
@@ -2425,8 +2475,23 @@ def _slice_context_in_snapshot(
     )
     final = result()
     if final["tokens"] > max_tokens:
-        raise RequiredAnchorOverflow(
-            f"required definitions need {final['tokens']} tokens including omission metadata, budget is {max_tokens}"
+        needed_budget = (
+            final["tokens"]
+            if _probing_overflow
+            else _verified_overflow_budget(
+                store,
+                anchors,
+                final["tokens"],
+                include_callee_bodies,
+                database,
+                render_estimator,
+                target_mode,
+                dedup_session,
+            )
         )
-    _commit_session_dedup(cache_path, sess_scope, all_sessions, final_seen)
+        raise RequiredAnchorOverflow(
+            f"required definitions need {needed_budget} tokens including omission metadata, budget is {max_tokens}"
+        )
+    if not _probing_overflow:
+        _commit_session_dedup(cache_path, sess_scope, all_sessions, final_seen)
     return final

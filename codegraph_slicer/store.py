@@ -47,6 +47,10 @@ def _default_jobs(jobs: int | None = None) -> int:
     env = os.environ.get("CODEGRAPH_SLICER_JOBS", "").strip()
     if env.isdigit() and int(env) > 0:
         return int(env)
+    main_mod = sys.modules.get("__main__")
+    main_file = getattr(main_mod, "__file__", None) if main_mod is not None else None
+    if not main_file or not Path(main_file).is_file():
+        return 1
     cpus = os.cpu_count() or 2
     return max(1, min(4, cpus // 2))
 
