@@ -1236,9 +1236,11 @@ def _extract_preceding_comments(preceding_lines: list[str]) -> list[str]:
 def _parse_python_first_stmt_docstring(body: str) -> str | None:
     if not body:
         return None
-    with contextlib.suppress(SyntaxError, IndexError):
+    with contextlib.suppress(SyntaxError):
         parsed = ast.parse(textwrap.dedent(body))
-        if parsed.body:
+        if parsed.body and isinstance(
+            parsed.body[0], (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef)
+        ):
             return ast.get_docstring(parsed.body[0])
     return None
 
@@ -1434,7 +1436,7 @@ def _build_type_summaries(
         item_record["text"] = (
             f"{row['file_path']}:{row['start_line']}-{row['end_line']}\n"
             + "\n".join(lines)
-            + f"\nExpansion {sid} ({full_size} tokens): codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {max(max_tokens, full_size * 2)}"
+            + f"\nExpansion {sid} ({full_size} tokens): codegraph-slicer slice --db {db_arg} {shlex.quote(sid)} --snapshot --max-tokens {full_size * 2}"
         )
         summaries[sid] = item_record
 
@@ -1579,7 +1581,7 @@ def _condense_class_public_methods(
     kept_parts = ["\n".join(body_lines[: min(first_m_offset, 15)])]
     comment_pfx = _comment_prefix(sym.file_path)
     full_size = tokens_for_length(len(sym.body))
-    expand_budget = max(max_tokens, full_size * 2)
+    expand_budget = full_size * 2
     span_len = sym.end_line - sym.start_line + 1
     kept_parts.append(
         f"    {comment_pfx} ... ({len(int_methods)} internal helper methods condensed in "

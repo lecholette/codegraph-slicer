@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
@@ -21,7 +22,11 @@ from .ast_extractor import (
     is_supported_source_path,
     valid_path,
 )
-from .slicer import build_slice_outline, serialized_tokens, slice_context
+from .slicer import (
+    build_slice_outline,
+    rendered_tokens,
+    slice_context,
+)
 from .store import (
     GraphStore,
     _dedupe_analysis_symbols,
@@ -408,8 +413,14 @@ def _populate_lazy_store(
     return store, coverage
 
 
+def _rendered_json_tokens(candidate) -> int:
+    return rendered_tokens(
+        json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
 def _wrap_coverage_estimator(render_estimator, coverage: dict):
-    base = render_estimator or serialized_tokens
+    base = render_estimator or (lambda candidate: _rendered_json_tokens(candidate))
     return lambda candidate: base({**candidate, "coverage": coverage})
 
 

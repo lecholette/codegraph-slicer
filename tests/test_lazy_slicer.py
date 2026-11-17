@@ -5,8 +5,12 @@ import pytest
 from codegraph_slicer import GraphStore
 from codegraph_slicer.ast_extractor import CodeGraphError, CodeGraphParseError, is_test_path
 from codegraph_slicer.cli import main
-from codegraph_slicer.lazy_slicer import lazy_slice_context, lazy_slice_outline
-from codegraph_slicer.slicer import serialized_tokens
+from codegraph_slicer.lazy_slicer import (
+    _wrap_coverage_estimator,
+    lazy_slice_context,
+    lazy_slice_outline,
+)
+from codegraph_slicer.slicer import rendered_tokens, serialized_tokens
 
 
 def _make_java_repo(tmp_path: Path) -> Path:
@@ -153,5 +157,58 @@ def test_scope_rejects_slash_and_lazy_json_budget_accounts_for_coverage(tmp_path
         max_tokens=300,
         include_callers=False,
     )
-    assert res["tokens"] == serialized_tokens(res)
+    rendered = json.dumps(res, ensure_ascii=False, separators=(",", ":"))
+    assert res["tokens"] == rendered_tokens(rendered)
     assert res["tokens"] <= 300
+
+
+def test_lazy_json_estimator_matches_cli_across_all_four_char_alignments() -> None:
+    coverage = {"mode": "lazy_target_seeded"}
+    estimator = _wrap_coverage_estimator(None, coverage)
+    seen_alignments = set()
+    for pad_len in range(8):
+        candidate = {"tokens": 22, "pad": "é" + ("x" * pad_len)}
+        raw_json = json.dumps(
+            {**candidate, "coverage": coverage},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        seen_alignments.add(len(raw_json) % 4)
+        assert estimator(candidate) == rendered_tokens(raw_json)
+    assert seen_alignments == {0, 1, 2, 3}
+
+
+def test_retry_budget_succeeds_across_indexed_and_lazy_all_formats(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    import shlex
+
+    monkeypatch.setattr("codegraph_slicer.lazy_slicer.monotonic", lambda: 1.0)
+    seen_json_alignments = set()
+    for pad in range(4):
+        sub = tmp_path / f"case_{pad}"
+        root = sub / "repo"
+        root.mkdir(parents=True)
+        (root / "a.py").write_text(
+            f"def f():\n    return '{'x' * pad}'\n",
+            encoding="utf-8",
+        )
+        db = sub / "graph.sqlite"
+        with GraphStore(db) as store:
+            store.sync_workspace(root)
+
+        for mode_args in (["--db", str(db)], ["--root", str(root)]):
+            for fmt in ("json", "markdown", "xml"):
+                for extra in ([], ["--outline"]):
+                    with pytest.raises(SystemExit, match="2"):
+                        main(["slice", *mode_args, *extra, "a.py:f", "--format", fmt, "--max-tokens", "1"])
+                    err_lines = capsys.readouterr().err.splitlines()
+                    rerun_line = next(line for line in err_lines if line.startswith("rerun: "))
+                    rerun_argv = shlex.split(rerun_line.removeprefix("rerun: "))[1:]
+                    assert main(rerun_argv) == 0
+                    out = capsys.readouterr().out.rstrip("\n")
+                    assert out
+                    if fmt == "json" and "--root" in mode_args and not extra:
+                        seen_json_alignments.add(len(out) % 4)
+    assert seen_json_alignments == {0, 1, 2, 3}
+

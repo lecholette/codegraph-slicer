@@ -270,3 +270,99 @@ def test_required_anchor_overflow_rerun_succeeds_when_budget_digit_length_grows(
     assert main(rerun_argv) == 0
     out = capsys.readouterr().out
     assert "<context tokens=" in out
+
+
+def test_embedded_expansion_budgets_depend_on_source_size_not_enclosing_budget(tmp_path):
+    from codegraph_slicer.slicer import (
+        _build_type_summaries,
+        _condense_class_public_methods,
+        tokens_for_length,
+    )
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    helpers = "\n".join(
+        f"    def _helper_{i}(self, x: int) -> int:\n"
+        + "".join(f"        v_{i}_{j} = x + {j}\n" for j in range(12))
+        + f"        return v_{i}_0\n"
+        for i in range(6)
+    )
+    pub = (
+        "    def run(self, x: int) -> int:\n"
+        + "".join(f"        step_{k} = self._helper_0(x + {k})\n" for k in range(20))
+        + "        return step_0\n"
+    )
+    (root / "service.py").write_text(
+        f"class BigService:\n{helpers}{pub}\n",
+        encoding="utf-8",
+    )
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(root)
+        row = store.rows("SELECT * FROM symbols WHERE symbol_id='service:BigService'")[0]
+        full_size = tokens_for_length(len(row["body"]))
+        expected_budget = full_size * 2
+
+        summaries_small, _, _ = _build_type_summaries(
+            store, [("service:BigService", row)], set(), db, 8000
+        )
+        summaries_large, _, _ = _build_type_summaries(
+            store, [("service:BigService", row)], set(), db, 11005
+        )
+        assert f"--max-tokens {expected_budget}" in summaries_small["service:BigService"]["text"]
+        assert summaries_small["service:BigService"]["text"] == summaries_large["service:BigService"]["text"]
+
+        condensed_small = _condense_class_public_methods(
+            store, "service:BigService", row, str(db), 8000, min_internal=1
+        )
+        condensed_large = _condense_class_public_methods(
+            store, "service:BigService", row, str(db), 11005, min_internal=1
+        )
+        assert condensed_small is not None
+        assert f"--max-tokens {expected_budget})" in condensed_small
+        assert condensed_small == condensed_large
+
+
+def test_java_method_signature_does_not_crash_python_docstring_parser(tmp_path):
+    from codegraph_slicer.slicer import (
+        _first_docstring_line,
+        _parse_python_first_stmt_docstring,
+        slice_context,
+    )
+
+    assert _parse_python_first_stmt_docstring("List<String> get();") is None
+    assert _first_docstring_line("List<String> get();") is None
+    assert _parse_python_first_stmt_docstring("def fn():\n    \"\"\"Func doc.\"\"\"\n    return 1\n") == "Func doc."
+    assert _parse_python_first_stmt_docstring("async def afn():\n    \"\"\"Async doc.\"\"\"\n    return 1\n") == "Async doc."
+    assert _parse_python_first_stmt_docstring("class Cls:\n    \"\"\"Class doc.\"\"\"\n    pass\n") == "Class doc."
+    with pytest.raises(TypeError):
+        _parse_python_first_stmt_docstring(123)  # type: ignore[arg-type]
+
+    root = tmp_path / "repo"
+    pkg = root / "src/main/java/com/acme"
+    pkg.mkdir(parents=True)
+    (pkg / "Provider.java").write_text(
+        "package com.acme;\nimport java.util.List;\npublic interface Provider {\n    List<String> get();\n    List<String> listAll();\n}\n",
+        encoding="utf-8",
+    )
+    (pkg / "ReportingJob.java").write_text(
+        "package com.acme;\npublic class ReportingJob {\n    public String execute(Provider provider) {\n        return provider.get().toString();\n    }\n}\n",
+        encoding="utf-8",
+    )
+    db = tmp_path / "graph.sqlite"
+    with GraphStore(db) as store:
+        store.sync_workspace(root)
+        res = slice_context(
+            store,
+            ["src/main/java/com/acme/ReportingJob.java:ReportingJob.execute"],
+            max_tokens=400,
+        )
+        assert res["sections"]["target_implementations"]
+        skel = slice_context(
+            store,
+            ["src/main/java/com/acme/Provider.java:Provider.get"],
+            max_tokens=400,
+            target_mode="skeleton",
+        )
+        assert "List<String> get();" in skel["sections"]["target_implementations"][0]["text"]
+
