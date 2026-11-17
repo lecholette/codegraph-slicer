@@ -1,6 +1,7 @@
 """Transactional index, retaining raw references for rebinding across snapshots."""
 
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 import contextlib
 import glob
 from dataclasses import dataclass
@@ -35,7 +36,36 @@ from .ast_extractor import (
 )
 
 _RAW_SOURCE_EXTS = tuple(ext.encode("ascii") for ext in SUPPORTED_EXTENSIONS)
-_RAW_EXCLUDED_EXTS = (b".d.ts", b".min.js", b".bundle.js")
+_RAW_EXCLUDED_EXTS = (b".d.ts", b".min.js", b".bundle.js", b".min.mjs", b".min.cjs")
+_BATCH_SIZE = 200
+_PARALLEL_THRESHOLD = 64
+
+
+def _default_jobs(jobs: int | None = None) -> int:
+    if jobs is not None and jobs > 0:
+        return jobs
+    env = os.environ.get("CODEGRAPH_SLICER_JOBS", "").strip()
+    if env.isdigit() and int(env) > 0:
+        return int(env)
+    cpus = os.cpu_count() or 2
+    return max(1, min(4, cpus // 2))
+
+
+def _worker_init() -> None:
+    try:
+        os.nice(10)
+    except (AttributeError, OSError):
+        pass
+
+
+def _extract_worker(task):
+    path, raw, packages, source_root, path_aliases = task
+    try:
+        if path_aliases is not None:
+            return path, extract_file(path, raw, packages, source_root, path_aliases), None
+        return path, extract_file(path, raw, packages, source_root), None
+    except CodeGraphParseError as exc:
+        return path, None, str(exc)
 
 
 @dataclass(frozen=True)
@@ -66,6 +96,7 @@ _SKIP_DIRS = {
     "__pycache__",
     "node_modules",
     "build",
+    "target",
     ".gradle",
     ".next",
 }
@@ -80,6 +111,9 @@ def _should_skip_rel_path(rel_parts: tuple[str, ...], include_hidden: bool = Fal
     ):
         return True
     if not include_hidden and rel_parts[-1].startswith("."):
+        return True
+    leaf = rel_parts[-1]
+    if leaf.startswith("swagger-ui") and leaf.endswith((".js", ".mjs", ".cjs")):
         return True
     return False
 
@@ -160,6 +194,46 @@ def _disambiguate_analysis(
         analysis.skeleton,
         new_symbols,
         new_edges,
+    )
+
+
+def _dedupe_analysis_symbols(analysis: FileAnalysis) -> FileAnalysis:
+    seen: dict[str, int] = {}
+    has_dups = False
+    for s in analysis.symbols:
+        if s.symbol_id in seen:
+            has_dups = True
+            break
+        seen[s.symbol_id] = 1
+    if not has_dups:
+        return analysis
+    seen.clear()
+    used: set[str] = set()
+    new_symbols: list[Symbol] = []
+    for s in analysis.symbols:
+        sid = s.symbol_id
+        if sid not in used:
+            used.add(sid)
+            seen[sid] = 1
+            new_symbols.append(s)
+        else:
+            n = seen.get(sid, 1) + 1
+            cand = f"{sid}#{n}"
+            while cand in used:
+                n += 1
+                cand = f"{sid}#{n}"
+            seen[sid] = n
+            used.add(cand)
+            new_symbols.append(
+                Symbol(cand, s.kind, s.signature, s.body, s.start, s.end, s.cx)
+            )
+    return FileAnalysis(
+        analysis.path,
+        analysis.module,
+        analysis.blob_sha,
+        analysis.skeleton,
+        tuple(new_symbols),
+        analysis.edges,
     )
 
 
@@ -366,10 +440,11 @@ class GraphStore:
                 raise CodeGraphError(f"symlink source refused: {rel.as_posix()}")
             name = valid_path(rel.as_posix())
             data = path.read_bytes()
-            files[name] = ("sha256:" + hashlib.sha256(data).hexdigest(), data)
+            files[name] = ("sha256:" + hashlib.sha256(data).hexdigest(), path)
         tsconfig_bytes = _read_ts_or_js_config(root)
         return self._sync(
             files,
+            loader=lambda p: p.read_bytes(),
             snapshot_root=str(root),
             snapshot_kind="workspace",
             tsconfig_bytes=tsconfig_bytes,
@@ -493,7 +568,13 @@ class GraphStore:
 
         def get_raw(p):
             if p not in raw_cache:
-                raw_cache[p] = loader(files[p][1]) if loader else files[p][1]
+                data = loader(files[p][1]) if loader else files[p][1]
+                expected = files[p][0]
+                if expected.startswith("sha256:"):
+                    actual = "sha256:" + hashlib.sha256(data).hexdigest()
+                    if actual != expected:
+                        raise CodeGraphError(f"workspace file modified during sync: {p}")
+                raw_cache[p] = data
             return raw_cache[p]
 
         self.db.execute("BEGIN IMMEDIATE")
@@ -547,33 +628,18 @@ class GraphStore:
                         if p in files and p not in skipped:
                             changed_set.add(p)
             changed = sorted(changed_set)
-            analyses = []
-            for path in changed:
-                try:
-                    analyses.append(
-                        extract_file(
-                            path,
-                            get_raw(path),
-                            packages,
-                            source_root,
-                            *( [path_aliases] if path_aliases else [] ),
-                        )
-                    )
-                except CodeGraphParseError as exc:
-                    if not skip_unparseable:
-                        raise
-                    skipped[path] = files[path][0]
-                    sys.stderr.write(
-                        f"codegraph-slicer: warning: skipping unparseable file {path}: {exc}\n"
-                    )
-            removed = deleted | (set(old) & set(skipped))
-            for path in sorted(removed | set(changed)):
+            for path in sorted(deleted | set(changed)):
                 self.db.execute("DELETE FROM files WHERE path=?", (path,))
             taken_modules = {
                 row[0] for row in self.db.execute("SELECT module FROM files")
             }
-            for raw_analysis in analyses:
-                analysis = _disambiguate_analysis(raw_analysis, taken_modules)
+            parsed_count = 0
+
+            def _insert_analysis(raw_analysis: FileAnalysis) -> None:
+                nonlocal parsed_count
+                analysis = _dedupe_analysis_symbols(
+                    _disambiguate_analysis(raw_analysis, taken_modules)
+                )
                 self.db.execute(
                     "INSERT INTO files VALUES(?,?,?,?,?)",
                     (
@@ -584,9 +650,9 @@ class GraphStore:
                         analysis.skeleton,
                     ),
                 )
-                for symbol in analysis.symbols:
-                    self.db.execute(
-                        "INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                self.db.executemany(
+                    "INSERT INTO symbols VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    [
                         (
                             symbol.symbol_id,
                             analysis.path,
@@ -599,8 +665,10 @@ class GraphStore:
                             symbol.body,
                             symbol.cx,
                             len(symbol.body) // 4 + 1,
-                        ),
-                    )
+                        )
+                        for symbol in analysis.symbols
+                    ],
+                )
                 self.db.executemany(
                     "INSERT INTO raw_edges VALUES(?,?,?,?,?)",
                     [
@@ -608,6 +676,56 @@ class GraphStore:
                         for e in analysis.edges
                     ],
                 )
+                parsed_count += 1
+
+            workers = _default_jobs()
+            if len(changed) >= _PARALLEL_THRESHOLD and workers > 1:
+                with ProcessPoolExecutor(
+                    max_workers=workers, initializer=_worker_init
+                ) as pool:
+                    for offset in range(0, len(changed), _BATCH_SIZE):
+                        batch_paths = changed[offset : offset + _BATCH_SIZE]
+                        tasks = []
+                        for path in batch_paths:
+                            raw = get_raw(path)
+                            raw_cache.pop(path, None)
+                            tasks.append((path, raw, packages, source_root, path_aliases))
+                        for path, raw_analysis, err in pool.map(
+                            _extract_worker, tasks, chunksize=16
+                        ):
+                            if err is not None:
+                                if not skip_unparseable:
+                                    raise CodeGraphParseError(err)
+                                skipped[path] = files[path][0]
+                                sys.stderr.write(
+                                    f"codegraph-slicer: warning: skipping unparseable file {path}: {err}\n"
+                                )
+                                continue
+                            _insert_analysis(raw_analysis)
+            else:
+                for path in changed:
+                    try:
+                        raw = get_raw(path)
+                        raw_cache.pop(path, None)
+                        raw_analysis = extract_file(
+                            path,
+                            raw,
+                            packages,
+                            source_root,
+                            *( [path_aliases] if path_aliases else [] ),
+                        )
+                    except CodeGraphParseError as exc:
+                        if not skip_unparseable:
+                            raise
+                        skipped[path] = files[path][0]
+                        sys.stderr.write(
+                            f"codegraph-slicer: warning: skipping unparseable file {path}: {exc}\n"
+                        )
+                        continue
+                    _insert_analysis(raw_analysis)
+            removed = deleted | (set(old) & set(skipped))
+            for path in sorted(set(old) & set(skipped)):
+                self.db.execute("DELETE FROM files WHERE path=?", (path,))
             if changed or removed:
                 self._rebind(source_root=source_root)
             self.db.execute(
@@ -631,8 +749,8 @@ class GraphStore:
                     (key, value),
                 )
             res = {
-                "parsed_files": len(analyses),
-                "cached_files": len(files) - len(analyses) - len(skipped),
+                "parsed_files": parsed_count,
+                "cached_files": len(files) - parsed_count - len(skipped),
                 "deleted_files": len(deleted),
                 "total_symbols": self.db.execute(
                     "SELECT count(*) FROM symbols"
@@ -804,21 +922,25 @@ class GraphStore:
                     row["target_id"], file_lang.get(row["source_file"], "py")
                 )
             )
+        pkg_members: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        for key, val in aliases.items():
+            if "." in key:
+                parent, member = key.rsplit(".", 1)
+                pkg_members[parent].append((member, val))
         if wildcard_exports:
             changed_wc = True
             while changed_wc:
                 changed_wc = False
                 for src_mod, tgt_mods in wildcard_exports.items():
                     for tgt_mod in tgt_mods:
-                        prefix = tgt_mod + "."
-                        for key, val in list(aliases.items()):
-                            if key.startswith(prefix):
-                                exported = key[len(prefix) :]
-                                if "." not in exported and f"{src_mod}.{exported}" not in aliases:
-                                    aliases[f"{src_mod}.{exported}"] = val
-                                    if src_mod in module_exports:
-                                        module_exports[src_mod].add(exported)
-                                    changed_wc = True
+                        for exported, val in list(pkg_members.get(tgt_mod, ())):
+                            alias_key = f"{src_mod}.{exported}"
+                            if alias_key not in aliases:
+                                aliases[alias_key] = val
+                                pkg_members[src_mod].append((exported, val))
+                                if src_mod in module_exports:
+                                    module_exports[src_mod].add(exported)
+                                changed_wc = True
         wildcard_imports = defaultdict(list)
         for row in self.db.execute(
             "SELECT source_file,source_id,target_id FROM raw_edges WHERE kind='WILDCARD_IMPORT'"
@@ -828,22 +950,26 @@ class GraphStore:
                     row["target_id"], file_lang.get(row["source_file"], "py")
                 )
             )
+        class_members: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        if wildcard_imports:
+            for sym_id in symbols:
+                if "." in sym_id:
+                    cls_prefix, member = sym_id.rsplit(".", 1)
+                    class_members[cls_prefix].append((member, sym_id))
         for src_mod, tgt_pkgs in wildcard_imports.items():
             for tgt_pkg in tgt_pkgs:
-                prefix = tgt_pkg + "."
-                for key, val in list(aliases.items()):
-                    if key.startswith(prefix):
-                        member = key[len(prefix) :]
-                        if "." not in member and f"{src_mod}.{member}" not in aliases:
-                            aliases[f"{src_mod}.{member}"] = val
+                for member, val in pkg_members.get(tgt_pkg, ()):
+                    alias_key = f"{src_mod}.{member}"
+                    if alias_key not in aliases:
+                        aliases[alias_key] = val
+                        pkg_members[src_mod].append((member, val))
                 class_sid = aliases.get(tgt_pkg)
                 if class_sid and class_sid in symbols:
-                    cprefix = class_sid + "."
-                    for sym_id in symbols:
-                        if sym_id.startswith(cprefix):
-                            member = sym_id[len(cprefix) :]
-                            if "." not in member and f"{src_mod}.{member}" not in aliases:
-                                aliases[f"{src_mod}.{member}"] = sym_id
+                    for member, sym_id in class_members.get(class_sid, ()):
+                        alias_key = f"{src_mod}.{member}"
+                        if alias_key not in aliases:
+                            aliases[alias_key] = sym_id
+                            pkg_members[src_mod].append((member, sym_id))
 
         def direct(target, module_parts=1):
             if target in symbols:
@@ -1041,9 +1167,15 @@ class GraphStore:
             file_lang, rewrite_target, resolve
         )
 
+        mro_memo: dict[str, tuple[str, ...]] = {}
+
         def mro_method(cls_sid: str, mname: str) -> str | None:
+            mro = mro_memo.get(cls_sid)
+            if mro is None:
+                mro = compute_c3_mro(cls_sid, class_bases)
+                mro_memo[cls_sid] = mro
             return next(
-                (f"{b}.{mname}" for b in compute_c3_mro(cls_sid, class_bases) if f"{b}.{mname}" in symbols),
+                (f"{b}.{mname}" for b in mro if f"{b}.{mname}" in symbols),
                 None,
             )
 
@@ -1103,8 +1235,13 @@ class GraphStore:
             sid for sid, k in symbols.items() if k == "class" and sid not in abc_sids and sid not in protocol_reqs
         )
         mro_cache = {csid: set(compute_c3_mro(csid, class_bases)) for csid in concrete}
+        by_base: dict[str, list[str]] = defaultdict(list)
+        for c in concrete:
+            for base in mro_cache[c]:
+                if base != c:
+                    by_base[base].append(c)
         impls_of = {
-            isid: [c for c in concrete if sym_lang.get(c) == sym_lang.get(isid, "py") and isid in mro_cache[c]]
+            isid: [c for c in by_base.get(isid, ()) if sym_lang.get(c) == sym_lang.get(isid, "py")]
             for isid in abc_sids
         }
         for psid, reqs in protocol_reqs.items():

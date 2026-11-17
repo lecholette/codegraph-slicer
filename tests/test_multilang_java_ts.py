@@ -23,6 +23,36 @@ def _write(root, files):
         path.write_text(content, encoding="utf-8")
 
 
+@pytest.mark.parametrize("snapshot", ["workspace", "git"])
+def test_java_build_outputs_are_excluded_from_sync_and_freshness(tmp_path, snapshot):
+    import subprocess
+
+    root = tmp_path / "repo"
+    source = "module/src/main/java/com/acme/Service.java"
+    outputs = [
+        "module/target/generated-sources/annotations/com/acme/Service.java",
+        "module/build/generated/sources/com/acme/Service.java",
+    ]
+    _write(root, {path: "package com.acme; class Service {}" for path in [source, *outputs]})
+    if snapshot == "git":
+        for args in (["init"], ["add", "."], ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "fixture"]):
+            subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    with GraphStore(tmp_path / "graph.sqlite") as store:
+        if snapshot == "git":
+            store.sync_git_tree(root, "HEAD")
+        else:
+            store.sync_workspace(root)
+        assert [row["path"] for row in store.rows("SELECT path FROM files")] == [source]
+        for path in outputs:
+            (root / path).write_text("generated output changed")
+        store.assert_fresh()
+        (root / source).write_text("package com.acme; class Service { void changed() {} }")
+        from codegraph_slicer.store import StaleSnapshotError
+
+        with pytest.raises(StaleSnapshotError):
+            store.assert_fresh()
+
+
 def test_java_extraction_field_dispatch_overloads_and_tests(tmp_path, capsys):
     root = tmp_path / "java_repo"
     _write(
@@ -1440,5 +1470,49 @@ class DefaultJobPolicyValidator:
         )
         == 0
     )
+
+
+def test_java_duplicate_symbol_id_within_file_does_not_crash_sync(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "src/main/java/com/acme").mkdir(parents=True)
+    (root / "src/main/java/com/acme/Outer.java").write_text(
+        """package com.acme;
+
+public class Outer {
+    public Outer() {}
+    public static class Outer {}
+}
+""",
+        encoding="utf-8",
+    )
+    db_file = tmp_path / "graph.sqlite"
+    with GraphStore(db_file) as store:
+        res = store.sync_workspace(root)
+        assert res["parsed_files"] == 1
+        rows = store.db.execute("SELECT symbol_id FROM symbols ORDER BY symbol_id").fetchall()
+        sids = [r[0] for r in rows]
+        assert len(sids) == len(set(sids))
+        assert any(s.endswith(":Outer.Outer#2") for s in sids)
+
+
+def test_batched_parallel_sync_skips_swagger_ui_and_indexes_over_threshold(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    (root / "src/main/java/com/acme").mkdir(parents=True)
+    (root / "web/assets").mkdir(parents=True)
+    (root / "web/assets/swagger-ui-bundle.js").write_text("function bad( { ", encoding="utf-8")
+    for i in range(70):
+        (root / f"src/main/java/com/acme/Service{i}.java").write_text(
+            f"package com.acme;\npublic class Service{i} {{ public int run() {{ return {i}; }} }}\n",
+            encoding="utf-8",
+        )
+    db_file = tmp_path / "graph.sqlite"
+    with GraphStore(db_file) as store:
+        res = store.sync_workspace(root)
+        assert res["parsed_files"] == 70
+        assert res["cached_files"] == 0
+        res2 = store.sync_workspace(root)
+        assert res2["parsed_files"] == 0
+        assert res2["cached_files"] == 70
+
 
 

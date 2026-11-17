@@ -55,6 +55,7 @@ codegraph-slicer sync . --db "$GRAPH"
 ```
 
 Sync is incremental: unchanged files are not reparsed, so re-run it whenever source changed.
+If a polyglot or legacy repo fails on an unparseable file (e.g., an old Python 2 script), pass `--skip-unparseable` (`codegraph-slicer sync . --skip-unparseable --db "$GRAPH"`).
 `map`, `slice`, `impact` and `flow` exit 2 with `StaleSnapshotError` when files changed since the sync.
 Re-sync for symbols you edited. For symbols you did not edit, `--snapshot` (a boolean flag taking no argument) reads the indexed bytes without a re-sync.
 Errors go to stderr with exit 2. An empty result is exit 0.
@@ -93,6 +94,7 @@ Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`,
 - `flow` is function-local. Calls are opaque. Aliases and implicit exceptions are not modelled.
 - `flow` models `try`/`except`/`finally`, `with`, `async with` and comprehensions conservatively. It refuses `await`, `yield`, lambdas, nested definitions and imports with a source location. Use `slice` for those.
 - `delta` never runs tests. Run them separately.
+- When `slice` or `impact` shows a multi-layer filter (e.g., DB/ES prefilter + Java/Python post-filter), verify edge-case parity (null/missing fields, timezone offsets, caps/truncation) between both layers—static graphs show call edges, not filter-predicate equivalence.
 - Do not pick a budget below the default up front. If a command refuses for size (`RequiredAnchorOverflow`), copy the `hint: rerun:` command it prints (which sets `--max-tokens` to the needed budget) and run it once; a multi-anchor `--outline` (3+ anchors) or a single-anchor `--outline` on a very large function may exceed 8000 tokens.
 - Errors print `hint:` lines (`did you mean`, `nearest anchor`, `no symbol named ... in any module`, `rerun`, snapshot commit, DB path state). Use them before retrying: copy `hint: did you mean:` or the first matching `hint: nearest anchor:` verbatim; if `no symbol named ... in any module` appears, run `map --seed <module>` to list the module's real symbols rather than guessing names.
 - `sync` takes the repository root as a positional (`codegraph-slicer sync . --db "$GRAPH"`), not a subdirectory (syncing a subdirectory fails with `relative import escapes package`). Run `sync` in the foreground (`codegraph-slicer sync ... && codegraph-slicer slice ...`) rather than backgrounding with `&` and querying before `sync` exits `0`.

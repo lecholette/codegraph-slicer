@@ -231,6 +231,8 @@ codegraph-slicer route --db "$GRAPH" \
 
 `ScaleRecommendation` classifies the repository into one of four modes:
 
+Skipped parse failures are reported as `skipped_files` and `skipped_languages`. They disable graph recommendations only for affected production languages; an unparseable legacy Python script does not disable an otherwise indexed Java graph. Static graphs can still have unresolved references and do not prove caller completeness.
+
 | Mode | When It Triggers | Recommended Action |
 | :--- | :--- | :--- |
 | **`map_then_read`** (`bypass_slicer: true`) | Compact scope (`< 30` files & `< 5,000` LOC in Java/TS/JS, or `< 50` files & `< 7,500` LOC in Python) with no monoliths (`>= 300` lines, `>= 15` definitions, or `CC >= 25`) and `< 40` cross-file edges. | Read the target files directly; skip `slice` and `delta`. |

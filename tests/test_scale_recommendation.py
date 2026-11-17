@@ -69,6 +69,21 @@ def _database(tmp_path, skip=False):
     return db
 
 
+def test_skipped_languages_do_not_disable_complete_language_graphs():
+    java_files = [(f"src/main/java/acme/Service{i}.java", 200) for i in range(30)]
+    rec = _rec(java_files, {"legacy.py": "sha256:x"})
+    assert rec["languages"] == ["java"]
+    assert rec["reason"] == "graph_candidate"
+    assert rec["bypass_slicer"] is False
+    assert rec["skipped_files"] == 1
+    assert rec["skipped_languages"] == ["python"]
+    assert _rec(java_files, {"src/main/java/acme/Broken.java": "sha256:x"})["reason"] == "incomplete_index"
+    test_only = _rec(java_files, {"src/test/java/acme/BrokenTest.java": "sha256:x"})
+    assert test_only["reason"] == "graph_candidate"
+    assert test_only["skipped_languages"] == ["java"]
+    assert _rec([], {"legacy.py": "sha256:x"})["reason"] == "incomplete_index"
+
+
 @pytest.mark.parametrize("outline", [False, True])
 @pytest.mark.parametrize("fmt", ["json", "markdown", "xml"])
 def test_map_recommendation_formats_and_legacy_parity(tmp_path, capsys, outline, fmt):

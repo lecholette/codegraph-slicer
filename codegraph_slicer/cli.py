@@ -13,7 +13,7 @@ from contextlib import ExitStack
 from pathlib import Path
 import xml.sax.saxutils as _saxutils
 
-from .ast_extractor import CodeGraphError, is_test_path
+from .ast_extractor import CodeGraphError, CodeGraphParseError, is_test_path
 from .delta import compute_delta, project_delta_v2, summarize_delta
 from .flow import FlowBudgetExceeded, FlowQueryError, UnsupportedFlowError, compact_flow_result
 from .flow_query import query_flow
@@ -417,12 +417,14 @@ def _scale_recommendation(store: GraphStore):
     files = len(production)
     loc = sum(row["loc"] for row in production)
     languages = sorted({_file_language(row["path"]) for row in production})
+    skipped_languages = sorted({_file_language(path) for path in skipped})
+    incomplete = any(not is_test_path(path) and _file_language(path) in languages for path in skipped)
     structure = inspect_scale_structure(store, production)
     mode, bypass, commands, reason = _classify_scale(
         files,
         loc,
         languages,
-        skipped,
+        skipped and (not files or incomplete),
         has_monolith=bool(structure.slice_targets),
         cross_file_edges=structure.cross_file_edges,
     )
@@ -439,6 +441,9 @@ def _scale_recommendation(store: GraphStore):
     }
     if structure.slice_targets:
         rec["slice_targets"] = structure.slice_targets
+    if skipped:
+        rec["skipped_files"] = len(skipped)
+        rec["skipped_languages"] = skipped_languages
     return rec
 
 
@@ -680,13 +685,13 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.9")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.10")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",
         help="index a workspace or Git commit snapshot",
         description=(
-            "Index Python files from a workspace, or an immutable Git revision.\n"
+            "Index Python, Java, TypeScript, and JavaScript source from a workspace or immutable Git revision.\n"
             "One database stores one source snapshot; syncing another replaces it."
         ),
         epilog="Example: codegraph-slicer sync ./project --db /tmp/project.sqlite\nNext: codegraph-slicer map --db /tmp/project.sqlite",
@@ -725,7 +730,11 @@ def main(argv=None):
         epilog="Example: codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.module:helper\nNext: inspect the JSON, or add --format markdown or --format xml for readable context.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    slicing.add_argument("--db", "--database", dest="db", required=True, help="existing indexed SQLite database")
+    slicing.add_argument("--db", "--database", dest="db", default=None, help="existing indexed SQLite database")
+    slicing.add_argument("--root", default=None, help="workspace root for target-seeded lazy slicing without a prebuilt --db")
+    slicing.add_argument("--max-files", type=int, default=40, help="max files to explore in lazy --root mode (default: 40)")
+    slicing.add_argument("--max-hops", type=int, default=2, help="max dependency hops in lazy --root mode (default: 2)")
+    slicing.add_argument("--no-callers", action="store_true", help="skip grep-based caller discovery in lazy --root mode")
     slicing.add_argument("--snapshot", action="store_true", help="explicitly query cached historical bytes without checking source freshness")
     slicing.add_argument("anchors", nargs="+", help="symbol, module, or path/line anchor")
     slicing.add_argument("--max-tokens", type=int, default=8000, help="estimated context budget (default: 8000)")
@@ -867,7 +876,37 @@ def main(argv=None):
                         selected_tests=bool(args.selected_test),
                         render_estimator=render_budget,
                     )
+            elif args.cmd == "slice" and args.root and not args.db:
+                from .lazy_slicer import lazy_slice_context, lazy_slice_outline
+
+                opening_db = False
+                if args.outline:
+                    result = lazy_slice_outline(
+                        args.root,
+                        args.anchors,
+                        args.max_tokens,
+                        include_imports=args.include_imports,
+                        max_files=args.max_files,
+                        max_hops=args.max_hops,
+                        include_callers=not args.no_callers,
+                        render_estimator=_render_budget_estimator(args.format),
+                    )
+                else:
+                    result = lazy_slice_context(
+                        args.root,
+                        args.anchors,
+                        args.max_tokens,
+                        args.include_callee_bodies,
+                        max_files=args.max_files,
+                        max_hops=args.max_hops,
+                        include_callers=not args.no_callers,
+                        render_estimator=_render_budget_estimator(args.format),
+                        target_mode=args.target_mode,
+                        dedup_session=args.dedup_session_id or args.dedup_session,
+                    )
             else:
+                if args.cmd == "slice" and not args.db:
+                    raise CodeGraphError("slice requires --db or --root")
                 opening_db_path = str(Path(args.db).resolve())
                 if args.cmd != "sync":
                     store = stack.enter_context(GraphStore(args.db, readonly=True))
@@ -984,6 +1023,10 @@ def main(argv=None):
             hints.append(
                 "hint: for symbols you did not edit, add --snapshot to read the indexed bytes; "
                 "re-run sync for symbols you edited"
+            )
+        elif isinstance(exc, CodeGraphParseError):
+            hints.append(
+                "hint: re-run sync with --skip-unparseable to skip legacy or unparseable files"
             )
         elif isinstance(exc, AnchorNotFoundError):
             exact_leaf = getattr(exc, "exact_leaf_match", "")
