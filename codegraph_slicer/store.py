@@ -237,12 +237,46 @@ def _dedupe_analysis_symbols(analysis: FileAnalysis) -> FileAnalysis:
     )
 
 
-def _iter_workspace_files(root: Path) -> list[Path]:
+def _normalize_scopes(scope: tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+    if not scope:
+        return ()
+    out: set[str] = set()
+    for raw in scope:
+        text = str(raw).replace("\\", "/").strip()
+        if not text:
+            raise CodeGraphError("invalid empty scope path")
+        if text.startswith("/"):
+            raise CodeGraphError(f"invalid scope path outside repository: {raw!r}")
+        p = PurePosixPath(text.rstrip("/") or ".")
+        if p.is_absolute() or ".." in p.parts:
+            raise CodeGraphError(f"invalid scope path outside repository: {raw!r}")
+        norm = p.as_posix()
+        if norm == ".":
+            return ()
+        out.add(norm)
+    return tuple(sorted(out))
+
+
+def _in_scopes(rel_posix: str, scopes: tuple[str, ...]) -> bool:
+    if not scopes:
+        return True
+    return any(rel_posix == s or rel_posix.startswith(s + "/") for s in scopes)
+
+
+def _iter_workspace_files(root: Path, scopes: tuple[str, ...] = ()) -> list[Path]:
     found: set[Path] = set()
-    for ext in SUPPORTED_EXTENSIONS:
-        for path in root.rglob(f"*{ext}"):
-            if is_supported_source_path(path.name):
-                found.add(path)
+    roots = [root / s for s in scopes] if scopes else [root]
+    for base in roots:
+        if base.is_file():
+            if is_supported_source_path(base.name):
+                found.add(base)
+            continue
+        if not base.is_dir():
+            continue
+        for ext in SUPPORTED_EXTENSIONS:
+            for path in base.rglob(f"*{ext}"):
+                if is_supported_source_path(path.name):
+                    found.add(path)
     return sorted(found)
 
 
@@ -421,14 +455,22 @@ class GraphStore:
             if self.db.in_transaction:
                 self.db.rollback()
 
-    def sync_workspace(self, root, *, include_hidden: bool = False, skip_unparseable: bool = False):
+    def sync_workspace(
+        self,
+        root,
+        *,
+        include_hidden: bool = False,
+        skip_unparseable: bool = False,
+        scope=None,
+    ):
         root = Path(root).resolve(strict=True)
         if not root.is_dir():
             raise CodeGraphError(f"workspace root is not a directory: {root}")
         if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
             include_hidden = True
+        scopes = _normalize_scopes(scope)
         files = {}
-        for path in _iter_workspace_files(root):
+        for path in _iter_workspace_files(root, scopes):
             rel = path.relative_to(root)
             if _should_skip_rel_path(rel.parts, include_hidden):
                 continue
@@ -450,9 +492,18 @@ class GraphStore:
             tsconfig_bytes=tsconfig_bytes,
             include_hidden=include_hidden,
             skip_unparseable=skip_unparseable,
+            scopes=scopes,
         )
 
-    def sync_git_tree(self, root, revision, *, include_hidden: bool = False, skip_unparseable: bool = False):
+    def sync_git_tree(
+        self,
+        root,
+        revision,
+        *,
+        include_hidden: bool = False,
+        skip_unparseable: bool = False,
+        scope=None,
+    ):
         root = Path(root).resolve(strict=True)
         if not include_hidden and os.environ.get("CODEGRAPH_INCLUDE_HIDDEN") == "1":
             include_hidden = True
@@ -477,6 +528,7 @@ class GraphStore:
                 )
             return result.stdout
 
+        scopes = _normalize_scopes(scope)
         rev = git("rev-parse", "--verify", revision + "^{commit}").decode().strip()
         files = {}
         tsconfig_oid = None
@@ -500,7 +552,7 @@ class GraphStore:
                 name = valid_path(raw_path.decode("utf8"))
             except UnicodeError as exc:
                 raise CodeGraphError(f"non-UTF8 Python path: {raw_path!r}") from exc
-            if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden):
+            if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden) or not _in_scopes(name, scopes):
                 continue
             files[name] = ("git:" + oid.decode("ascii"), oid.decode("ascii"))
         cfg_oid = tsconfig_oid or jsconfig_oid
@@ -514,6 +566,7 @@ class GraphStore:
             tsconfig_bytes=tsconfig_bytes,
             include_hidden=include_hidden,
             skip_unparseable=skip_unparseable,
+            scopes=scopes,
         )
 
     def _sync(
@@ -527,6 +580,7 @@ class GraphStore:
         tsconfig_bytes=b"",
         include_hidden=False,
         skip_unparseable=False,
+        scopes=(),
     ):
         started = monotonic()
         base_digest = hashlib.sha256()
@@ -742,6 +796,7 @@ class GraphStore:
                 ("include_hidden", "1" if include_hidden else "0"),
                 ("tsconfig_sha", tsconfig_sha),
                 ("skipped_files", json.dumps(skipped, sort_keys=True)),
+                ("scopes", json.dumps(list(scopes))),
             ):
                 self.db.execute(
                     "INSERT INTO metadata(key,value) VALUES(?,?) "
@@ -772,12 +827,13 @@ class GraphStore:
         metadata = {
             row["key"]: row["value"]
             for row in self.db.execute(
-                "SELECT key,value FROM metadata WHERE key IN ('snapshot_root','snapshot_kind','snapshot_revision','include_hidden','tsconfig_sha','skipped_files')"
+                "SELECT key,value FROM metadata WHERE key IN ('snapshot_root','snapshot_kind','snapshot_revision','include_hidden','tsconfig_sha','skipped_files','scopes')"
             )
         }
         root_text = metadata.get("snapshot_root")
         kind = metadata.get("snapshot_kind")
         include_hidden = metadata.get("include_hidden") == "1"
+        scopes = tuple(json.loads(metadata.get("scopes") or "[]"))
         if not root_text or kind not in {"workspace", "git"}:
             raise StaleSnapshotError("snapshot freshness cannot be verified: missing source metadata; run codegraph-slicer sync ROOT --db DB")
         try:
@@ -794,7 +850,7 @@ class GraphStore:
                 )
             if kind == "workspace":
                 actual = {}
-                for path in _iter_workspace_files(root):
+                for path in _iter_workspace_files(root, scopes):
                     rel = path.relative_to(root)
                     if _should_skip_rel_path(rel.parts, include_hidden):
                         continue
@@ -827,11 +883,11 @@ class GraphStore:
                     if typ != b"blob" or mode not in {b"100644", b"100755"}:
                         raise StaleSnapshotError(f"snapshot source cannot be verified: non-regular Python source {raw_path!r}")
                     name = valid_path(raw_path.decode("utf8"))
-                    if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden):
+                    if _should_skip_rel_path(PurePosixPath(name).parts, include_hidden) or not _in_scopes(name, scopes):
                         continue
                     actual[name] = "git:" + oid.decode("ascii")
                 working = {}
-                for path in _iter_workspace_files(root):
+                for path in _iter_workspace_files(root, scopes):
                     rel = path.relative_to(root)
                     if ".git" in rel.parts:
                         continue

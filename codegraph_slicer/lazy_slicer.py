@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
+import sys
 from time import monotonic
 
 from .ast_extractor import (
@@ -20,7 +21,7 @@ from .ast_extractor import (
     is_supported_source_path,
     valid_path,
 )
-from .slicer import build_slice_outline, slice_context
+from .slicer import build_slice_outline, serialized_tokens, slice_context
 from .store import (
     GraphStore,
     _dedupe_analysis_symbols,
@@ -223,11 +224,14 @@ def _populate_lazy_store(
     max_hops = max(0, max_hops)
 
     seed_paths: list[str] = []
+    direct_seed_paths: set[str] = set()
     needles: list[str] = []
     for anchor in anchors:
         direct_path, needle = _anchor_seed_info(root, anchor)
-        if direct_path and direct_path not in seed_paths:
-            seed_paths.append(direct_path)
+        if direct_path:
+            direct_seed_paths.add(direct_path)
+            if direct_path not in seed_paths:
+                seed_paths.append(direct_path)
         if needle and needle not in needles:
             needles.append(needle)
         if not direct_path and needle:
@@ -268,6 +272,7 @@ def _populate_lazy_store(
 
     # Bounded hop expansion over imports / types / calls
     analyses_by_path = {}
+    parse_failures: dict[str, str] = {}
     for hop in range(max_hops + 1):
         if not frontier:
             break
@@ -285,7 +290,14 @@ def _populate_lazy_store(
                     source_root,
                     *([path_aliases] if path_aliases else []),
                 )
-            except CodeGraphParseError:
+            except CodeGraphParseError as exc:
+                if rel_p in direct_seed_paths:
+                    raise
+                if rel_p not in parse_failures:
+                    parse_failures[rel_p] = str(exc)
+                    sys.stderr.write(
+                        f"codegraph-slicer: warning: skipping unparseable file {rel_p}: {exc}\n"
+                    )
                 continue
             analyses_by_path[rel_p] = analysis
             if hop < max_hops:
@@ -310,6 +322,7 @@ def _populate_lazy_store(
     # Re-extract with unified layout and insert into an in-memory GraphStore
     source_root, packages = detect_layout(explored_raw.keys())
     store = GraphStore(":memory:")
+    indexed_count = 0
     store.db.execute("BEGIN IMMEDIATE")
     with store.db:
         taken_modules: set[str] = set()
@@ -324,7 +337,14 @@ def _populate_lazy_store(
                     source_root,
                     *([path_aliases] if path_aliases else []),
                 )
-            except CodeGraphParseError:
+            except CodeGraphParseError as exc:
+                if rel_p in direct_seed_paths:
+                    raise
+                if rel_p not in parse_failures:
+                    parse_failures[rel_p] = str(exc)
+                    sys.stderr.write(
+                        f"codegraph-slicer: warning: skipping unparseable file {rel_p}: {exc}\n"
+                    )
                 continue
             analysis = _dedupe_analysis_symbols(_disambiguate_analysis(raw_analysis, taken_modules))
             store.db.execute(
@@ -354,6 +374,7 @@ def _populate_lazy_store(
                 "INSERT INTO raw_edges VALUES(?,?,?,?,?)",
                 [(analysis.path, e.source, e.target, e.kind, e.line) for e in analysis.edges],
             )
+            indexed_count += 1
         store._rebind(source_root=source_root)
         for key, value in (
             ("snapshot_root", str(root)),
@@ -371,6 +392,10 @@ def _populate_lazy_store(
     coverage = {
         "mode": "lazy_target_seeded",
         "explored_files": len(explored_raw),
+        "indexed_files": indexed_count,
+        "failed_files": [
+            {"path": p, "error": err} for p, err in sorted(parse_failures.items())
+        ],
         "max_files": max_files,
         "max_hops": max_hops,
         "truncated": truncated,
@@ -381,6 +406,11 @@ def _populate_lazy_store(
         ),
     }
     return store, coverage
+
+
+def _wrap_coverage_estimator(render_estimator, coverage: dict):
+    base = render_estimator or serialized_tokens
+    return lambda candidate: base({**candidate, "coverage": coverage})
 
 
 def lazy_slice_context(
@@ -404,16 +434,19 @@ def lazy_slice_context(
         include_callers=include_callers,
     )
     try:
+        wrapped = _wrap_coverage_estimator(render_estimator, coverage)
         result = slice_context(
             store,
             anchors,
             max_tokens=max_tokens,
             include_callee_bodies=include_callee_bodies,
-            render_estimator=render_estimator,
+            render_estimator=wrapped,
             target_mode=target_mode,
             dedup_session=dedup_session,
         )
         result["coverage"] = coverage
+        if wrapped is not None:
+            result["tokens"] = wrapped(result)
         return result
     finally:
         store.close()
@@ -438,14 +471,17 @@ def lazy_slice_outline(
         include_callers=include_callers,
     )
     try:
+        wrapped = _wrap_coverage_estimator(render_estimator, coverage)
         result = build_slice_outline(
             store,
             anchors,
             max_tokens=max_tokens,
             include_imports=include_imports,
-            render_estimator=render_estimator,
+            render_estimator=wrapped,
         )
         result["coverage"] = coverage
+        if wrapped is not None:
+            result["tokens"] = wrapped(result)
         return result
     finally:
         store.close()

@@ -196,6 +196,43 @@ def _xml_attr(val):
     return _saxutils.quoteattr(str(val))
 
 
+def _xml_coverage(coverage: dict) -> list[str]:
+    failed = coverage.get("failed_files") or []
+    lines = [
+        f'  <coverage mode={_xml_attr(coverage.get("mode", ""))} '
+        f'explored_files="{coverage.get("explored_files", 0)}" '
+        f'indexed_files="{coverage.get("indexed_files", 0)}" '
+        f'max_files="{coverage.get("max_files", 0)}" '
+        f'max_hops="{coverage.get("max_hops", 0)}" '
+        f'truncated="{str(bool(coverage.get("truncated", False))).lower()}" '
+        f'failed_files="{len(failed)}" '
+        f'note={_xml_attr(coverage.get("note", ""))}>'
+    ]
+    for item in failed:
+        lines.append(
+            f'    <failed_file path={_xml_attr(item.get("path", ""))} '
+            f'error={_xml_attr(item.get("error", ""))} />'
+        )
+    lines.append("  </coverage>")
+    return lines
+
+
+def _markdown_coverage(coverage: dict) -> str:
+    failed = coverage.get("failed_files") or []
+    lines = [
+        "## Coverage",
+        f"- Mode: `{coverage.get('mode', '')}`",
+        f"- Files: {coverage.get('indexed_files', 0)} indexed / {coverage.get('explored_files', 0)} explored "
+        f"(budget: max_files={coverage.get('max_files', 0)}, max_hops={coverage.get('max_hops', 0)}, "
+        f"truncated={str(bool(coverage.get('truncated', False))).lower()})",
+    ]
+    if failed:
+        lines.append(f"- Parse failures ({len(failed)}): " + ", ".join(f"`{f['path']}`" for f in failed))
+    if coverage.get("note"):
+        lines.append(f"- Note: {coverage['note']}")
+    return "\n".join(lines)
+
+
 def _xml(result):
     return render_xml_report(result)
 
@@ -254,6 +291,8 @@ def render_xml_report(result):
                 if v:
                     blocks.append(f'    <{k} count="{v}" />')
             blocks.append("  </omitted>")
+        if result.get("coverage"):
+            blocks.extend(_xml_coverage(result["coverage"]))
         blocks.append("</slice_outline>")
         return "\n".join(blocks)
 
@@ -308,6 +347,8 @@ def render_xml_report(result):
 
     if "sections" in result:
         blocks = [f'<context tokens="{result.get("tokens", 0)}">']
+        if result.get("coverage"):
+            blocks.extend(_xml_coverage(result["coverage"]))
         if result.get("unresolved_anchors"):
             blocks.append("  <unresolved_anchors>")
             for anchor in result["unresolved_anchors"]:
@@ -503,6 +544,8 @@ def render_markdown_report(result):
                 f"- {name}: {count}"
                 for name, count in result["omitted"].items()
             )
+        if result.get("coverage"):
+            blocks.append(_markdown_coverage(result["coverage"]))
         return "\n\n".join(blocks)
     if "schema_version" in result and "files" in result and "edges" in result:
         blocks = [f"# Repository outline (schema v{result['schema_version']})"]
@@ -622,6 +665,8 @@ def render_markdown_report(result):
         )
     if "sections" in result:
         blocks = [f"Estimated context tokens: {result['tokens']}"]
+        if result.get("coverage"):
+            blocks.append(_markdown_coverage(result["coverage"]))
         if result.get("unresolved_anchors"):
             blocks.append(
                 "## unresolved anchors\n\n"
@@ -701,6 +746,7 @@ def main(argv=None):
     sync.add_argument("--db", "--database", dest="db", required=True, help="SQLite database to create or replace")
     sync.add_argument("--revision", help="Git revision to index instead of workspace files (default: workspace)")
     sync.add_argument("--skip-unparseable", action="store_true", help="skip source files that fail syntax parsing instead of aborting")
+    sync.add_argument("--scope", action="append", default=None, help="repo-relative directory or file to index (repeatable)")
     mapping = sub.add_parser(
         "map",
         help="rank files and render a bounded repository map",
@@ -914,9 +960,9 @@ def main(argv=None):
                 opening_db = False
                 if args.cmd == "sync":
                     result = sync_atomically(args.db, lambda store: (
-                        store.sync_git_tree(args.root, args.revision, skip_unparseable=args.skip_unparseable)
+                        store.sync_git_tree(args.root, args.revision, skip_unparseable=args.skip_unparseable, scope=args.scope)
                         if args.revision is not None
-                        else store.sync_workspace(args.root, skip_unparseable=args.skip_unparseable)
+                        else store.sync_workspace(args.root, skip_unparseable=args.skip_unparseable, scope=args.scope)
                     ))
                 elif args.cmd == "map":
                     if not args.snapshot:

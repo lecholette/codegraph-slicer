@@ -81,7 +81,10 @@ def is_test_path(path: str) -> bool:
         return any(part == "tests" for part in parts) or name.startswith("test_")
     if path.endswith(".java"):
         return (
-            any(part in {"test", "tests"} for part in parts[:-1])
+            any(
+                part in {"test", "tests"} or part.endswith(("-test", "-tests"))
+                for part in parts[:-1]
+            )
             or name.endswith(("Test.java", "Tests.java", "IT.java"))
             or name.startswith("Test")
         )

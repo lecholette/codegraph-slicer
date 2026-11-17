@@ -27,6 +27,10 @@ codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
 codegraph-slicer slice --snapshot --db "$GRAPH" --max-tokens 8000 --format xml \
   path/to/FileA.ext:ClassA.methodA \
   path/to/FileB.ext:ClassB
+
+# Or on huge unindexed monorepos (no upfront sync): target-seeded lazy slice (~1-2s)
+codegraph-slicer slice --root . --max-tokens 8000 --format xml \
+  path/to/FileA.ext:ClassA.methodA
 ```
 
 ## Routing Precedence (When to Slice vs. Read Directly)
@@ -55,6 +59,7 @@ codegraph-slicer sync . --db "$GRAPH"
 ```
 
 Sync is incremental: unchanged files are not reparsed, so re-run it whenever source changed.
+For large monorepos, pass repeatable `--scope <dir>` (`codegraph-slicer sync . --scope mod-a --scope shared --db "$GRAPH"`) to index only the relevant modules while keeping repo-root paths.
 If a polyglot or legacy repo fails on an unparseable file (e.g., an old Python 2 script), pass `--skip-unparseable` (`codegraph-slicer sync . --skip-unparseable --db "$GRAPH"`).
 `map`, `slice`, `impact` and `flow` exit 2 with `StaleSnapshotError` when files changed since the sync.
 Re-sync for symbols you edited. For symbols you did not edit, `--snapshot` (a boolean flag taking no argument) reads the indexed bytes without a re-sync.
@@ -67,6 +72,7 @@ Errors go to stderr with exit 2. An empty result is exit 0.
 - Orient: `codegraph-slicer map --db "$GRAPH" --recommend-workflow --seed package.module --format markdown` (default budget 2000; a large seed file may need `--max-tokens 8000`)
 - Plan workflow & localize anchors (`<25` ms): `codegraph-slicer route --db "$GRAPH" --prompt "<task>" --format json`
 - One function/method with its types, production callers and callees: `codegraph-slicer slice --db "$GRAPH" package.module:func --format xml` (use `--outline` or `impact` to include test callers)
+- Lazy target-seeded slice without upfront `sync` (ideal for 10k+ file monorepos when you already have a path/symbol anchor): `codegraph-slicer slice --root . path/to/File.java:Class.method --format xml` (bounded by `--max-files 40`, `--max-hops 2`, `--no-callers`)
 - Several symbols: pass every anchor to one `slice` call (`slice --db "$GRAPH" pkg.mod:a pkg.mod:b --format xml`), not a shell loop. One call deduplicates enclosing classes, shared types, and callers across anchors.
 - Structure only (callers, callees, types, no bodies): `slice --outline`. Outlines are not always small; keep the default budget.
 - Bounded transitive callers: `codegraph-slicer impact package.module:func --db "$GRAPH" --max-depth 3 --max-nodes 200 --format markdown` (or `--format xml`)
@@ -90,6 +96,7 @@ Anchors: `pkg.mod:qualname`, `pkg.mod:` (whole module), `path/file.py:qualname`,
 ## Limits (state them when you cite output)
 
 - Output is static evidence, not a verdict. Unresolved references do not prove absence; confirm with `grep`.
+- In `slice --root` (lazy mode), only seed files, resolved imports/types, and grep-matched candidate callers within `--max-files` / `--max-hops` are indexed; check `coverage` in the output and never treat unexplored callers as absent.
 - `impact` follows resolved `CALLS` edges backward with explicit depth and caller-node bounds. Its witnesses show call reachability, not value flow or runtime execution. It reports unresolved `CALLS` references across the indexed snapshot as potential unknown boundaries, not linked to the selected anchor; excess boundary records are counted and a truncated walk is not a complete impact set.
 - `flow` is function-local. Calls are opaque. Aliases and implicit exceptions are not modelled.
 - `flow` models `try`/`except`/`finally`, `with`, `async with` and comprehensions conservatively. It refuses `await`, `yield`, lambdas, nested definitions and imports with a source location. Use `slice` for those.
