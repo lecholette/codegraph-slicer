@@ -386,3 +386,133 @@ def test_direct_unit_coverage_of_service_readiness_helpers(tmp_path):
         assert "m:Server.handle_req" in chosen
         assert unresolved == ["m:missing"]
 
+
+def test_diagnostics_indexes_and_chained_call_suppression(tmp_path):
+    """Diagnostics table has source_file/source_id indexes and suppresses chained-call '?' noise."""
+    files = {
+        "src/main/java/com/acme/OrderService.java": (
+            "package com.acme;\n"
+            "public class OrderService {\n"
+            "    public String run() {\n"
+            "        this.unknownField.doWork();\n"
+            "        return builder().stepA().stepB().build();\n"
+            "    }\n"
+            "}\n"
+        ),
+        "web/client.ts": (
+            "export function load(svc: any) {\n"
+            "  svc.ping();\n"
+            "  return fetchData().then(x => x).catch(() => null);\n"
+            "}\n"
+        ),
+    }
+    with _workspace_fixture(files) as (store, _, _):
+        idx_names = {row["name"] for row in store.rows("PRAGMA index_list('diagnostics')")}
+        assert {"df", "ds"}.issubset(idx_names)
+
+        java_diags = [
+            row["target"]
+            for row in store.rows(
+                "SELECT target FROM diagnostics WHERE source_file='src/main/java/com/acme/OrderService.java'"
+            )
+        ]
+        assert "?this.unknownField.doWork" in java_diags
+        assert not any("(" in t for t in java_diags)
+
+        ts_diags = [
+            row["target"]
+            for row in store.rows(
+                "SELECT target FROM diagnostics WHERE source_file='web/client.ts'"
+            )
+        ]
+        assert "?svc.ping" in ts_diags
+        assert not any("(" in t for t in ts_diags)
+
+
+def test_multi_anchor_condenses_depth2_types_before_overflow(tmp_path):
+    """4-anchor slice condenses/drops depth-2 transitive types to stay within max_tokens=8000."""
+    files = {}
+    for i in range(40):
+        fields = "\n".join(f'    public String leaf_{i}_{j} = "val_{j}";' for j in range(12))
+        files[f"src/main/java/com/acme/LeafDto{i:02d}.java"] = (
+            f"package com.acme;\npublic class LeafDto{i:02d} {{\n{fields}\n}}\n"
+        )
+    for c in range(4):
+        leaf_imports = "\n".join(
+            f"import com.acme.LeafDto{i:02d};" for i in range(c * 10, (c + 1) * 10)
+        )
+        leaf_fields = "\n".join(
+            f"    public LeafDto{i:02d} leaf{i};" for i in range(c * 10, (c + 1) * 10)
+        )
+        files[f"src/main/java/com/acme/MidModel{c}.java"] = (
+            f"package com.acme;\n{leaf_imports}\npublic class MidModel{c} {{\n{leaf_fields}\n}}\n"
+        )
+        files[f"src/main/java/com/acme/Handler{c}.java"] = (
+            f"package com.acme;\nimport com.acme.MidModel{c};\n"
+            f"public class Handler{c} {{\n"
+            f"    public String handle(MidModel{c} model) {{\n"
+            f"        return model.toString();\n"
+            f"    }}\n}}\n"
+        )
+
+    with _workspace_fixture(files) as (store, _, db_path):
+        anchors = [
+            f"src/main/java/com/acme/Handler{c}.java:Handler{c}.handle" for c in range(4)
+        ]
+        res = slice_context(store, anchors, max_tokens=8000, database=db_path)
+        assert res["tokens"] <= 8000
+        assert len(res["sections"]["target_implementations"]) == 4
+
+
+def test_ts_workspace_prunes_node_modules_reads_tsconfig_base_and_includes_interfaces(tmp_path):
+    """_iter_workspace_files prunes node_modules, tsconfig.base.json aliases resolve, and TS interfaces appear in types_and_schemas."""
+    files = {
+        "tsconfig.json": '{\n  "extends": "./tsconfig.base.json"\n}\n',
+        "tsconfig.base.json": '{\n  "compilerOptions": {\n    "baseUrl": ".",\n    "paths": {\n      "@shared/*": ["libs/shared/src/*"]\n    }\n  }\n}\n',
+        "libs/shared/src/models.ts": "export interface UserContract {\n  id: string;\n  email: string;\n}\n",
+        "apps/web/service.ts": (
+            "import { UserContract } from '@shared/models';\n"
+            "export class UserService {\n"
+            "  getUser(u: UserContract): string {\n"
+            "    return u.email;\n"
+            "  }\n"
+            "}\n"
+        ),
+        "node_modules/pkg/index.ts": "export const ignored = 1;\n",
+    }
+    with _workspace_fixture(files) as (store, _, db_path):
+        indexed_files = {row["path"] for row in store.rows("SELECT path FROM files")}
+        assert "node_modules/pkg/index.ts" not in indexed_files
+        res = slice_context(
+            store, ["apps/web/service.ts:UserService.getUser"], max_tokens=8000, database=db_path
+        )
+        type_syms = {entry["symbol"] for entry in res["sections"]["types_and_schemas"]}
+        assert "libs.shared.src.models:UserContract" in type_syms
+
+
+def test_ts_generic_tagged_template_literal_parses_cleanly(tmp_path):
+    """CSS-in-JS generic tagged template literals (styled.div<Props>`...`) do not raise syntax error."""
+    from codegraph_slicer.ts_extractor import extract_typescript_file
+
+    files = {
+        "ui/layout.styles.ts": (
+            "import styled from 'styled-components';\n"
+            "export const ContentArea = styled.main<{\n"
+            "  $pinBottom?: boolean;\n"
+            "  $showGradient?: boolean;\n"
+            "}>`\n"
+            "  flex: 1;\n"
+            "  display: flex;\n"
+            "  justify-content: ${({ $pinBottom }) => ($pinBottom ? 'flex-end' : 'flex-start')};\n"
+            "`;\n"
+        ),
+    }
+    direct = extract_typescript_file(
+        "ui/layout.styles.ts", files["ui/layout.styles.ts"].encode("utf-8")
+    )
+    assert direct.symbols
+    with _workspace_fixture(files) as (store, _, _):
+        syms = {row["symbol_id"] for row in store.rows("SELECT symbol_id FROM symbols")}
+        assert "ui.layout.styles:" in syms
+        assert store.rows("SELECT value FROM metadata WHERE key='skipped_files'")[0]["value"] == "{}"
+

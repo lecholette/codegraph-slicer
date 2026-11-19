@@ -83,6 +83,25 @@ def test_skipped_languages_do_not_disable_complete_language_graphs():
     assert test_only["skipped_languages"] == ["java"]
     assert _rec([], {"legacy.py": "sha256:x"})["reason"] == "incomplete_index"
 
+    # Small percentage (<= 2%, e.g. 2 of 512 = 0.39% or exact 1 of 50 = 2.0%) of unparseable files should not bypass slicer
+    large_java = [(f"src/main/java/acme/Service{i}.java", 200) for i in range(510)]
+    minor_skip = _rec(
+        large_java,
+        {
+            "src/main/java/acme/Broken1.java": "sha256:x",
+            "src/main/java/acme/Broken2.java": "sha256:y",
+        },
+    )
+    assert minor_skip["bypass_slicer"] is False
+    assert minor_skip["reason"] == "graph_candidate"
+    assert minor_skip["skipped_files"] == 2
+    exact_two_pct = _rec(
+        [(f"src/main/java/acme/Service{i}.java", 200) for i in range(49)],
+        {"src/main/java/acme/Broken1.java": "sha256:x"},
+    )
+    assert exact_two_pct["bypass_slicer"] is False
+    assert exact_two_pct["reason"] == "graph_candidate"
+
 
 @pytest.mark.parametrize("outline", [False, True])
 @pytest.mark.parametrize("fmt", ["json", "markdown", "xml"])

@@ -10,6 +10,7 @@ import sqlite3
 import stat
 from collections import Counter
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 import xml.sax.saxutils as _saxutils
 
@@ -196,40 +197,72 @@ def _xml_attr(val):
     return _saxutils.quoteattr(str(val))
 
 
+@dataclass(frozen=True)
+class _CoverageView:
+    mode: str
+    explored_files: int
+    indexed_files: int
+    max_files: int
+    max_hops: int
+    truncated: bool
+    failed_files: tuple[tuple[str, str], ...]
+    note: str
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "_CoverageView":
+        failed = tuple(
+            (str(item.get("path", "")), str(item.get("error", "")))
+            for item in (raw.get("failed_files") or ())
+        )
+        return cls(
+            mode=str(raw.get("mode", "")),
+            explored_files=int(raw.get("explored_files", 0)),
+            indexed_files=int(raw.get("indexed_files", 0)),
+            max_files=int(raw.get("max_files", 0)),
+            max_hops=int(raw.get("max_hops", 0)),
+            truncated=bool(raw.get("truncated", False)),
+            failed_files=failed,
+            note=str(raw.get("note", "")),
+        )
+
+
 def _xml_coverage(coverage: dict) -> list[str]:
-    failed = coverage.get("failed_files") or []
+    cov = _CoverageView.from_dict(coverage)
     lines = [
-        f'  <coverage mode={_xml_attr(coverage.get("mode", ""))} '
-        f'explored_files="{coverage.get("explored_files", 0)}" '
-        f'indexed_files="{coverage.get("indexed_files", 0)}" '
-        f'max_files="{coverage.get("max_files", 0)}" '
-        f'max_hops="{coverage.get("max_hops", 0)}" '
-        f'truncated="{str(bool(coverage.get("truncated", False))).lower()}" '
-        f'failed_files="{len(failed)}" '
-        f'note={_xml_attr(coverage.get("note", ""))}>'
+        f'  <coverage mode={_xml_attr(cov.mode)} '
+        f'explored_files="{cov.explored_files}" '
+        f'indexed_files="{cov.indexed_files}" '
+        f'max_files="{cov.max_files}" '
+        f'max_hops="{cov.max_hops}" '
+        f'truncated="{str(cov.truncated).lower()}" '
+        f'failed_files="{len(cov.failed_files)}" '
+        f'note={_xml_attr(cov.note)}>'
     ]
-    for item in failed:
+    for path, error in cov.failed_files:
         lines.append(
-            f'    <failed_file path={_xml_attr(item.get("path", ""))} '
-            f'error={_xml_attr(item.get("error", ""))} />'
+            f'    <failed_file path={_xml_attr(path)} '
+            f'error={_xml_attr(error)} />'
         )
     lines.append("  </coverage>")
     return lines
 
 
 def _markdown_coverage(coverage: dict) -> str:
-    failed = coverage.get("failed_files") or []
+    cov = _CoverageView.from_dict(coverage)
     lines = [
         "## Coverage",
-        f"- Mode: `{coverage.get('mode', '')}`",
-        f"- Files: {coverage.get('indexed_files', 0)} indexed / {coverage.get('explored_files', 0)} explored "
-        f"(budget: max_files={coverage.get('max_files', 0)}, max_hops={coverage.get('max_hops', 0)}, "
-        f"truncated={str(bool(coverage.get('truncated', False))).lower()})",
+        f"- Mode: `{cov.mode}`",
+        f"- Files: {cov.indexed_files} indexed / {cov.explored_files} explored "
+        f"(budget: max_files={cov.max_files}, max_hops={cov.max_hops}, "
+        f"truncated={str(cov.truncated).lower()})",
     ]
-    if failed:
-        lines.append(f"- Parse failures ({len(failed)}): " + ", ".join(f"`{f['path']}`" for f in failed))
-    if coverage.get("note"):
-        lines.append(f"- Note: {coverage['note']}")
+    if cov.failed_files:
+        lines.append(
+            f"- Parse failures ({len(cov.failed_files)}): "
+            + ", ".join(f"`{path}`" for path, _ in cov.failed_files)
+        )
+    if cov.note:
+        lines.append(f"- Note: {cov.note}")
     return "\n".join(lines)
 
 
@@ -446,6 +479,22 @@ def _classify_scale(
     return "graph_optional", False, [], "graph_candidate"
 
 
+def _is_incomplete_production_index(
+    files: int, skipped, languages: list[str]
+) -> bool:
+    if not skipped:
+        return False
+    if not files:
+        return True
+    skipped_prod = [
+        path
+        for path in skipped
+        if not is_test_path(path) and _file_language(path) in languages
+    ]
+    total_prod = files + len(skipped_prod)
+    return bool(skipped_prod) and (len(skipped_prod) / total_prod) > 0.02
+
+
 def _scale_recommendation(store: GraphStore):
     from .router import inspect_scale_structure
 
@@ -459,13 +508,13 @@ def _scale_recommendation(store: GraphStore):
     loc = sum(row["loc"] for row in production)
     languages = sorted({_file_language(row["path"]) for row in production})
     skipped_languages = sorted({_file_language(path) for path in skipped})
-    incomplete = any(not is_test_path(path) and _file_language(path) in languages for path in skipped)
+    incomplete = _is_incomplete_production_index(files, skipped, languages)
     structure = inspect_scale_structure(store, production)
     mode, bypass, commands, reason = _classify_scale(
         files,
         loc,
         languages,
-        skipped and (not files or incomplete),
+        incomplete,
         has_monolith=bool(structure.slice_targets),
         cross_file_edges=structure.cross_file_edges,
     )
@@ -730,7 +779,7 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.10")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.11")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",

@@ -2045,6 +2045,75 @@ def slice_context(
         )
 
 
+def _condense_depth2_types_to_signatures(
+    depth2_entries: list[dict],
+    sections: dict,
+    types: dict,
+    item_fn,
+    result_fn,
+    required: dict,
+    max_tokens: int,
+) -> dict:
+    for entry in depth2_entries:
+        if required["tokens"] <= max_tokens:
+            break
+        tsid = entry["symbol"]
+        if tsid in types:
+            sig_entry = item_fn(types[tsid], False)
+            if len(sig_entry["text"]) < len(entry["text"]):
+                sections["types_and_schemas"] = [
+                    sig_entry if e["symbol"] == tsid else e
+                    for e in sections["types_and_schemas"]
+                ]
+                required = result_fn()
+    return required
+
+
+def _drop_depth2_types(
+    depth2_entries: list[dict],
+    sections: dict,
+    result_fn,
+    required: dict,
+    max_tokens: int,
+) -> dict:
+    for entry in depth2_entries:
+        if required["tokens"] <= max_tokens:
+            break
+        tsid = entry["symbol"]
+        sections["types_and_schemas"] = [
+            e for e in sections["types_and_schemas"] if e["symbol"] != tsid
+        ]
+        required = result_fn()
+    return required
+
+
+def _condense_or_drop_depth2_types(
+    sections: dict,
+    types: dict,
+    type_depths: dict[str, int],
+    item_fn,
+    result_fn,
+    required: dict,
+    max_tokens: int,
+) -> dict:
+    depth2_entries = sorted(
+        (
+            e
+            for e in sections["types_and_schemas"]
+            if type_depths.get(e["symbol"], 1) > 1
+        ),
+        key=lambda e: (-type_depths.get(e["symbol"], 1), -len(e["text"]), e["symbol"]),
+    )
+    required = _condense_depth2_types_to_signatures(
+        depth2_entries, sections, types, item_fn, result_fn, required, max_tokens
+    )
+    if required["tokens"] > max_tokens:
+        required = _drop_depth2_types(
+            depth2_entries, sections, result_fn, required, max_tokens
+        )
+    return required
+
+
 def _verified_overflow_budget(
     store,
     anchors,
@@ -2103,6 +2172,7 @@ def _slice_context_in_snapshot(
     item = _slice_item
     all_target_in_test = all(_is_test_symbol(r) for r in chosen.values())
     types = {}
+    type_depths: dict[str, int] = {}
     callers = {}
     caller_lines = {}
     callees = {}
@@ -2144,6 +2214,7 @@ def _slice_context_in_snapshot(
                 )
                 if enc_rows:
                     types[enclosing_class_sid] = enc_rows[0]
+                    type_depths.setdefault(enclosing_class_sid, 1)
                     enclosing_py_classes.add(enclosing_class_sid)
         elif row["kind"] == "class":
             for mrow in store.rows(
@@ -2157,15 +2228,19 @@ def _slice_context_in_snapshot(
                     SELECT ?,0 UNION SELECT e.target_id,c.depth+1 FROM edges e
                     JOIN closure c ON e.source_id=c.node
                     WHERE e.kind IN ('USES_TYPE','INHERITS') AND c.depth<?
-                ) SELECT DISTINCT s.* FROM symbols s JOIN closure c ON s.symbol_id=c.node
-                    WHERE c.depth>0 AND s.kind IN ('class','type_alias') ORDER BY s.symbol_id""",
+                ) SELECT s.*, MIN(c.depth) AS type_depth FROM symbols s JOIN closure c ON s.symbol_id=c.node
+                    WHERE c.depth>0 AND s.kind IN ('class','type_alias','interface')
+                    GROUP BY s.symbol_id ORDER BY s.symbol_id""",
                 (seed_id, max_type_depth),
             ):
+                tsid = related["symbol_id"]
                 if (
-                    related["symbol_id"] not in chosen
-                    and related["symbol_id"] not in chosen_enclosing_classes
+                    tsid not in chosen
+                    and tsid not in chosen_enclosing_classes
                 ):
-                    types[related["symbol_id"]] = related
+                    types[tsid] = related
+                    d = int(related["type_depth"])
+                    type_depths[tsid] = min(type_depths.get(tsid, d), d)
         caller_seeds, callee_seeds = _collect_class_call_seeds(store, sid, row)
         for c_seed in caller_seeds:
             for related in store.rows(
@@ -2422,6 +2497,10 @@ def _slice_context_in_snapshot(
         ]
         required = _condense_multi_anchor_targets(
             store, chosen, sections, result, database, max_tokens, soft_target_cap=soft_cap
+        )
+    if required["tokens"] > max_tokens and len(chosen) > 1 and max_tokens >= 2000:
+        required = _condense_or_drop_depth2_types(
+            sections, types, type_depths, item, result, required, max_tokens
         )
     if required["tokens"] > max_tokens and any(
         totals[name] > len(sections[name])

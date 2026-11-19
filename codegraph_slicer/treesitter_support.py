@@ -38,7 +38,7 @@ def _bundled_wheel_parser(grammar: str):
             import tree_sitter_javascript
 
             return Parser(Language(tree_sitter_javascript.language()))
-    except Exception:
+    except (ImportError, OSError, TypeError, ValueError, AttributeError, RuntimeError):
         return None
     return None
 
@@ -66,24 +66,40 @@ def parser_for(grammar: str):
         raise
 
 
-def _has_non_jsx_syntax_error(root, data: bytes) -> bool:
+def _is_ts_tagged_template_false_positive(node, data: bytes) -> bool:
+    return (
+        node.type == "!"
+        and node.parent is not None
+        and node.parent.type == "non_null_expression"
+        and data[node.start_byte :].lstrip().startswith(b"`")
+    )
+
+
+def _is_jsx_ampersand_error(node, data: bytes) -> bool:
+    raw_err = data[node.start_byte : node.end_byte]
+    if b"&" not in raw_err:
+        return False
+    curr = node.parent
+    while curr is not None:
+        if curr.type == "jsx_expression":
+            return False
+        if (
+            curr.type in {"jsx_element", "jsx_self_closing_element", "jsx_Opening_element"}
+            or curr.type.startswith("jsx_")
+        ):
+            return True
+        curr = curr.parent
+    return False
+
+
+def _has_non_jsx_syntax_error(root, data: bytes, grammar: str = "tsx") -> bool:
     for node in descendants(root):
         if node.type == "ERROR" or node.is_missing:
             if node.is_missing:
+                if _is_ts_tagged_template_false_positive(node, data):
+                    continue
                 return True
-            raw_err = data[node.start_byte : node.end_byte]
-            if b"&" not in raw_err:
-                return True
-            curr = node.parent
-            in_jsx_text = False
-            while curr is not None:
-                if curr.type == "jsx_expression":
-                    return True
-                if curr.type in {"jsx_element", "jsx_self_closing_element", "jsx_Opening_element"} or curr.type.startswith("jsx_"):
-                    in_jsx_text = True
-                    break
-                curr = curr.parent
-            if not in_jsx_text:
+            if grammar != "tsx" or not _is_jsx_ampersand_error(node, data):
                 return True
     return False
 
@@ -107,7 +123,8 @@ def parse_tree(source: bytes, path: str, grammar: str):
     data = text.encode("utf-8")
     tree = parser_for(grammar).parse(data)
     if tree.root_node.has_error and (
-        grammar != "tsx" or _has_non_jsx_syntax_error(tree.root_node, data)
+        grammar not in {"tsx", "typescript"}
+        or _has_non_jsx_syntax_error(tree.root_node, data, grammar)
     ):
         raise CodeGraphParseError(f"cannot parse {path}: syntax error")
     return text, data, tree.root_node

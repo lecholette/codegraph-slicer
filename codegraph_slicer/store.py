@@ -267,7 +267,23 @@ def _in_scopes(rel_posix: str, scopes: tuple[str, ...]) -> bool:
     return any(rel_posix == s or rel_posix.startswith(s + "/") for s in scopes)
 
 
-def _iter_workspace_files(root: Path, scopes: tuple[str, ...] = ()) -> list[Path]:
+def _walk_workspace_dir(
+    base: Path, include_hidden: bool, found: set[Path]
+) -> None:
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in _SKIP_DIRS and (include_hidden or not d.startswith("."))
+        ]
+        for fname in filenames:
+            if (include_hidden or not fname.startswith(".")) and is_supported_source_path(fname):
+                found.add(Path(dirpath) / fname)
+
+
+def _iter_workspace_files(
+    root: Path, scopes: tuple[str, ...] = (), *, include_hidden: bool = False
+) -> list[Path]:
     found: set[Path] = set()
     roots = [root / s for s in scopes] if scopes else [root]
     for base in roots:
@@ -275,20 +291,25 @@ def _iter_workspace_files(root: Path, scopes: tuple[str, ...] = ()) -> list[Path
             if is_supported_source_path(base.name):
                 found.add(base)
             continue
-        if not base.is_dir():
-            continue
-        for ext in SUPPORTED_EXTENSIONS:
-            for path in base.rglob(f"*{ext}"):
-                if is_supported_source_path(path.name):
-                    found.add(path)
+        if base.is_dir():
+            _walk_workspace_dir(base, include_hidden, found)
     return sorted(found)
 
 
 def _read_ts_or_js_config(root: Path) -> bytes:
-    for cfg_name in ("tsconfig.json", "jsconfig.json"):
+    from .ts_extractor import parse_tsconfig_paths
+
+    for cfg_name in ("tsconfig.json", "tsconfig.base.json", "jsconfig.json"):
         cfg_path = root / cfg_name
         if cfg_path.is_file() and not cfg_path.is_symlink():
-            return cfg_path.read_bytes()
+            data = cfg_path.read_bytes()
+            if cfg_name == "tsconfig.json" and not parse_tsconfig_paths(data):
+                base_cfg = root / "tsconfig.base.json"
+                if base_cfg.is_file() and not base_cfg.is_symlink():
+                    base_data = base_cfg.read_bytes()
+                    if parse_tsconfig_paths(base_data):
+                        return base_data
+            return data
     return b""
 
 
@@ -435,6 +456,8 @@ class GraphStore:
                 CREATE INDEX IF NOT EXISTS sm ON symbols(module);
                 CREATE INDEX IF NOT EXISTS sq ON symbols(qualname);
                 CREATE INDEX IF NOT EXISTS sf ON symbols(file_path,qualname,kind,cx);
+                CREATE INDEX IF NOT EXISTS df ON diagnostics(source_file);
+                CREATE INDEX IF NOT EXISTS ds ON diagnostics(source_id);
             """)
 
     def __enter__(self):
@@ -474,7 +497,7 @@ class GraphStore:
             include_hidden = True
         scopes = _normalize_scopes(scope)
         files = {}
-        for path in _iter_workspace_files(root, scopes):
+        for path in _iter_workspace_files(root, scopes, include_hidden=include_hidden):
             rel = path.relative_to(root)
             if _should_skip_rel_path(rel.parts, include_hidden):
                 continue
@@ -854,7 +877,7 @@ class GraphStore:
                 )
             if kind == "workspace":
                 actual = {}
-                for path in _iter_workspace_files(root, scopes):
+                for path in _iter_workspace_files(root, scopes, include_hidden=include_hidden):
                     rel = path.relative_to(root)
                     if _should_skip_rel_path(rel.parts, include_hidden):
                         continue
@@ -891,7 +914,7 @@ class GraphStore:
                         continue
                     actual[name] = "git:" + oid.decode("ascii")
                 working = {}
-                for path in _iter_workspace_files(root, scopes):
+                for path in _iter_workspace_files(root, scopes, include_hidden=True):
                     rel = path.relative_to(root)
                     if ".git" in rel.parts:
                         continue
@@ -934,28 +957,35 @@ class GraphStore:
             if row["module"] != raw_mod:
                 lang_mod_map[(_lang_group(row["path"]), raw_mod)] = row["module"]
 
+        rewrite_cache: dict[tuple[str, str], str] = {}
+
         def _rewrite_lang_target(t: str, lg: str) -> str:
             if not lang_mod_map or t.startswith("?"):
                 return t
+            key = (t, lg)
+            if key in rewrite_cache:
+                return rewrite_cache[key]
+            out = t
             if MODULE_END in t:
                 mod_part, sep, rest = t.partition(MODULE_END)
                 mapped = lang_mod_map.get((lg, mod_part))
                 if mapped:
-                    return f"{mapped}{sep}{rest}"
-                return t
-            if ":" in t:
+                    out = f"{mapped}{sep}{rest}"
+            elif ":" in t:
                 mod_part, sep, rest = t.partition(":")
                 mapped = lang_mod_map.get((lg, mod_part))
                 if mapped:
-                    return f"{mapped}{sep}{rest}"
-                return t
-            parts = t.split(".")
-            for idx in range(len(parts), 0, -1):
-                prefix = ".".join(parts[:idx])
-                mapped = lang_mod_map.get((lg, prefix))
-                if mapped:
-                    return ".".join([mapped, *parts[idx:]])
-            return t
+                    out = f"{mapped}{sep}{rest}"
+            else:
+                parts = t.split(".")
+                for idx in range(len(parts), 0, -1):
+                    prefix = ".".join(parts[:idx])
+                    mapped = lang_mod_map.get((lg, prefix))
+                    if mapped:
+                        out = ".".join([mapped, *parts[idx:]])
+                        break
+            rewrite_cache[key] = out
+            return out
 
         # Module-level import bindings: "pkg.Name" -> dotted import target.
         aliases = {
@@ -1050,7 +1080,12 @@ class GraphStore:
                     return candidate
             return None
 
+        resolve_cache: dict[str, str | None] = {}
+
         def resolve(target):
+            if target in resolve_cache:
+                return resolve_cache[target]
+            orig_target = target
             applied = set()  # an alias applied twice is a cycle, even if the target grows
             while True:
                 # The import system resolves the module path; after it, follow the
@@ -1066,6 +1101,7 @@ class GraphStore:
                     if bound is None or plain_target(bound) == prefix:  # `from . import sub`
                         continue
                     if prefix in applied:
+                        resolve_cache[orig_target] = None
                         return None
                     applied.add(prefix)
                     target = ".".join([bound, *parts[index:]])
@@ -1073,12 +1109,14 @@ class GraphStore:
                 else:
                     found = direct(target, module_parts)
                     if found is not None:
+                        resolve_cache[orig_target] = found
                         return found
                     if module_parts >= 1 and len(parts) > module_parts and parts[module_parts].startswith("__cjs__"):
                         mod_prefix = ".".join(parts[:module_parts])
                         rest = [parts[module_parts][len("__cjs__") :], *parts[module_parts + 1 :]]
                         target = ".".join([mod_prefix, *rest])
                         continue
+                    resolve_cache[orig_target] = None
                     return None
 
         _META_KINDS = (
@@ -1096,6 +1134,7 @@ class GraphStore:
         self.db.execute("DELETE FROM edges")
         self.db.execute("DELETE FROM diagnostics")
         unresolved_rows = []
+        resolved_edge_rows: list[tuple[str, str, str, str, int]] = []
         for row in self.db.execute(
             f"SELECT * FROM raw_edges WHERE kind NOT IN ({','.join('?' for _ in _META_KINDS)}) "
             "ORDER BY source_file,source_id,target_id,kind,line",
@@ -1108,27 +1147,39 @@ class GraphStore:
             if target is None:
                 unresolved_rows.append((row, raw_target))
             else:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+                resolved_edge_rows.append(
                     (
                         row["source_file"],
                         row["source_id"],
                         target,
                         row["kind"],
                         row["line"],
-                    ),
+                    )
                 )
+        if resolved_edge_rows:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+                resolved_edge_rows,
+            )
         self._resolve_cross_file_calls(
             symbols, file_lang, _rewrite_lang_target, resolve, unresolved_rows
         )
-        for row in self.db.execute(
-            "SELECT symbol_id,file_path,module,qualname FROM symbols WHERE kind!='module'"
-        ).fetchall():
-            qualname = row["qualname"]
-            parent = row["module"] + ":" + qualname.rpartition(".")[0]
-            self.db.execute(
+        defines_rows = [
+            (
+                row["file_path"],
+                row["module"] + ":" + row["qualname"].rpartition(".")[0],
+                row["symbol_id"],
+                "DEFINES",
+                0,
+            )
+            for row in self.db.execute(
+                "SELECT symbol_id,file_path,module,qualname FROM symbols WHERE kind!='module'"
+            ).fetchall()
+        ]
+        if defines_rows:
+            self.db.executemany(
                 "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
-                (row["file_path"], parent, row["symbol_id"], "DEFINES", 0),
+                defines_rows,
             )
 
     def _load_type_facts(self, file_lang, rewrite_target, resolve):
@@ -1158,7 +1209,14 @@ class GraphStore:
                 field_types[(cls_sid, fname)].append(ft)
         return class_bases, return_types, field_types
 
-    def _emit_resolved_call(self, src_file: str, src_id: str, tgt: str, line: int):
+    def _emit_resolved_call(
+        self, src_file: str, src_id: str, tgt: str, line: int, edge_buf=None
+    ):
+        if edge_buf is not None:
+            edge_buf.append((src_file, src_id, tgt, "CALLS", line))
+            if is_test_path(src_file):
+                edge_buf.append((src_file, src_id, tgt, "TESTS", line))
+            return
         self.db.execute(
             "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
             (src_file, src_id, tgt, "CALLS", line),
@@ -1169,21 +1227,24 @@ class GraphStore:
                 (src_file, src_id, tgt, "TESTS", line),
             )
 
-    def _emit_diagnostic(self, src_file: str, src_id: str, tgt: str, kind: str, line: int):
-        self.db.execute(
-            "INSERT INTO diagnostics VALUES(?,?,?,?,?,?)",
-            (
-                src_file,
-                src_id,
-                tgt,
-                kind,
-                line,
-                "external, dynamic, shadowed, or unobserved reference",
-            ),
+    def _emit_diagnostic(
+        self, src_file: str, src_id: str, tgt: str, kind: str, line: int, diag_buf=None
+    ):
+        row = (
+            src_file,
+            src_id,
+            tgt,
+            kind,
+            line,
+            "external, dynamic, shadowed, or unobserved reference",
         )
+        if diag_buf is not None:
+            diag_buf.append(row)
+            return
+        self.db.execute("INSERT INTO diagnostics VALUES(?,?,?,?,?,?)", row)
 
     def _resolve_unresolved_call(
-        self, row, raw_target: str, symbols, return_types, resolve, mro_method
+        self, row, raw_target: str, symbols, return_types, resolve, mro_method, edge_buf=None
     ) -> bool:
         ref = UnresolvedCallRef.from_row(row)
         if ref.kind != "CALLS" or "." not in raw_target or raw_target.startswith("?"):
@@ -1197,7 +1258,7 @@ class GraphStore:
         )
         resolved = [mt for c in candidates if (mt := mro_method(c, mname))]
         for mt in resolved:
-            self._emit_resolved_call(ref.source_file, ref.source_id, mt, ref.line)
+            self._emit_resolved_call(ref.source_file, ref.source_id, mt, ref.line, edge_buf)
         return bool(resolved)
 
     def _resolve_deferred_targets(
@@ -1239,9 +1300,11 @@ class GraphStore:
                 None,
             )
 
+        edge_buf: list[tuple[str, str, str, str, int]] = []
+        diag_buf: list[tuple[str, str, str, str, int, str]] = []
         for row, raw_target in unresolved_rows:
             if not self._resolve_unresolved_call(
-                row, raw_target, symbols, return_types, resolve, mro_method
+                row, raw_target, symbols, return_types, resolve, mro_method, edge_buf
             ):
                 self._emit_diagnostic(
                     row["source_file"],
@@ -1249,6 +1312,7 @@ class GraphStore:
                     plain_target(raw_target).replace(".__cjs__", "."),
                     row["kind"],
                     row["line"],
+                    diag_buf,
                 )
 
         for row in self.db.execute(
@@ -1260,9 +1324,18 @@ class GraphStore:
                 parts, lg, class_bases, return_types, field_types, rewrite_target, resolve, mro_method
             )
             for mt in targets:
-                self._emit_resolved_call(row["source_file"], row["source_id"], mt, row["line"])
+                self._emit_resolved_call(
+                    row["source_file"], row["source_id"], mt, row["line"], edge_buf
+                )
             if not targets and len(parts) >= 4 and parts[-1].startswith("?"):
-                self._emit_diagnostic(row["source_file"], row["source_id"], parts[-1], "CALLS", row["line"])
+                self._emit_diagnostic(
+                    row["source_file"], row["source_id"], parts[-1], "CALLS", row["line"], diag_buf
+                )
+
+        if edge_buf:
+            self.db.executemany("INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)", edge_buf)
+        if diag_buf:
+            self.db.executemany("INSERT INTO diagnostics VALUES(?,?,?,?,?,?)", diag_buf)
 
         self._fanout_subtype_calls(symbols, class_bases, mro_method)
 
@@ -1322,6 +1395,7 @@ class GraphStore:
         for sid in symbols:
             if "#" in sid:
                 overload_siblings[sid.partition("#")[0]].append(sid)
+        fanout_rows: list[tuple[str, str, str, str, int]] = []
         for row in self.db.execute(
             "SELECT source_file,source_id,target_id,line FROM edges WHERE kind='CALLS'"
         ).fetchall():
@@ -1334,10 +1408,14 @@ class GraphStore:
             if 1 <= len(resolved) <= 4:
                 for mt in resolved:
                     for tgt in (mt, *overload_siblings.get(mt, ())):
-                        self.db.execute(
-                            "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
-                            (row["source_file"], row["source_id"], tgt, "CALLS", row["line"]),
+                        fanout_rows.append(
+                            (row["source_file"], row["source_id"], tgt, "CALLS", row["line"])
                         )
+        if fanout_rows:
+            self.db.executemany(
+                "INSERT OR IGNORE INTO edges VALUES(?,?,?,?,?)",
+                fanout_rows,
+            )
 
     def rows(self, sql, args=()):
         return [dict(row) for row in self.db.execute(sql, args)]

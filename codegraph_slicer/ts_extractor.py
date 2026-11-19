@@ -1418,7 +1418,17 @@ def extract_typescript_file(
             raw_obj = node_text(data, obj).strip()
             root_ident = re.split(r"[.(?\[]", raw_obj, maxsplit=1)[0].strip()
             if (
-                not raw_obj.startswith(("console.", "expect("))
+                obj.type
+                not in {
+                    "call_expression",
+                    "new_expression",
+                    "parenthesized_expression",
+                    "subscript_expression",
+                    "await_expression",
+                }
+                and "(" not in raw_obj
+                and "\n" not in raw_obj
+                and not raw_obj.startswith(("console.", "expect("))
                 and root_ident not in _TS_BUILTINS
                 and mname not in _TS_BUILTIN_PROTOTYPE_METHODS
             ):

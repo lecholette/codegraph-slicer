@@ -941,7 +941,20 @@ def extract_java_file(
                 emit(sid, f"{resolved_static}.{mname}", "CALLS", line, in_test)
                 return
         raw_recv = node_text(data, receiver).strip()
-        if not raw_recv.startswith("System.") and mname not in _JAVA_BUILTIN_METHODS:
+        if (
+            receiver.type
+            not in {
+                "method_invocation",
+                "object_creation_expression",
+                "parenthesized_expression",
+                "cast_expression",
+                "array_access",
+            }
+            and "(" not in raw_recv
+            and "\n" not in raw_recv
+            and not raw_recv.startswith("System.")
+            and mname not in _JAVA_BUILTIN_METHODS
+        ):
             emit(sid, f"?{raw_recv}.{mname}", "CALLS", line, in_test)
 
     for child in root.children:
