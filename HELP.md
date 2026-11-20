@@ -27,19 +27,25 @@ codegraph-slicer map --db /tmp/example.sqlite --max-tokens 500
 codegraph-slicer slice --db /tmp/example.sqlite spend:admit
 ```
 
-`--help` on the command or a subcommand gives a short form; `README.md`
-describes the index model and known static-analysis limits.
+`--help` on the command or a subcommand gives a short form. `README.md` covers
+installation, the agent skill, and benchmarks; this file covers every flag and
+the static-analysis limits (see [Analysis limits](#analysis-limits)).
 
 ## Workflow
 
-1. Run `sync` once to create the snapshot database.
-2. Run `map` to see ranked file skeletons, or `slice` for context around one or
-   more anchors.
-3. Run `impact` for bounded transitive call reachability from one function or
-   method; it does not trace values.
-4. To review changes, sync base and head source into separate databases and
+1. Run `sync` once to create the snapshot database (add `--scope` for monorepo
+   subtrees or `--skip-unparseable` for legacy files). On a huge unindexed
+   repository where you already know the target, skip this step and use
+   `slice --root` instead.
+2. Run `map --recommend-workflow` (or `route --prompt`) to decide whether to
+   slice or read files directly.
+3. Run `slice` for bounded context around one or more anchors.
+4. Run `impact` for bounded transitive call reachability from one function or
+   method (it does not trace values), or `flow` for a local Python data/control
+   slice.
+5. To review changes, sync base and head source into separate databases and
    run `delta --base-db BASE --head-db HEAD`.
-5. Inspect the report, then run any tests separately. `delta` only reports
+6. Inspect the report, then run any tests separately. `delta` only reports
    static test-selection gaps; `--selected-test` does not execute or certify a
    test.
 
@@ -49,11 +55,20 @@ describes the index model and known static-analysis limits.
 
 ```text
 codegraph-slicer sync ROOT --db DATABASE [--revision REVISION]
+                           [--scope PATH ...] [--skip-unparseable]
+                           [--format json|markdown|xml]
 ```
 
 `ROOT` is a workspace directory or Git repository. Without `--revision`, sync
-indexes the workspace's current `.py` files. With `--revision`, it reads the
-specified Git commit tree instead. `DATABASE` is created or updated. A database
+indexes the workspace's current Python (`.py`), Java (`.java`), TypeScript
+(`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) files in
+parallel (`CODEGRAPH_JOBS` controls worker count), pruning ignored build and
+dependency directories (`node_modules`, `.git`, `build`, `target`, `.gradle`,
+`.next`, `dist`, `out`, `vendor`) in a single filesystem walk. Repeat
+`--scope PATH` to restrict indexing to specific repo-relative directories or
+files while preserving repository-root relative paths. Add `--skip-unparseable`
+to record and skip files that fail syntax parsing instead of aborting the sync.
+With `--revision`, it reads the specified Git commit tree instead. `DATABASE` is created or updated. A database
 holds one selected source root/snapshot: syncing another source replaces the
 current snapshot in that database. Keep base and head in separate database
 files when comparing them. Sync is the only command that writes a database.
@@ -71,11 +86,13 @@ finish wins.
 Sync is the only supported writer: a foreign connection that stays open across
 a sync keeps writing to the replaced file, and those writes are not kept.
 
-Map, slice, and flow check the recorded source root before ordinary queries.
-They refuse when Python source has changed, the Git HEAD moved, metadata is
-missing, or freshness cannot be verified. Re-run sync to refresh. To explicitly
-inspect the historical cached snapshot, pass `--snapshot` to map, slice, or
-flow; this mode remains read-only and does not change the database.
+`map`, `route`, `slice --db`, `impact`, and `flow` check the recorded source
+root before ordinary queries. They exit `2` with `StaleSnapshotError` when an
+indexed source file (or `tsconfig.json` / `tsconfig.base.json`) has changed, the
+Git HEAD moved, metadata is missing, or freshness cannot be verified. Re-run
+sync to refresh. To explicitly inspect the historical cached snapshot, pass
+`--snapshot` to any of those commands; this mode remains read-only and does not
+change the database.
 Parse or SQL errors roll back both graph data and cache identity.
 
 Sync detects the project layout; there is nothing to configure. Packages are
@@ -90,6 +107,9 @@ a full parse.
 ```sh
 codegraph-slicer sync /path/to/project --db /tmp/project.sqlite
 codegraph-slicer sync /path/to/repo --revision HEAD --db /tmp/head.sqlite
+codegraph-slicer sync /path/to/repo --scope services/orders --scope libs/shared \
+  --db /tmp/scoped.sqlite
+codegraph-slicer sync /path/to/repo --skip-unparseable --db /tmp/project.sqlite
 ```
 
 Next, pass the created database to `map` or `slice`.
@@ -106,12 +126,9 @@ codegraph-slicer map --db DATABASE [--seed MODULE_OR_PATH ...]
 rank from one or more indexed module names or source paths; with no seeds,
 ranking starts across the whole indexed repository. `--max-tokens` defaults to
 2000 and is a deterministic estimate, not a model tokenizer count. Add
-`--recommend-workflow` to include a deterministic `scale_recommendation`
-advisory (`file_count`, `total_loc`, `dominant_language`, `scale_tier`,
-`recommended_workflow`, `bypass_slicer`, and `reason`) classifying compact
-repositories vs. multi-package graph-eligible repositories within the
-`--max-tokens` budget. The map
-includes whole file skeletons in rank order while they fit. When files are
+`--recommend-workflow` to prepend a deterministic `ScaleRecommendation`
+advisory (see [Scale recommendation](#scale-recommendation)) within the
+`--max-tokens` budget. The map includes whole file skeletons in rank order while they fit. When files are
 omitted, JSON and Markdown report the exact omitted count; emitted and omitted
 counts reconcile to the complete map. Increase `--max-tokens` to retrieve more.
 Seeded maps omit zero-score files. If the highest-ranked file cannot fit, its
@@ -139,19 +156,83 @@ for required map metadata is an error. `--format` defaults to JSON.
 codegraph-slicer map --db /tmp/project.sqlite --seed package.module --max-tokens 1800
 ```
 
+#### Scale recommendation
+
+`--recommend-workflow` adds a `scale_recommendation` object (schema version 1)
+computed over indexed non-test source files. Fields: `scope`, `source_files`,
+`source_loc`, `languages`, `mode`, `bypass_slicer`, `skip_commands`, and
+`reason`, plus `slice_targets` when monoliths are found and `skipped_files` /
+`skipped_languages` when the index was synced with `--skip-unparseable`.
+
+A monolith is a non-test file with `>= 300` lines, `>= 15` definitions and
+`>= 200` lines, or cyclomatic complexity `>= 25`. Rules apply in this order:
+
+| `mode` | `reason` | When |
+| --- | --- | --- |
+| `direct_read` | `incomplete_index` | Skipped files in an indexed production language exceed 2% of production files |
+| `direct_read` | `empty_index` | No source files are indexed |
+| `slice_monoliths` | `monolith_present` | At least one monolith; its paths are in `slice_targets` |
+| `graph_optional` | `coupled_graph` | `>= 40` resolved cross-file edges |
+| `map_then_read` | `compact_scale` | `< 30` files and `< 5,000` LOC |
+| `map_then_read` | `compact_python` | Python-only, `< 50` files and `< 7,500` LOC |
+| `graph_optional` | `graph_candidate` | Anything larger |
+
+`direct_read` and `map_then_read` set `bypass_slicer: true` and list `slice`
+and `delta` in `skip_commands`. The recommendation is advisory.
+
+```sh
+codegraph-slicer map --db /tmp/project.sqlite --recommend-workflow --format markdown
+```
+
 Next, choose a symbol from the indexed repository and use `slice` to retrieve
 its implementation and related context.
+
+### `route`
+
+```text
+codegraph-slicer route --db DATABASE --prompt PROMPT [--snapshot]
+                       [--format json|markdown|xml]
+```
+
+`route` resolves file and symbol tokens mentioned in `PROMPT` against an
+existing indexed snapshot in `< 25 ms`, computes 4-axis structural difficulty
+(`D_loc`, `D_coupling`, `D_monolith`, `D_spec`, and composite `R_struct`), and
+returns `workflow_mode`, `bypass_slicer`, `resolved_anchors`, `target_files`,
+and ranked `slice_targets`. Like `map`, it opens the database read-only and
+refuses a stale snapshot unless `--snapshot` is passed.
+
+```sh
+codegraph-slicer route --db /tmp/project.sqlite \
+  --prompt "Fix validation in CheckoutHandler.processOrder and update callers"
+```
 
 ### `slice`
 
 ```text
-codegraph-slicer slice --db DATABASE ANCHOR [ANCHOR ...]
+codegraph-slicer slice (--db DATABASE | --root ROOT) ANCHOR [ANCHOR ...]
                        [--max-tokens N] [--include-callee-bodies] [--outline]
-                       [--format json|markdown|xml]
+                       [--include-imports] [--target-mode full|skeleton]
+                       [--dedup-session] [--dedup-session-id ID]
+                       [--max-files N] [--max-hops N] [--no-callers]
+                       [--snapshot] [--format json|markdown|xml]
 ```
 
-`--db` must be an existing index and is opened read-only. Supply one or more
-anchors in any of these forms:
+Pass either `--db DATABASE` (an existing index opened read-only) or `--root ROOT`
+(target-seeded lazy slicing of an unindexed workspace directory). With neither,
+`slice` exits `2`; with both, `--db` is used. Lazy `--root` mode parses only the
+seed files, their resolved imports and types up to `--max-hops` (default 2),
+and grep-matched candidate callers (skipped with `--no-callers`), stopping at
+`--max-files` (default 40). It emits a `coverage` block (`explored_files`,
+`indexed_files`, `truncated`, and any failed files) in every format; callers
+outside that coverage are unexplored, not absent. `--snapshot` has no effect in
+`--root` mode because it reads current files directly.
+
+`--target-mode skeleton` returns signature-only target implementations (useful
+when you plan to read the target files anyway). `--dedup-session` compacts
+types and callers already emitted by an earlier `slice` call in the same
+session; pass `--dedup-session-id ID` to name the session explicitly.
+
+Supply one or more anchors in any of these forms:
 
 | Form | Meaning |
 | --- | --- |
@@ -211,7 +292,15 @@ codegraph-slicer slice --db /tmp/project.sqlite package.module:run package.modul
 codegraph-slicer slice --db /tmp/project.sqlite src/worker.py:42 --include-callee-bodies --format markdown
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --format json
 codegraph-slicer slice --db /tmp/project.sqlite package.module:run --outline --include-imports
+codegraph-slicer slice --db /tmp/project.sqlite --format xml --target-mode skeleton \
+  src/Checkout.java:CheckoutHandler.processOrder src/Validator.java:OrderValidator
+codegraph-slicer slice --root /path/to/project --format xml --max-files 40 --max-hops 2 \
+  src/Checkout.java:CheckoutHandler.processOrder
 ```
+
+If the required definitions exceed `--max-tokens`, the command exits `2` with
+`RequiredAnchorOverflow` and prints a `rerun:` line on stderr carrying the
+smallest admitting `--max-tokens`; run that command as printed.
 
 Next, inspect the returned sections; if the anchor is unknown, choose an
 indexed symbol or module from the map/database.
@@ -221,7 +310,7 @@ indexed symbol or module from the map/database.
 ```text
 codegraph-slicer impact ANCHOR --db DATABASE [--max-depth N] [--max-nodes N]
                          [--unknown-boundaries N] [--max-tokens N]
-                         [--snapshot] [--format json|markdown]
+                         [--snapshot] [--format json|markdown|xml]
 ```
 
 `impact` follows resolved `CALLS` edges backward from one indexed function or
@@ -259,7 +348,7 @@ codegraph-slicer delta --base-db DATABASE --head-db DATABASE
                        [--selected-test PATH ...] [--max-tokens N] [--full]
                        [--projection legacy|v2] [--anchor SYMBOL ...]
                        [--kind KIND ...] [--edge-sample-limit N]
-                       [--format json|markdown]
+                       [--format json|markdown|xml]
 ```
 
 Both databases must already exist and are opened read-only. They should contain
@@ -320,6 +409,16 @@ codegraph-slicer delta --base-db /tmp/base.sqlite --head-db /tmp/head.sqlite \
   --edge-sample-limit 10 --max-tokens 2400
 ```
 
+Edge identity is `(source, target, kind)`. Each reported line is one
+representative occurrence, not a list of all call sites. Reachability uses
+both snapshots, but test candidates and explicit test selections come from
+observed HEAD test symbols. A test counts as updated only when its source
+symbol changed; an edge rebind by itself does not count. Selection says only
+that the test was selected, not that it ran. `affected_entrypoints` uses a
+heuristic: `__main__` modules, module paths containing `cli`, `scripts`, or
+`mcp`, and symbols named `main`. Arbitrary framework-decorated entrypoints are
+not discovered automatically.
+
 Next, review the static change report and run relevant tests separately. There
 are no project-specific import boundaries unless supplied with
 `--forbid-import`.
@@ -330,8 +429,8 @@ are no project-specific import boundaries unless supplied with
 codegraph-slicer flow ANCHOR --db DATABASE [--variable NAME_OR_ACCESS_PATH]
                       [--line LINE] [--direction backward|forward]
                       [--data-only] [--max-tokens N]
-                      [--compact]
-                      [--format json|markdown]
+                      [--snapshot] [--compact]
+                      [--format json|markdown|xml]
 ```
 
 `flow` requires one observed function or method; module/class and ambiguous
@@ -464,20 +563,11 @@ not the outer `tokens` field or Markdown. If the selected dependencies do not
 fit, the command errors without trimming them. This is a deterministic size
 estimate, not a tokenizer count.
 
-Edge identity is `(source, target, kind)`. Each reported line is one
-representative occurrence, not a list of all call sites. Reachability uses
-both snapshots, but test candidates and explicit test selections come from
-observed HEAD test symbols. A test counts as updated only when its source
-symbol changed; an edge rebind by itself does not count. Selection says only
-that the test was selected, not that it ran. `affected_entrypoints` uses a
-heuristic: `__main__` modules, module paths containing `cli`, `scripts`, or
-`mcp`, and symbols named `main`. Arbitrary framework-decorated entrypoints are
-not discovered automatically.
-
 ## Results and errors
 
 Commands print JSON by default; `--format markdown` produces a readable report
-where supported. Successful commands exit `0`. Invalid input, unreadable
+and `--format xml` an XML envelope (structured for `map`, `slice`, and `impact`;
+`delta` and `flow` wrap their JSON in `<codegraph_report>`). Successful commands exit `0`. Invalid input, unreadable
 source/database, unsupported syntax, an unknown anchor/seed, or a budget that
 cannot hold required content reports an error on stderr and exits `2`.
 Successful empty results are still JSON/Markdown output with exit `0` (for

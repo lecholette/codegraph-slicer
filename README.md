@@ -2,13 +2,13 @@
 
 **Give your coding agent the relevant code before it edits.**
 
-Ask a coding agent to change a method in a large repository and it can spend its first dozen turns finding the file, reading hundreds of lines of unrelated helpers, and chasing callers across packages. By the time it starts editing, critical DTO contracts, constructor state wiring, or caller assumptions may still be missing.
+Ask a coding agent to change a method in a large repository and it can spend its first dozen turns finding the file, reading hundreds of lines of unrelated helpers, and chasing callers across packages. By the time it starts editing, critical DTO contracts, interface definitions, constructor state wiring, or caller assumptions may still be missing.
 
-`codegraph-slicer` gives your agent a different starting point: the target implementation, enclosing class contracts, upstream callers, and downstream dependencies in one bounded XML context slice.
+`codegraph-slicer` gives your agent a different starting point: the target implementation, enclosing class and interface contracts, upstream callers, and downstream dependencies in one bounded XML context slice.
 
-Install the CLI and bundled skill, and your agent automatically checks repository structure before drowning in raw file reads. Small, straightforward tasks bypass slicing and go directly to the files; large monoliths and cross-package changes get structural context first.
+Install the CLI and bundled skill, and your agent automatically checks repository structure before drowning in raw file reads. Small, straightforward tasks bypass slicing and go directly to the files; large monoliths and cross-package changes get structural context first—either from a fast local SQLite index (`sync` + `slice --db`) or immediately with zero upfront indexing via target-seeded lazy slicing (`slice --root .`).
 
-**`v0.3.8`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
+**`v0.3.11`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
 
 ---
 
@@ -19,7 +19,7 @@ Install the CLI and bundled skill, and your agent automatically checks repositor
 - [Installation & Agent Skill Setup](#installation--agent-skill-setup)
 - [How Your Agent Uses the Skill](#how-your-agent-uses-the-skill)
 - [The Basic CLI Workflow](#the-basic-cli-workflow)
-- [Benchmark Results (`v0.3.8`)](#benchmark-results-v038)
+- [Benchmark Results (`v0.3.11`)](#benchmark-results-v0311)
 - [When Something Goes Wrong](#when-something-goes-wrong)
 - [What's Inside](#whats-inside)
 - [Philosophy](#philosophy)
@@ -32,7 +32,7 @@ Install the CLI and bundled skill, and your agent automatically checks repositor
 ### Step 1: Install the CLI (Python 3.12+)
 
 ```sh
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.8"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.11"
 ```
 
 ### Step 2: Install the Agent Skill (Pick Your Harness)
@@ -40,37 +40,41 @@ uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.8"
 ```sh
 # Claude Code:
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 
 # Cursor (Global):
 mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Codex (User):
 mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 ```
 
 *(See [Installation & Agent Skill Setup](#installation--agent-skill-setup) below for Gemini CLI, Antigravity, OpenCode, and repo-scoped paths.)*
 
-### Step 3: Index a Local Repo & Slice Your First Target
+### Step 3: Index or Lazy-Slice a Local Repo
 
 ```sh
 cd /path/to/your/repo
 
-# 1. Index the local workspace into a temporary SQLite graph (~1s for ~300 files; keeps git status clean)
+# Option A — Full or scoped workspace index (~1s for ~300 files; keeps git status clean):
 GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
 codegraph-slicer sync . --db "$GRAPH"
 
-# 2. Check repo map + scale recommendation (tells you whether to slice or read directly)
+# Check repo map + scale recommendation (tells you whether to slice or read directly):
 codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
 
-# 3. Route a task prompt to exact symbols and monolith slice targets
+# Route a task prompt to exact symbols and monolith slice targets (<25 ms):
 codegraph-slicer route --db "$GRAPH" \
   --prompt "Fix validation in CheckoutHandler and update callers" --format json
+
+# Option B — Target-seeded lazy slice on huge unindexed monorepos (no upfront sync):
+codegraph-slicer slice --root . --max-tokens 8000 --format xml \
+  src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler.processOrder
 ```
 
 Once the skill is installed, **you don't need to run these commands manually**—just prompt your coding agent as usual, and it will automatically sync, route, and slice when working in multi-package or monolithic repositories.
@@ -79,13 +83,21 @@ Once the skill is installed, **you don't need to run these commands manually**�
 
 ## How It Works
 
-From the moment you install the CLI and skill, your agent has a structural workflow before reading large source files:
+From the moment you install the CLI and skill, your agent follows a five-step structural workflow before reading large source files:
 
-1. **Index (`sync`)**: Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees into a local SQLite graph (`~1s` on ~300-file repositories).
-2. **Orient & Route (`map --recommend-workflow` or `route`)**: Evaluates repository scale, coupling, and monoliths (`>= 300` lines, `>= 15` definitions, or `CC >= 25`). Compact scopes automatically bypass slicing (`map_then_read`); monolithic or coupled scopes surface exact `slice_targets`.
-3. **Front-Load Bounded Context (`slice --format xml`)**: Extracts 3–8 target symbols in a single deduplicated, token-budgeted XML envelope (`<types_and_schemas>`, `<upstream_callers>`, `<downstream_dependencies>`, `<target_implementations>`), including class/method Javadoc/JSDoc preambles and field declarations.
-4. **Read Only What Remains**: Uses line-bounded reads only where condensed blocks or signature stubs need inspection, avoiding the double-context tax of loading both full files and slices.
-5. **Verify Impact & Boundaries (`impact`, `flow`, `delta`)**: Traces caller blast radius, intraprocedural Python control/data flow, and base-vs-head import or cycle regressions alongside your test suite.
+1. **Index (`sync`) or Seed Lazily (`slice --root`)**:
+   - **`sync`**: Indexes Python (`.py`), Java (`.java`), TypeScript (`.ts`, `.tsx`), and JavaScript (`.js`, `.jsx`, `.mjs`, `.cjs`) source trees into a local SQLite graph in parallel (`~1s` on ~300-file repositories), pruning build/vendor directories (`node_modules`, `.git`, `build`, `target`, `.gradle`, `.next`, `dist`, `out`, `vendor`) in a single filesystem walk. Supports repeatable `--scope <dir>` for monorepo subtrees and `--skip-unparseable` for legacy files.
+   - **`slice --root`**: On `10,000+`-file monorepos where you already have a target file or symbol anchor, explores only the seed file, its resolved imports/types (up to `--max-hops 2`), and grep-matched candidate callers (up to `--max-files 40`) in `~1–2s` with zero upfront database creation.
+2. **Orient & Route (`map --recommend-workflow` or `route`)**:
+   - Evaluates repository scale, cross-file coupling, and monoliths (`>= 300` lines, `>= 15` definitions, or `CC >= 25`).
+   - Compact scopes automatically bypass slicing (`map_then_read`); monolithic or coupled scopes surface exact `slice_targets`. Minor parse failures (`<= 2%` of production files when using `--skip-unparseable`) are recorded without disabling graph recommendations.
+3. **Front-Load Bounded Context (`slice --format xml`)**:
+   - Extracts 3–8 target symbols in a single deduplicated, token-budgeted XML envelope (`<types_and_schemas>`, `<upstream_callers>`, `<downstream_dependencies>`, `<target_implementations>`), including class/interface contracts, Javadoc/JSDoc preambles, and field declarations.
+   - Automatically condenses multi-anchor targets and depth-2 transitive types to fit the `--max-tokens` budget, and supports `--dedup-session` across follow-up turns.
+4. **Read Only What Remains**:
+   - Uses line-bounded reads (`offset` and `limit` from `<code_slice lines="start-end">`) only where condensed blocks or signature stubs need inspection, avoiding the double-context tax of loading both full files and slices.
+5. **Verify Impact & Boundaries (`impact`, `flow`, `delta`)**:
+   - Traces transitive caller blast radius (`impact`), intraprocedural Python control/data flow (`flow`), and base-vs-head import or cycle regressions (`delta`) alongside your test suite.
 
 ---
 
@@ -97,33 +109,36 @@ Requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and **Git** (to install fr
 
 ```sh
 # With uv (recommended):
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.8"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.11"
+
+# Or upgrade an existing uv tool installation:
+uv tool install --force "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.11"
 
 # Or with pip:
-python3 -m pip install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.8"
+python3 -m pip install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.11"
 ```
 
 Verify installation:
 
 ```sh
-codegraph-slicer --version
+codegraph-slicer --version   # codegraph-slicer 0.3.11
 codegraph-slicer --help
 ```
 
 #### Local Code & Git Behavior
-- **Operates on local source trees (`sync .`)**: `codegraph-slicer` indexes local files on disk (`Python`, `Java`, `TypeScript`, `JavaScript`). No code ever leaves your machine, and the target directory **does not even need to be a Git repository** for normal workspace indexing (`sync`), `map`, `route`, `slice`, `impact`, or `flow`.
-- **When Git is used at runtime**: `git` is only invoked when you explicitly pass `--revision <git-ref>` (for example, `codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite` before running `delta`). In `--revision` mode, blobs are read directly from local `.git` objects (`git ls-tree` / `git cat-file`) without modifying or checking out your working tree.
-- **Keeping `git status` clean**: Writing `--db` to a temp path (`$(mktemp -d)/graph.sqlite` or `/tmp/graph.sqlite`) keeps your repository working tree 100% clean without needing `.gitignore` changes. If you prefer a repo-local database (such as `.codegraph/graph.sqlite`), run `mkdir -p .codegraph` first and add `.codegraph/` to `.gitignore` (hidden dot-directories are automatically skipped during indexing).
+- **Operates on local source trees (`sync .` or `slice --root .`)**: `codegraph-slicer` indexes local files on disk (`Python`, `Java`, `TypeScript`, `JavaScript`). No code ever leaves your machine, and the target directory **does not even need to be a Git repository** for normal workspace indexing (`sync`), `map`, `route`, `slice`, `impact`, or `flow`.
+- **When Git is used at runtime**: `git` is only invoked when you explicitly pass `--revision <git-ref>` (for example, `codegraph-slicer sync . --revision origin/main --db /tmp/base.sqlite` before running `delta`), or when `slice --root` uses `git grep` as a fast path inside Git repositories (falling back automatically to `rg` or Python file scanning outside Git). In `--revision` mode, blobs are read directly from local `.git` objects (`git ls-tree` / `git cat-file`) without modifying or checking out your working tree.
+- **Keeping `git status` clean**: Writing `--db` to a temp path (`$(mktemp -d)/graph.sqlite` or `/tmp/graph.sqlite`) or using `slice --root .` keeps your repository working tree 100% clean without needing `.gitignore` changes. If you prefer a repo-local database (such as `.codegraph/graph.sqlite`), run `mkdir -p .codegraph` first and add `.codegraph/` to `.gitignore` (hidden dot-directories are automatically skipped during indexing).
 
 ### 2. Add the Skill to Your Coding Harness
 
-The bundled [`SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md) teaches your coding agent **when to slice** (multi-package repos and `>= 300`-line monoliths) and **when to bypass slicing** (compact repos where direct file reads are faster). Each snippet below is self-contained:
+The bundled [`SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md) teaches your coding agent **when to slice** (multi-package repos and `>= 300`-line monoliths), **when to use lazy `--root` or scoped `--scope` indexing** (huge monorepos), and **when to bypass slicing** (compact repos where direct file reads are faster). Each snippet below is self-contained:
 
 #### Claude Code
 
 ```sh
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -132,12 +147,12 @@ mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
 ```sh
 # Global user skill:
 mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
 mkdir -p .cursor/skills/codegraph-slicer && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o .cursor/skills/codegraph-slicer/SKILL.md
 ```
 
@@ -146,12 +161,12 @@ mkdir -p .cursor/skills/codegraph-slicer && \
 ```sh
 # User-scoped skill:
 mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
 mkdir -p .agents/skills/codegraph-slicer && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o .agents/skills/codegraph-slicer/SKILL.md
 ```
 
@@ -159,7 +174,7 @@ mkdir -p .agents/skills/codegraph-slicer && \
 
 ```sh
 mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.gemini/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -167,7 +182,7 @@ mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
 
 ```sh
 mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.gemini/config/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -175,7 +190,7 @@ mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
 
 ```sh
 mkdir -p "$HOME/.config/opencode/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.8/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.config/opencode/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -194,7 +209,7 @@ Once `codegraph-slicer` is on your `PATH` and `SKILL.md` is placed in your harne
      ```markdown
      ## Code Graph Indexing (`codegraph-slicer`)
      - Before reading large source files (`>= 300` lines) or grepping across packages, run `mkdir -p .codegraph && codegraph-slicer sync . --db .codegraph/graph.sqlite` and `codegraph-slicer map --db .codegraph/graph.sqlite --recommend-workflow --format markdown`.
-     - When `bypass_slicer: false`, front-load one batched `codegraph-slicer slice --snapshot --db .codegraph/graph.sqlite --max-tokens 8000 --format xml <anchors...>` call for your target symbols before editing.
+     - When `bypass_slicer: false`, front-load one batched `codegraph-slicer slice --snapshot --db .codegraph/graph.sqlite --max-tokens 8000 --format xml <anchors...>` call for your target symbols before editing (or use `codegraph-slicer slice --root . --format xml <anchors...>` on unindexed monorepos).
      ```
 
 ---
@@ -203,17 +218,23 @@ Once `codegraph-slicer` is on your `PATH` and `SKILL.md` is placed in your harne
 
 ### 1. Sync the Repository (`sync`)
 
-Keep the index outside the repository or in a git-ignored dot-directory (such as `.codegraph/`). Hidden dot-directories are automatically ignored during workspace indexing.
+Keep the index outside the repository or in a git-ignored dot-directory (such as `.codegraph/`). Hidden dot-directories and build/dependency folders (`node_modules`, `.git`, `build`, `target`, `.gradle`, `.next`, `dist`, `out`, `vendor`) are automatically pruned during workspace indexing.
 
 ```sh
 GRAPH="${CODEGRAPH_DB:-$(mktemp -d)/graph.sqlite}"
 codegraph-slicer sync . --db "$GRAPH"
 
+# Scope indexing to specific monorepo modules while preserving repo-root paths:
+codegraph-slicer sync . --scope services/orders --scope libs/shared --db "$GRAPH"
+
+# Skip legacy or broken files instead of aborting:
+codegraph-slicer sync . --skip-unparseable --db "$GRAPH"
+
 # Or index a specific Git revision:
 codegraph-slicer sync . --revision HEAD --db /tmp/head.sqlite
 ```
 
-`sync` is incremental: unchanged files are not reparsed when re-syncing after edits.
+`sync` is incremental and parallelized across CPU cores (`CODEGRAPH_JOBS` to override worker count): unchanged files are not reparsed when re-syncing after edits.
 
 ### 2. Orient & Route (`map --recommend-workflow` and `route`)
 
@@ -223,42 +244,49 @@ Check repository structure and scale before reading source files:
 # Ranked PageRank repository map + scale recommendation at the top of the report:
 codegraph-slicer map --db "$GRAPH" --recommend-workflow --format markdown
 
-# Or route a specific task prompt directly to resolved anchors and monolith slice targets:
+# Or route a specific task prompt directly to resolved anchors and monolith slice targets (<25 ms):
 codegraph-slicer route --db "$GRAPH" \
   --prompt "Update CheckoutHandler.processOrder and inspect its callers" \
   --format json
 ```
 
-`ScaleRecommendation` classifies the repository into one of four modes:
-
-Skipped parse failures are reported as `skipped_files` and `skipped_languages`. They disable graph recommendations only for affected production languages; an unparseable legacy Python script does not disable an otherwise indexed Java graph. Static graphs can still have unresolved references and do not prove caller completeness.
+`ScaleRecommendation` classifies the repository into one of four modes. A *monolith* is a non-test file with `>= 300` lines, `>= 15` definitions and `>= 200` lines, or `CC >= 25`:
 
 | Mode | When It Triggers | Recommended Action |
 | :--- | :--- | :--- |
-| **`map_then_read`** (`bypass_slicer: true`) | Compact scope (`< 30` files & `< 5,000` LOC in Java/TS/JS, or `< 50` files & `< 7,500` LOC in Python) with no monoliths (`>= 300` lines, `>= 15` definitions, or `CC >= 25`) and `< 40` cross-file edges. | Read the target files directly; skip `slice` and `delta`. |
+| **`map_then_read`** (`bypass_slicer: true`) | Compact scope (`< 30` files & `< 5,000` LOC, or `< 50` files & `< 7,500` LOC for Python-only repositories) with no monoliths and `< 40` cross-file edges. | Read the target files directly; skip `slice` and `delta`. |
 | **`slice_monoliths`** (`bypass_slicer: false`) | One or more source files are monoliths (`>= 300` lines, `>= 15` definitions with `>= 200` lines, or `CC >= 25`), even in small-file-count repositories. | Slice symbols inside the monolithic files listed in `slice_targets` instead of reading them end-to-end. |
-| **`graph_optional`** (`bypass_slicer: false`) | Multi-package or strongly coupled repository (`>= 30` files, `>= 5,000` LOC, or `>= 40` cross-file edges). | Front-load a batched `slice` for target symbols across packages. |
-| **`direct_read`** | Empty or unparsed index. | Inspect source files directly. |
+| **`graph_optional`** (`bypass_slicer: false`) | Multi-package or strongly coupled repository (`>= 40` cross-file edges, or larger than the compact thresholds). | Front-load a batched `slice` for target symbols across packages. |
+| **`direct_read`** (`bypass_slicer: true`) | Empty index or `> 2%` unparseable production files (`incomplete_index`). | Inspect source files directly. |
 
-### 3. Extract One Bounded XML Context Slice (`slice`)
+Skipped parse failures (when synced with `--skip-unparseable`) are reported as `skipped_files` and `skipped_languages`. They trigger `incomplete_index` only when skipped non-test files in an indexed production language exceed **2%** of production files, so one broken file in a large repository, or an unparseable script in a language the repo doesn't otherwise use, won't disable the graph. On a very small repository a single skipped file can cross 2%; fix or delete it and re-sync.
 
-Batch 3–8 target anchors into a single call so shared types and callers are deduplicated:
+### 3. Extract One Bounded XML Context Slice (`slice --db` or `slice --root`)
+
+Batch 3–8 target anchors into a single call so shared types, interfaces, and callers are deduplicated. Pass `--db` (indexed snapshot) or `--root` (lazy, no index); if you pass both, `--db` wins:
 
 ```sh
+# From an indexed SQLite snapshot (--db):
 codegraph-slicer slice --db "$GRAPH" --max-tokens 8000 --format xml \
   src/main/java/com/acme/orders/OrderPipeline.java:OrderPipeline.dispatchDueOrders \
   src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler \
   src/main/java/com/acme/validation/OrderPolicyValidator.java:OrderPolicyValidator
+
+# Or target-seeded lazy slicing on an unindexed workspace (--root, no --db needed):
+codegraph-slicer slice --root . --max-tokens 8000 --format xml \
+  src/main/java/com/acme/orders/OrderPipeline.java:OrderPipeline.dispatchDueOrders \
+  --max-files 40 --max-hops 2        # add --no-callers to skip grep-based caller discovery
 ```
 
-The XML slice organizes structural context into four deterministic sections:
+The XML slice organizes structural context into four deterministic sections (plus `<coverage>` metadata in lazy `--root` mode):
 
 | XML Section | Contents |
 | :--- | :--- |
-| **`<types_and_schemas>`** | Enclosing class fields/constructors, inherited types, `@property` getters, JSDoc types, and instantiated DTOs (`USES_TYPE` / `INHERITS` up to 2 hops) with non-called methods folded to 1-line signatures. |
+| **`<coverage>`** *(lazy `--root` mode)* | Reports `mode="lazy_target_seeded"`, `explored_files`, `indexed_files`, `max_files`, `max_hops`, `truncated`, and any `<failed_file>` parse errors. |
+| **`<types_and_schemas>`** | Enclosing class fields/constructors, interfaces, inherited types, `@property` getters, JSDoc types, and referenced DTOs (`USES_TYPE` / `INHERITS` up to 2 hops) with non-called methods folded to 1-line signatures. Multi-anchor slices automatically condense or drop depth-2 transitive types to stay within `--max-tokens`. |
 | **`<upstream_callers>`** | Direct 1-hop caller snippets and dispatch windows showing how targets are invoked. |
 | **`<downstream_dependencies>`** | Callee signatures, 1-line return hints, and compact same-file helper bodies (`<= 40` lines). |
-| **`<target_implementations>`** | Placed at the tail of the XML envelope with top-level file imports and class header preambles preserved. |
+| **`<target_implementations>`** | Placed at the tail of the XML envelope with top-level file imports and class header preambles preserved. Pass `--target-mode skeleton` for signature-only targets or `--dedup-session` to elide types/callers already emitted earlier in the session. |
 
 ### 4. Check Blast Radius, Data Flow, and Structural Deltas (`impact`, `flow`, `delta`)
 
@@ -280,13 +308,13 @@ codegraph-slicer delta --base-db "$GRAPH" --head-db /tmp/head.sqlite \
 
 ---
 
-## Benchmark Results (`v0.3.8`)
+## Benchmark Results (`v0.3.11`)
 
 ### 1. Enterprise JavaScript Hard Monorepo (`289` `.js` Files, `44,219` LOC, `89` Tests + `6` Cross-Package Contracts)
 
 Evaluated across five coding models on a 12-package enterprise CommonJS JavaScript repository containing `400–520`-line monolithic strategy/orchestration classes, barrel `index.js` re-exports, and `273` decoy modules (zero post-hoc fixups):
 
-| Model | Baseline (No Slicer) | With `codegraph-slicer v0.3.8` | Delta |
+| Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
 | :--- | :--- | :--- | :--- |
 | **`gpt-6-luna`** | `69/89 (77.5%)`, `6/6` Contracts (`CP2: 14/18`, `CP4: 7/21`), `20` exec calls, `72,751` tokens | **`85/89 (95.5%)`**, **`6/6` Contracts (`100%`, `CP1–CP2: 100%`, `CP4: 19/21`)**, `29` exec calls, `106,666` tokens | **`+18.0%` accuracy (`+16` tests), `100%` on CP1 & CP2, `+57.1%` on CP4** |
 | **Cursor Auto (`auto`)** | `76/89 (85.4%)`, `4/6` Contracts (`CP2: 13/18`, `CP3: 11/18`), `18` turns, `1.24M` cache read (`205.5k` in / `21.4k` out), `1.47M` total tokens | **`87/89 (97.8%)`**, **`6/6` Contracts (`100%`, `CP2: 18/18`, `CP3: 17/18`)**, **`18` turns**, **`969k` cache read** (**`86.1k` in** / `22.5k` out), **`1.08M` total tokens** | **`+12.4%` accuracy (`+11` tests), `+33.3%` contracts (`4/6 -> 6/6`), `-58.1%` input tokens, `-22.0%` cache read tokens, `-26.6%` total tokens** |
@@ -298,7 +326,7 @@ Evaluated across five coding models on a 12-package enterprise CommonJS JavaScri
 
 Evaluated across the same five coding models on a 12-package enterprise Java repository containing `500–640`-line monolithic handlers and `279` decoy classes (zero post-hoc fixups):
 
-| Model | Baseline (No Slicer) | With `codegraph-slicer v0.3.8` | Delta |
+| Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
 | :--- | :--- | :--- | :--- |
 | **Cursor Composer (`composer-2.5`)** | `64/89 (71.9%)`, `6/6` Contracts, `24` turns, `1.45M` cache read (`231.8k` in / `16.8k` out), `154.9s` | **`87/89 (97.8%)`**, **`6/6` Contracts (`100%`, `CP1–CP3: 100%`)**, `35` turns, `2.18M` cache read (**`208.2k` in** / `24.1k` out), **`135.0s`** | **`+25.9%` accuracy (`+23` tests), `-10.2%` input tokens, `-12.8%` wall time** |
 | **`deepseek-v4.1-flash-1017`** | `30/89 (33.7%)`, `6/6` Contracts (`CP1: 4/32`), `46` turns, `2.48M` cache read (`76.7k` in / `37.2k` out) | **`75/89 (84.3%)`**, **`6/6` Contracts (`100%`, `CP1: 32/32`, `CP4: 21/21`)**, `61` turns, **`2.44M` cache read** (`88.1k` in / `42.4k` out), `346.9s` | **`+50.6%` accuracy (`+45` tests), `+87.5%` on CP1 & `100%` on CP4, `-1.6%` cache read tokens** |
@@ -308,11 +336,11 @@ Evaluated across the same five coding models on a 12-package enterprise Java rep
 
 ### 3. Additional Cross-Language Highlights (`Python`, `TypeScript`, `JavaScript`)
 
-- **Enterprise JavaScript Monorepo (`289` `.js` files, `44,213` LOC, `89` tests + `6` contracts):**
+- **Enterprise JavaScript Monorepo (`289` `.js` files, `44,219` LOC, `89` tests + `6` contracts):**
   - **`deepseek-v4.1-flash-1017`:** **`84/89 (94.4%) -> 86/89 (96.6%, +2.2%)`**, **`5/6 -> 6/6` contracts (`100%`)**, **`-20.2%` turns** (`84 -> 67`).
   - **`gpt-6.1-terra`:** **`70/89 (78.7%) -> 85/89 (95.5%, +16.8%)`**, **`-25.0%` exec calls** (`20 -> 15`).
   - **`claude-sonnet-5-5`:** `84/89 (94.4%)`, **`6/6` contracts (`100%`)**, **`-21.4%` turns** (`14 -> 11`), **`-44.3%` cache read tokens** (`1.05M -> 582k`), **`-40.9%` cost** (`$0.68 -> $0.40`).
-  - **`gpt-6-luna`:** **`69/89 (77.5%) -> 85/89 (95.5%, +18.0%)`**, **`6/6` contracts (`100%`)**, **`-23.7%` exec calls** (`38 -> 29`), **`-13.8%` tokens** (`123.7k -> 106.7k`).
+  - **`gpt-6-luna`:** **`69/89 (77.5%) -> 85/89 (95.5%, +18.0%)`**, **`6/6` contracts (`100%`)**, **`CP1–CP2: 100%`**, **`CP4: 7/21 -> 19/21 (+57.1%)`**.
 - **Python Multi-File Services & Libraries:**
   - **`claude-sonnet-5-5` (`dynamic_config_service_api`, `76` tests / `26` CP3 tests):** **`72/76 (94.7%)`** overall (**`13/26 -> 24/26 (+42.3%)`** on CP3 subset), **`-47.8%` turns** (`23 -> 12`), **`-48.7%` cache read tokens** (`972k -> 499k`).
   - **`gpt-6.1-terra` (`dynamic_config_service_api`, `76` tests / `26` CP3 tests):** **`24/26 -> 26/26 (100.0%)`** on CP3 subset, **`-27.8%` exec calls** (`18 -> 13`), **`-19.2%` tokens** (`91.6k -> 74.1k`).
@@ -327,17 +355,21 @@ Evaluated across the same five coding models on a 12-package enterprise Java rep
 ## When Something Goes Wrong
 
 ### `StaleSnapshotError` (Exit Code `2`)
-`map`, `route`, `slice`, `impact`, and `flow` open the SQLite database read-only and verify that indexed source files have not changed on disk.
+`map`, `route`, `slice`, `impact`, and `flow` open the SQLite database read-only and verify that indexed source files (and `tsconfig.json` / `tsconfig.base.json`) have not changed on disk.
 - **If you want current workspace code:** Re-run `codegraph-slicer sync . --db "$GRAPH"`.
 - **If you want to query the pre-edit snapshot without re-syncing:** Pass `--snapshot` (`codegraph-slicer slice --snapshot --db "$GRAPH" ...`).
 
 ### `AnchorNotFoundError` (Exit Code `2`)
-When a requested symbol or file anchor cannot be resolved, `codegraph-slicer` returns nearest-match `candidates` in copy-pasteable `path/file.ext:Class.method` format (for example, `src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler.processOrder`) in `< seconds` even on million-line indices.
+When a requested symbol or file anchor cannot be resolved, `codegraph-slicer` prints `hint: did you mean:` or `hint: nearest anchor:` suggestions in copy-pasteable `path/file.ext:Class.method` format (for example, `src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler.processOrder`).
 - Copy the exact candidate anchor from the error diagnostic instead of guessing method names.
-- If a class's method names are unknown, pass the class anchor directly (`path/file.ext:ClassName`).
+- If `hint: no symbol named ... in any module` appears, run `codegraph-slicer map --db "$GRAPH" --seed <module>` to list the module's symbols or pass the class anchor directly (`path/file.ext:ClassName`).
 
-### Output Exceeds `--max-tokens`
-`--max-tokens` bounds the complete printed JSON, Markdown, or XML output (`len(output) // 4 + 1`). When records are omitted to fit the budget, exact omission counts (`<omitted>`) and line ranges (`lines="start-end"`) are reported so you can inspect specific lines or raise `--max-tokens`.
+### `RequiredAnchorOverflow` & `--max-tokens` Budgets (Exit Code `2`)
+`--max-tokens` bounds the complete printed JSON, Markdown, or XML output (`(len(output) + 1) // 4 + 1`, including the trailing newline). When optional callers or callees are omitted to fit the budget, exact omission counts (`<omitted>`) and line ranges (`lines="start-end"`) are reported.
+- If the required target definitions themselves exceed `--max-tokens`, the CLI exits `2` with `RequiredAnchorOverflow` and prints a fixed-point verified `rerun: codegraph-slicer slice ... --max-tokens <N>` command on stderr. Copy and run that `rerun:` command directly.
+
+### Unparseable Legacy Files (`CodeGraphParseError`, Exit Code `2`)
+If a workspace contains legacy or broken files (for example, an old Python 2 script in a Java or TypeScript repo), re-run `sync` with `--skip-unparseable` (`codegraph-slicer sync . --skip-unparseable --db "$GRAPH"`). Skipped files are recorded in index metadata without blocking queries.
 
 ### Small Repositories & Double-Context Tax
 On small repositories with no monoliths (`ScaleRecommendation` reports `bypass_slicer: true` / `mode: "map_then_read"`), reading 2–3 small files directly is faster and cheaper than loading both an XML slice and full files. Follow `bypass_slicer: true` and skip `slice` and `delta`.
@@ -350,22 +382,22 @@ On small repositories with no monoliths (`ScaleRecommendation` reports `bypass_s
 
 | Command | Purpose |
 | :--- | :--- |
-| **`sync`** | Index a workspace directory or Git `--revision` into SQLite (incremental on re-sync). |
-| **`map`** | Ranked PageRank repository map (`--seed` to focus on a package/path; `--recommend-workflow` for scale/monolith advisory). |
+| **`sync`** | Index a workspace directory or Git `--revision` into SQLite (`--scope <dir>` repeatable for monorepo subtrees; `--skip-unparseable` for legacy files; incremental & parallel on re-sync). |
+| **`map`** | Ranked PageRank repository map (`--seed` to focus on a package/path; `--recommend-workflow` for scale/monolith advisory; `--outline` for entity/edge schema; JSON/Markdown/XML). |
 | **`route`** | Fast (`< 25 ms` warm on 1M-LOC graphs) task prompt router returning `workflow_mode`, `resolved_anchors`, `target_files`, and ranked `slice_targets`. |
-| **`slice`** | Bounded XML/Markdown/JSON context slice combining `<types_and_schemas>`, `<upstream_callers>`, `<downstream_dependencies>`, and `<target_implementations>`. |
-| **`impact`** | Bounded transitive caller reachability (`--max-depth`, `--max-nodes`, `--include-ambiguous`). |
-| **`flow`** | Intraprocedural Python control/data-flow slice (`--variable`, `--line`, `--direction backward|forward`, `--data-only`, `--compact`). |
-| **`delta`** | Base-vs-head snapshot diff reporting modified symbols, added/removed edges, new cycles, complexity drift, and `--forbid-import` violations. |
+| **`slice`** | Bounded XML/Markdown/JSON context slice (`--db` for indexed snapshots or `--root` for zero-setup lazy slicing with `--max-files`, `--max-hops`, `--no-callers`; `--target-mode full\|skeleton`; `--dedup-session`; `--outline`). |
+| **`impact`** | Bounded transitive caller reachability (`--max-depth`, `--max-nodes`, `--unknown-boundaries`; JSON/Markdown/XML). |
+| **`flow`** | Intraprocedural Python control/data-flow slice (`--variable`, `--line`, `--direction backward\|forward`, `--data-only`, `--compact`). Python anchors only. |
+| **`delta`** | Base-vs-head snapshot diff reporting modified symbols, added/removed edges, new cycles, complexity drift, and `--forbid-import` violations (`--projection legacy\|v2`). |
 
 ### Language Support Matrix
 
 | Language | Extensions | Indexed Constructs & Static Resolution | Local `flow` |
 | :--- | :--- | :--- | :--- |
-| **Python** | `.py` | Classes, functions, `async def`, methods, `@property`, PEP 695 `type` aliases, C3 MRO inheritance, Protocol/ABC subtypes, constructor `self.<attr>` state coupling, and top-level file import preambles. | Yes (CFG + def-use). |
-| **Java** | `.java` | Classes, interfaces, enums, records (including compact constructors), nested classes (`Outer.Inner`), constructors, methods, fields, generic type unwrapping (`List<T> -> T`), `this.field.method()` chains, and arity-aware overload resolution. | No (use `slice`). |
-| **TypeScript** | `.ts`, `.tsx` | Classes, interfaces, type aliases, enums, functions, arrow callbacks, methods, `tsconfig.json` `baseUrl`/`paths` aliases, barrel `index.ts` re-exports, and JSX component tags. | No (use `slice`). |
-| **JavaScript** | `.js`, `.jsx`, `.mjs`, `.cjs` | ES modules & CommonJS (`require()`, `module.exports`, `exports.x`, barrel `index.js` spreads), classes, functions, prototype assignments (`Cls.prototype.m`), constructor `this.field` inference, `new ClassName()` `USES_TYPE` edges, and JSDoc `@param`/`@returns`/`@type` annotations. | No (use `slice`). |
+| **Python** | `.py` | Classes, functions, `async def`, methods, `@property`, PEP 695 `type` aliases, C3 MRO inheritance, Protocol/ABC subtypes, constructor `self.<attr>` state coupling, context-manager (`with` / `enter_context`) type inference, and top-level file import preambles. | Yes (CFG + def-use). |
+| **Java** | `.java` | Classes, interfaces, enums, records (including compact constructors), nested classes (`Outer.Inner`), constructors, methods, fields, generic type unwrapping (`List<T> -> T`), `this.field.method()` chains, overload sibling expansion, subtype call fanout, and wildcard package imports. | No (use `slice`). |
+| **TypeScript** | `.ts`, `.tsx` | Classes, interfaces (included in `<types_and_schemas>`), type aliases, enums, functions, arrow callbacks, methods, `tsconfig.json` and `tsconfig.base.json` `baseUrl`/`paths` aliases, barrel `index.ts` re-exports, JSX component tags, and CSS-in-JS generic tagged template literals (`styled.div<Props>\`...\``). | No (use `slice`). |
+| **JavaScript** | `.js`, `.jsx`, `.mjs`, `.cjs` | ES modules & CommonJS (`require()`, `module.exports`, `exports.x`, barrel `index.js` spreads), classes, functions, prototype assignments (`Cls.prototype.m`), constructor `this.field` inference, DI default parameter types, `new ClassName()` `USES_TYPE` edges, and JSDoc `@param`/`@returns`/`@type` annotations. | No (use `slice`). |
 
 See [HELP.md](HELP.md) for complete command schemas and static-analysis limits.
 
@@ -373,14 +405,14 @@ See [HELP.md](HELP.md) for complete command schemas and static-analysis limits.
 
 ## Philosophy
 
-- **Deterministic static evidence over brute-force `grep`:** Give the agent exact type schemas, constructor fields, caller snippets, and file import preambles before it edits.
-- **Scale-aware routing from 1k to 1M+ LOC:** Automatically bypass slicing on compact tasks while detecting and slicing monolithic files (`>= 300` lines, `>= 15` definitions, or `CC >= 25`) even in repositories with few files.
-- **Strict token budgets with explicit omission accounting:** Every command respects `--max-tokens` and reports exact counts of omitted records so nothing is silently dropped.
+- **Deterministic static evidence over brute-force `grep`:** Give the agent exact type schemas, interface contracts, constructor fields, caller snippets, and file import preambles before it edits.
+- **Scale-aware routing from 1k to 1M+ LOC:** Automatically bypass slicing on compact tasks while detecting and slicing monolithic files (`>= 300` lines, `>= 15` definitions, or `CC >= 25`)—and offer instant `slice --root` lazy slicing on unindexed monorepos.
+- **Strict token budgets with explicit omission accounting:** Every command respects `--max-tokens` (including trailing-newline accounting across JSON, Markdown, and XML) and reports exact counts of omitted records so nothing is silently dropped.
 - **Read-only queries & freshness guarantees:** Only `sync` writes to SQLite. All query commands open the database read-only and verify source freshness unless `--snapshot` is explicitly requested.
 - **Static evidence complements runtime tests:** Call graphs and slices accelerate localization and prevent contract mismatches; test suites verify runtime behavior.
 
 ```sh
-uv run pytest -q tests
+uv run --with pytest pytest -q
 ```
 
 ## License

@@ -4,7 +4,7 @@ Pull requests and issue reports are welcome!
 
 ## Development Setup
 
-`codegraph-slicer` requires **Python 3.12+** and `git` on `PATH`. Its only runtime dependencies are the prebuilt `tree-sitter` wheels (`tree-sitter`, `tree-sitter-java`, `tree-sitter-typescript`, `tree-sitter-javascript`).
+`codegraph-slicer` requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and `git` on `PATH`. Its only runtime dependencies are the prebuilt `tree-sitter` wheels (`tree-sitter`, `tree-sitter-java`, `tree-sitter-typescript`, `tree-sitter-javascript`).
 
 Clone a fork of the repository and run the test suite with [`uv`](https://docs.astral.sh/uv/) (or a standard `venv`):
 

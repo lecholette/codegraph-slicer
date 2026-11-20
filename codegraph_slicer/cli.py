@@ -767,9 +767,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="codegraph-slicer",
         description=(
-            "Build a static Python code graph, query bounded repository context,\n"
-            "or compare two indexed snapshots. Sync once, then run map or slice;\n"
-            "queries refuse stale or unverifiable source. Use --snapshot only to\n"
+            "Build a static Python, Java, TypeScript, and JavaScript code graph,\n"
+            "query bounded repository context, or compare two indexed snapshots.\n"
+            "Sync once, then run map, route, or slice (or use slice --root for\n"
+            "target-seeded lazy slicing without a prebuilt database); queries\n"
+            "refuse stale or unverifiable source. Use --snapshot only to\n"
             "intentionally query historical cached bytes.\n"
             "Sync ROOT indexes its workspace unless --revision selects a Git\n"
             "commit; each database holds one selected snapshot. This is static\n"
