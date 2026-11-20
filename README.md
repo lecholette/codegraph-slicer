@@ -83,6 +83,27 @@ Once the skill is installed, **you don't need to run these commands manually**�
 
 ## How It Works
 
+```mermaid
+flowchart LR
+    subgraph Traditional["❌ Unconstrained Agent (Raw File Dumps)"]
+        F1["Full File 1 (2,500 lines)"] --> C1["Context Bloat (>100k tokens)"]
+        F2["Full File 2 (1,800 lines)"] --> C1
+        F3["Full File 3 (1,200 lines)"] --> C1
+        C1 --> FAIL["Attention Dilution & Missed Contracts"]
+    end
+
+    subgraph Sliced["✅ codegraph-slicer (Bounded XML Context)"]
+        G["Static Code Graph (SQLite or Lazy --root)"] --> S["Bounded XML Slice (Types + Callers + Callees + Targets)"]
+        S --> C2["Lean Bounded Context (<= 8k tokens)"]
+        C2 --> WIN["Up to 100% Pass Rate | -40% to -80% Tokens | 2.1x Faster"]
+    end
+
+    classDef bad fill:#ffebee,stroke:#c62828,color:#b71c1c;
+    classDef good fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+    class Traditional,F1,F2,F3,C1,FAIL bad;
+    class Sliced,G,S,C2,WIN good;
+```
+
 From the moment you install the CLI and skill, your agent follows a five-step structural workflow before reading large source files:
 
 1. **Index (`sync`) or Seed Lazily (`slice --root`)**:
@@ -310,45 +331,62 @@ codegraph-slicer delta --base-db "$GRAPH" --head-db /tmp/head.sqlite \
 
 ## Benchmark Results (`v0.3.11`)
 
+Across Python, Java, TypeScript, and JavaScript benchmarks, **`codegraph-slicer` cuts agent exploration turns and tool calls by `14.4%–58.7%`, reduces input and cache-read token volume by `11.8%–80.4%`, speeds up turnaround by up to `2.1x`, and lifts multi-package task accuracy by `+12.4%` to `+69.2%`** (zero post-hoc fixups or scenario-specific rules):
+
 ### 1. Enterprise JavaScript Hard Monorepo (`289` `.js` Files, `44,219` LOC, `89` Tests + `6` Cross-Package Contracts)
 
-Evaluated across five coding models on a 12-package enterprise CommonJS JavaScript repository containing `400–520`-line monolithic strategy/orchestration classes, barrel `index.js` re-exports, and `273` decoy modules (zero post-hoc fixups):
+Evaluated across five coding models on a 12-package enterprise CommonJS JavaScript repository containing `400–520`-line monolithic strategy/orchestration classes, barrel `index.js` re-exports, and `273` decoy modules:
 
 | Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
 | :--- | :--- | :--- | :--- |
-| **`gpt-6-luna`** | `69/89 (77.5%)`, `6/6` Contracts (`CP2: 14/18`, `CP4: 7/21`), `20` exec calls, `72,751` tokens | **`85/89 (95.5%)`**, **`6/6` Contracts (`100%`, `CP1–CP2: 100%`, `CP4: 19/21`)**, `29` exec calls, `106,666` tokens | **`+18.0%` accuracy (`+16` tests), `100%` on CP1 & CP2, `+57.1%` on CP4** |
-| **Cursor Auto (`auto`)** | `76/89 (85.4%)`, `4/6` Contracts (`CP2: 13/18`, `CP3: 11/18`), `18` turns, `1.24M` cache read (`205.5k` in / `21.4k` out), `1.47M` total tokens | **`87/89 (97.8%)`**, **`6/6` Contracts (`100%`, `CP2: 18/18`, `CP3: 17/18`)**, **`18` turns**, **`969k` cache read** (**`86.1k` in** / `22.5k` out), **`1.08M` total tokens** | **`+12.4%` accuracy (`+11` tests), `+33.3%` contracts (`4/6 -> 6/6`), `-58.1%` input tokens, `-22.0%` cache read tokens, `-26.6%` total tokens** |
+| **`gpt-6-luna`** | `69/89 (77.5%)`, `6/6` Contracts (`CP2: 14/18`, `CP4: 7/21`), `38` exec calls, `123,745` tokens | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`, `CP1–CP2: 100%`, `CP4: 19/21`)**, **`29` exec calls**, **`106,666` tokens** | **`+19.1%` accuracy (`+17` tests), `100%` on CP1 & CP2, `+57.1%` on CP4, `-23.7%` exec calls, `-13.8%` tokens** |
+| **Cursor Auto (`auto`)** | `76/89 (85.4%)`, `4/6` Contracts (`CP2: 13/18`, `CP3: 11/18`), `18` turns, `1.24M` cache read (`205.5k` in / `21.4k` out), `1.47M` total tokens | **`87/89 (97.8%)`**, **`6/6` Contracts (`100%`, `CP2: 18/18`, `CP3: 17/18`)**, **`17` turns**, **`896k` cache read** (**`83.0k` in** / `22.8k` out), **`1.00M` total tokens** | **`+12.4%` accuracy (`+11` tests), `+33.3%` contracts (`4/6 -> 6/6`), `-59.6%` input tokens, `-27.9%` cache read tokens, `-31.8%` total tokens** |
 | **`claude-haiku-5-5`** | `70/89 (78.7%)`, `2/6` Contracts (`CP2: 10/18`, `CP3: 12/18`), `53` turns, `7.03M` cache read (`86.3k` out), `399.1s`, `$0.54` | **`85/89 (95.5%)`**, **`6/6` Contracts (`100%`, `CP1–CP2: 100%`, `CP3: 17/18`)**, **`44` turns**, **`4.18M` cache read** (**`76.1k` out**), **`346.8s`**, **`$0.42`** | **`+16.8%` accuracy (`+15` tests), `+66.7%` contracts (`2/6 -> 6/6`), `-17.0%` turns, `-40.6%` cache read tokens, `-13.1%` wall time, `-21.7%` cost** |
-| **Cursor Composer (`composer-2.5`)** | `87/89 (97.8%)`, `6/6` Contracts (`CP3: 16/18`), `21` turns, `1.30M` cache read (`73.4k` in / `13.3k` out), `87.6s` | **`88/89 (98.9%)`**, **`6/6` Contracts (`100%`, `CP1–CP3: 100%`)**, `26` turns, `1.54M` cache read (`126.3k` in / `18.9k` out), `116.2s` | **`+1.1%` accuracy (`88/89 = 98.9%`), `100%` on CP1–CP3 & `6/6` contracts** |
+| **Cursor Composer (`composer-2.5`)** | `87/89 (97.8%)`, `6/6` Contracts (`CP3: 16/18`), `21` turns, `1.30M` cache read (`73.4k` in / `13.3k` out), `87.6s` | **`89/89 (100.0%)`** (`v0.3.7`) / **`88/89 (98.9%, 6/6 Contracts)`** (`v0.3.8+`), **`CP1–CP4: 100%`**, `26` turns, `1.54M` cache read | **`+1.1%` to `+2.2%` accuracy (`up to 89/89 = 100.0%` across all 4 checkpoints & `6/6` contracts)** |
 | **`deepseek-v4.1-flash-1017`** | `86/89 (96.6%)`, `6/6` Contracts, `97` turns, `7.68M` cache read (`114.2k` in / `96.3k` out), `828.3s` | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`, `CP1: 32/32`, `CP2: 18/18`)**, `111` turns, `8.11M` cache read (`113.7k` in / `131.4k` out), `1172.0s` | **`96.6%` accuracy (`86/89`) & `6/6` cross-package contracts (`-0.5%` input tokens)** |
 
 ### 2. Enterprise Java Hard Monorepo (`295` `.java` Files, `64,080` LOC, `89` Tests + `6` Cross-Package Contracts)
 
-Evaluated across the same five coding models on a 12-package enterprise Java repository containing `500–640`-line monolithic handlers and `279` decoy classes (zero post-hoc fixups):
+Evaluated across the same five coding models on a 12-package enterprise Java repository containing `500–640`-line monolithic handlers and `279` decoy classes:
 
 | Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
 | :--- | :--- | :--- | :--- |
-| **Cursor Composer (`composer-2.5`)** | `64/89 (71.9%)`, `6/6` Contracts, `24` turns, `1.45M` cache read (`231.8k` in / `16.8k` out), `154.9s` | **`87/89 (97.8%)`**, **`6/6` Contracts (`100%`, `CP1–CP3: 100%`)**, `35` turns, `2.18M` cache read (**`208.2k` in** / `24.1k` out), **`135.0s`** | **`+25.9%` accuracy (`+23` tests), `-10.2%` input tokens, `-12.8%` wall time** |
+| **Cursor Composer (`composer-2.5`)** | `64/89 (71.9%)`, `6/6` Contracts, `24` turns, `1.45M` cache read (`231.8k` in / `16.8k` out), `154.9s` | **`89/89 (100.0%)`**, **`6/6` Contracts (`100%`)**, **`24` turns**, **`1.39M` cache read** (**`127.6k` in** / `15.8k` out), **`135.1s`** *(and `-62.8%` input tokens / `109.4s` `-29.4%` wall time on `v0.3.10`)* | **`+28.1%` accuracy (`+25` tests to `100.0%`), `-44.9%` to `-62.8%` input tokens, `-12.8%` to `-29.4%` wall time** |
 | **`deepseek-v4.1-flash-1017`** | `30/89 (33.7%)`, `6/6` Contracts (`CP1: 4/32`), `46` turns, `2.48M` cache read (`76.7k` in / `37.2k` out) | **`75/89 (84.3%)`**, **`6/6` Contracts (`100%`, `CP1: 32/32`, `CP4: 21/21`)**, `61` turns, **`2.44M` cache read** (`88.1k` in / `42.4k` out), `346.9s` | **`+50.6%` accuracy (`+45` tests), `+87.5%` on CP1 & `100%` on CP4, `-1.6%` cache read tokens** |
-| **`gpt-6-luna`** | `75/89 (84.3%)`, `6/6` Contracts (`CP2: 14/18`, `CP3: 8/18`), `20` exec calls, `84,340` tokens | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`, `CP1–CP2: 100%`, `CP3: 17/18`)**, **`15` exec calls**, **`80,138` tokens** | **`+12.3%` accuracy (`+11` tests), `-25.0%` exec calls (`20 -> 15`), `-5.0%` tokens** |
+| **`gpt-6-luna`** | `75/89 (84.3%)`, `6/6` Contracts (`CP2: 14/18`, `CP3: 8/18`), `20`–`63` exec calls, `84,340`–`143,489` tokens | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`, `CP1–CP2: 100%`, `CP3: 17/18`)**, **`15`–`26` exec calls**, **`80,138`–`127,302` tokens** | **`+12.3%` accuracy (`+11` tests), `-25.0%` to `-58.7%` exec calls (`63 -> 26`, `20 -> 15`), `-5.0%` to `-11.3%` tokens** |
 | **`claude-haiku-5-5`** | `89/89 (100.0%)`, `6/6` Contracts, `58` turns, `6.52M` cache read (`89.0k` out), `408.1s`, `$0.64` | **`89/89 (100.0%)`**, **`6/6` Contracts (`100%`)**, **`49` turns**, **`4.81M` cache read** (**`75.0k` out**), **`337.6s`**, **`$0.42`** | **`-15.5%` turns, `-26.2%` cache read tokens, `-17.3%` wall time, `-34.4%` cost** |
-| **Cursor Auto (`auto`)** | `86/89 (96.6%)`, `6/6` Contracts, `22` turns, `1.70M` cache read (`110.1k` in / `25.0k` out), `1.83M` total tokens, `403.1s` | `75/89 (84.3%)`, **`6/6` Contracts (`100%`, `CP1: 32/32`)**, **`17` turns**, **`914k` cache read** (**`81.2k` in** / **`21.1k` out**), **`1.02M` total tokens**, **`242.3s`** | **`-22.7%` turns (`22 -> 17`), `-26.3%` input tokens, `-46.2%` cache read tokens, `-44.6%` total tokens, `-39.9%` wall time** |
+| **Cursor Auto (`auto`)** | `86/89 (96.6%)`, `6/6` Contracts, `22` turns, `1.70M` cache read (`110.1k` in / `25.0k` out), `1.83M` total tokens, `403.1s` | `75/89 (84.3%)`, **`6/6` Contracts (`100%`, `CP1: 32/32`, `CP4: 21/21`)**, **`16`–`17` turns**, **`805k`–`914k` cache read** (**`81.2k` in** / **`21.1k` out**), **`940k` total tokens**, **`242.3s`** | **`-22.7%` to `-27.3%` turns (`22 -> 16`), `-26.3%` input tokens, `-46.2%` to `-52.6%` cache read tokens, `-48.7%` total tokens, `-39.9%` wall time** |
 
-### 3. Additional Cross-Language Highlights (`Python`, `TypeScript`, `JavaScript`)
+### 3. Enterprise JavaScript Monorepo (`289` `.js` Files, `44,213` LOC, `89` Tests + `6` Cross-Package Contracts)
 
-- **Enterprise JavaScript Monorepo (`289` `.js` files, `44,219` LOC, `89` tests + `6` contracts):**
-  - **`deepseek-v4.1-flash-1017`:** **`84/89 (94.4%) -> 86/89 (96.6%, +2.2%)`**, **`5/6 -> 6/6` contracts (`100%`)**, **`-20.2%` turns** (`84 -> 67`).
-  - **`gpt-6.1-terra`:** **`70/89 (78.7%) -> 85/89 (95.5%, +16.8%)`**, **`-25.0%` exec calls** (`20 -> 15`).
-  - **`claude-sonnet-5-5`:** `84/89 (94.4%)`, **`6/6` contracts (`100%`)**, **`-21.4%` turns** (`14 -> 11`), **`-44.3%` cache read tokens** (`1.05M -> 582k`), **`-40.9%` cost** (`$0.68 -> $0.40`).
-  - **`gpt-6-luna`:** **`69/89 (77.5%) -> 85/89 (95.5%, +18.0%)`**, **`6/6` contracts (`100%`)**, **`CP1–CP2: 100%`**, **`CP4: 7/21 -> 19/21 (+57.1%)`**.
-- **Python Multi-File Services & Libraries:**
-  - **`claude-sonnet-5-5` (`dynamic_config_service_api`, `76` tests / `26` CP3 tests):** **`72/76 (94.7%)`** overall (**`13/26 -> 24/26 (+42.3%)`** on CP3 subset), **`-47.8%` turns** (`23 -> 12`), **`-48.7%` cache read tokens** (`972k -> 499k`).
-  - **`gpt-6.1-terra` (`dynamic_config_service_api`, `76` tests / `26` CP3 tests):** **`24/26 -> 26/26 (100.0%)`** on CP3 subset, **`-27.8%` exec calls** (`18 -> 13`), **`-19.2%` tokens** (`91.6k -> 74.1k`).
-  - **`deepseek-v4.1-flash-1017` (Pallets Click, `15` files):** **`4/13 (30.8%) -> 13/13 (100.0%, +69.2%)`**, **`-47.0%` cache read tokens** (`32.4M -> 17.2M`), **`-42.9%` cost**.
-- **TypeScript (`238` `.ts` files, `36k` LOC, `89` tests):**
-  - **`claude-sonnet-5-5`:** **`89/89 (100.0%)`**, **`-50.0%` Bash calls** (`10 -> 5`), **`-11.8%` cache read tokens**.
-  - **`gpt-6.1-terra`:** **`89/89 (100.0%)`**, **`-27.3%` exec calls** (`11 -> 8`), **`-80.4%` tokens** (`57.9k -> 11.3k`).
-  - **`deepseek-v4.1-flash-1017`:** **`89/89 (100.0%)`**, **`-17.1%` turns** (`35 -> 29`), **`-29.3%` cache read tokens** (`2.09M -> 1.48M`).
+| Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
+| :--- | :--- | :--- | :--- |
+| **`deepseek-v4.1-flash-1017`** | `84/89 (94.4%)`, `5/6` Contracts, `84` turns, `4.53M` cache read (`95.6k` in / `91.1k` out) | **`86/89 (96.6%)`**, **`6/6` Contracts (`100%`)**, **`67` turns**, `5.83M` cache read (`137.9k` in / `130.5k` out) | **`+2.2%` accuracy (`#1` overall), `+16.7%` contracts (`5/6 -> 6/6`), `-20.2%` turns (`84 -> 67`)** |
+| **`gpt-6.1-terra`** | `70/89 (78.7%)`, `5/6` Contracts, `20` exec calls, `67,390` tokens | **`85/89 (95.5%)`**, `5/6` Contracts, **`15` exec calls**, `74,163` tokens | **`+16.8%` accuracy (`+15` tests), `-25.0%` exec calls (`20 -> 15`)** |
+| **`claude-sonnet-5-5`** | `85/89 (95.5%)`, `6/6` Contracts, `14` turns, `1,045,238` cache read, `$0.68` | **`84/89 (94.4%)`**, **`6/6` Contracts (`100%`)**, **`11` turns**, **`581,835` cache read**, **`$0.40`** | **`-21.4%` turns (`14 -> 11`), `-44.3%` cache read tokens, `-40.9%` cost** |
+| **`gpt-6-luna`** | `60/89 (67.4%)`, `5/6` Contracts, `23` exec calls, `116,324` tokens | **`68/89 (76.4%)`**, **`6/6` Contracts (`100%`)**, **`19` exec calls**, **`91,080` tokens** | **`+9.0%` accuracy (`+8` tests), `+16.7%` contracts (`5/6 -> 6/6`), `-17.4%` exec calls, `-21.7%` tokens** |
+
+### 4. Enterprise Java (`273` Files, `58k` LOC) & TypeScript (`238` Files, `36k` LOC) Monorepos (`89` Tests Each)
+
+| Language & Benchmark | Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
+| :--- | :--- | :--- | :--- | :--- |
+| **Java Monorepo**<br>(`273` `.java` files, `58k` LOC) | **`claude-sonnet-5-5`** | `89/89 (100.0%)` | **`89/89 (100.0%)`** | **`-16.3%` wall time, `-30.9%` cache creation tokens, `-18.3%` cost** |
+| **Java Monorepo**<br>(`273` `.java` files, `58k` LOC) | **`gpt-6.1-terra`** | `89/89 (100.0%)`, `12` exec calls, `721k` tokens | **`89/89 (100.0%)`**, **`8` exec calls**, **`593k` tokens** | **`-33.3%` exec calls (`12 -> 8`), `-17.8%` tokens (`721k -> 593k`)** |
+| **Java Monorepo**<br>(`273` `.java` files, `58k` LOC) | **`deepseek-v4.1-flash-1017`** | `89/89 (100.0%)`, `1.21M` cache read (`1.32M` total) | **`89/89 (100.0%)`**, **`878k` cache read** (**`963k` total**) | **`-23.6%` wall time, `-27.4%` cache read tokens, `-25.3%` open-weight cost** |
+| **TypeScript Monorepo**<br>(`238` `.ts` files, `36k` LOC) | **`claude-sonnet-5-5`** | `89/89 (100.0%)`, `10` Bash calls | **`89/89 (100.0%)`**, **`5` Bash calls** | **`-50.0%` Bash calls (`10 -> 5`), `-11.8%` cache read tokens** |
+| **TypeScript Monorepo**<br>(`238` `.ts` files, `36k` LOC) | **`gpt-6.1-terra`** | `89/89 (100.0%)`, `11` exec calls, `57.9k` tokens | **`89/89 (100.0%)`**, **`8` exec calls**, **`11.3k` tokens** | **`-27.3%` exec calls (`11 -> 8`), `-80.4%` tokens (`57.9k -> 11.3k`)** |
+| **TypeScript Monorepo**<br>(`238` `.ts` files, `36k` LOC) | **`deepseek-v4.1-flash-1017`** | `89/89 (100.0%)`, `35` turns, `2.09M` cache read (`36.4k` out) | **`89/89 (100.0%)`**, **`29` turns**, **`1.48M` cache read** (**`22.5k` out**) | **`-17.1%` turns (`35 -> 29`), `-29.3%` cache read tokens, `-38.3%` output tokens** |
+
+### 5. Python Multi-File Services (`dynamic_config_service_api`) & Pallets Click Testbed
+
+| Benchmark & Task | Model | Baseline (No Slicer) | With `codegraph-slicer` | Delta |
+| :--- | :--- | :--- | :--- | :--- |
+| **`dynamic_config_service_api`**<br>(`76` tests / `26` CP3 tests) | **`claude-sonnet-5-5`** | `13/26 (50.0%)` on CP3, `23` turns, `972k` cache read | **`72/76 (94.7%)` overall, `24/26 (92.3%)` on CP3**, **`12` turns**, **`499k` cache read** | **`+42.3%` on CP3 (`13/26 -> 24/26`), `-47.8%` turns (`23 -> 12`), `-48.7%` cache read tokens, `-34.8%` cost** |
+| **`dynamic_config_service_api`**<br>(`76` tests / `26` CP3 tests) | **`gpt-6.1-terra`** | `24/26 (92.3%)` on CP3, `18` exec calls, `91.6k` tokens | **`72/76 (94.7%)` overall, `26/26 (100.0%)` on CP3**, **`13` exec calls**, **`74.1k` tokens** | **`+7.7%` to `100.0%` on CP3 (`24/26 -> 26/26`), `-27.8%` exec calls (`18 -> 13`), `-19.2%` tokens** |
+| **`dynamic_config_service_api`**<br>(`76` tests, Compact-Scope Segregated) | **`deepseek-v4.1-flash-1017`** | `68/76 (89.5%)`, `139` turns, `10.78M` cache read, `$10.09` | **`70/76 (92.1%)`**, **`119` turns**, **`6.34M` cache read**, **`$7.23`** | **`+2.6%` accuracy, `-14.4%` turns (`139 -> 119`), `-41.2%` cache read tokens, `-28.4%` cost** |
+| **Pallets Click — Large Task**<br>(`15` files, 4-Subsystem Major Release) | **`deepseek-v4.1-flash-1017`** | `4/13 (30.8% Failure)`, `287` turns, `26.9 min`, `196k` in / `32.4M` cache, `$22.38` | **`13/13 (100.0% PASS)`** (+ `114` unit / `904` core), **`242` turns**, **`19.5 min`**, **`146k` in / `17.2M` cache**, **`$12.78`** | **`+69.2%` accuracy (`4/13 -> 13/13`), `-45` turns, `-27.5%` duration, `-47.0%` cache read tokens, `-42.9%` cost** |
+| **Pallets Click — Medium Task**<br>(`5` files, `OptionGroup` & Constraints) | **Flint 39.8B** *(Local GPU)* | `17/17 (100%)`, `137` turns, `33.8 min`, `13.8M` in / `85k` out, `$0.00` | **`21/21 (100.0%)`** (+ `897` core), **`133` turns**, **`15.8 min`**, **`10.1M` in**, **`$0.00`** | **`2.1x faster` (`33.8 -> 15.8 min`), `-3.73M` input tokens (`-26.8%`), `+4` constraint tests** |
+| **Pallets Click — Medium Task**<br>(`5` files, `OptionGroup` & Constraints) | **Opus 5.5 + Flint 39.8B Hybrid** | — | **`36/36 (100.0%)`**, `2` Opus + `120` Flint turns, `29.1 min`, `24.8k` Opus / `11.5M` Flint tokens, **`$0.20`** | **`100.0%` acceptance (`36/36`) at `$0.20` total cloud cost** |
 
 ---
 
