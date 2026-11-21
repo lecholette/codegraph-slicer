@@ -552,6 +552,73 @@ def test_stub_contract_domain_methods_and_flag_state_partition() -> None:
     assert ("HttpError(404)", "HttpError") in ts_c.raises
     assert ("HttpError", "HttpError") in ts_c.raises
 
+
+def test_entry_only_requires_self_caught_suppression_and_java_collection_mutates() -> None:
+    from codegraph_slicer.contracts import _BraceContractScanner, extract_direct_contract
+
+    # 1a. Mid-body guard on a local variable (`row`) must NOT leak into entry `@requires`,
+    # while still recording `@raises: KeyError("missing")`.
+    py_mid = extract_direct_contract(
+        "def load(self, uid: str):\n"
+        "    if not uid:\n"
+        "        raise ValueError('bad_uid')\n"
+        "    row = self.db.get(uid)\n"
+        "    if row is None:\n"
+        "        raise KeyError('missing')\n"
+        "    return row\n",
+        "svc.py",
+    )
+    assert py_mid.requires == (("not (not uid)", "ValueError"),)
+    assert ('KeyError("missing")', "KeyError") in py_mid.raises
+
+    js_mid = extract_direct_contract(
+        "function load(uid) {\n"
+        "  if (!uid) { throw new Error('bad_uid'); }\n"
+        "  const row = db.get(uid);\n"
+        "  if (!row) { throw new Error('missing'); }\n"
+        "  return row;\n"
+        "}",
+        "svc.js",
+    )
+    assert js_mid.requires == (("not (!uid)", "Error"),)
+    assert ('Error("missing")', "Error") in js_mid.raises
+
+    # 1b. Self-caught raise/throw inside a function's own try/except must NOT appear in @requires or @raises.
+    py_self_caught = extract_direct_contract(
+        "def safe_int(x: str) -> int:\n"
+        "    try:\n"
+        "        if not x:\n"
+        "            raise ValueError('empty')\n"
+        "        return int(x)\n"
+        "    except ValueError:\n"
+        "        return 0\n",
+        "safe.py",
+    )
+    assert py_self_caught.requires == ()
+    assert py_self_caught.raises == ()
+
+    java_self_caught = extract_direct_contract(
+        "public int safeParse(String s) {\n"
+        "    try {\n"
+        "        if (s == null) { throw new IllegalArgumentException(\"null_s\"); }\n"
+        "        return Integer.parseInt(s);\n"
+        "    } catch (IllegalArgumentException ex) {\n"
+        "        return 0;\n"
+        "    }\n"
+        "}",
+        "Safe.java",
+    )
+    assert java_self_caught.requires == ()
+    assert java_self_caught.raises == ()
+
+    # 3. Java collection/map mutating calls (`this.cache.put`, `this.items.add`) must record @mutates.
+    java_mut = extract_direct_contract(
+        "public void record(String k, int v) { this.cache.put(k, v); this.items.add(k); }",
+        "Store.java",
+    )
+    assert java_mut.mutates == ("this.cache", "this.items")
+
+
     java_c = extract_direct_contract(
         'public void check(int n) { if (n < 0) { throw new IllegalStateException("neg"); } this.total = n; }',
         "src/Order.JAVA",
@@ -562,6 +629,46 @@ def test_stub_contract_domain_methods_and_flag_state_partition() -> None:
     )
     assert java_c.requires == (("not (n < 0)", "IllegalStateException"),)
     assert java_c.mutates == ("this.total",)
+
+
+def test_class_instantiation_does_not_steal_unrelated_method_contracts(tmp_path: Path) -> None:
+    repo = tmp_path / "ts_ctor"
+    _write(
+        repo,
+        "src/api.ts",
+        '''export class SessionsApi {
+  public bulkArchive(req: string | null): void {
+    if (req == null) {
+      throw new Error("bulkArchiveRequest_required");
+    }
+  }
+}
+
+export class Client {
+  private api: SessionsApi;
+  constructor() {
+    this.api = new SessionsApi();
+  }
+  public ping(): boolean {
+    return Boolean(this.api);
+  }
+}
+''',
+    )
+    _write(
+        repo,
+        "src/main.ts",
+        '''import { Client } from "./api";
+export function boot(): boolean {
+  const c = new Client();
+  return c.ping();
+}
+''',
+    )
+    res = lazy_slice_context(repo, ["src/main.ts:boot"], max_tokens=8000, contracts=True)
+    txt = "\n".join(e["text"] for g in res["sections"].values() for e in g)
+    assert "bulkArchiveRequest_required" not in txt
+
 
 
 
