@@ -489,3 +489,79 @@ def run_entry(x: int) -> int:
     assert "\x1b" not in proc.stdout
 
 
+def test_stub_contract_domain_methods_and_flag_state_partition() -> None:
+    from codegraph_slicer.contracts import StubContract, extract_direct_contract, is_contracts_enabled
+
+    # Explicit state partitions: unset, blank/whitespace, and falsy tokens -> False
+    assert is_contracts_enabled(None, env_val=None) is False
+    assert is_contracts_enabled(None, env_val="") is False
+    assert is_contracts_enabled(None, env_val="   ") is False
+    assert is_contracts_enabled(None, env_val="0") is False
+    assert is_contracts_enabled(None, env_val="false") is False
+    assert is_contracts_enabled(None, env_val="1") is True
+    assert is_contracts_enabled(None, env_val="true") is True
+    assert is_contracts_enabled(False, env_val="1") is False
+    assert is_contracts_enabled(True, env_val="0") is True
+
+    # L1 StubContract domain behavior: catches, merge_callees, render_lines
+    callee_ok = StubContract(
+        requires=(("x > 0", "ValueError"), ("y > 0", "KeyError")),
+        raises=(('ValueError("bad_x")', "ValueError"), ('KeyError("missing_y")', "KeyError")),
+    )
+    own = StubContract(
+        requires=(("z is not None", "AssertionError"),),
+        caught_types=frozenset({"ValueError"}),
+        mutates=("self._cache",),
+    )
+    assert own.catches("ValueError") is True
+    assert own.catches("") is True
+    assert own.catches("KeyError") is False
+    assert StubContract(caught_types=frozenset({"Exception"})).catches("KeyError") is True
+    lines = own.render_with_callees([("helper", callee_ok)], comment_pfx="#", indent="    ")
+    assert lines == [
+        "    # @requires: z is not None",
+        "    # @requires: y > 0 [via helper]",
+        '    # @raises: KeyError("missing_y") [via helper]',
+        "    # @mutates: self._cache",
+    ]
+
+    # Case-insensitive suffix lookup table (.JAVA / .TSX) + direct scanner entrypoints
+    from codegraph_slicer.contracts import _BraceContractScanner, _PyContractScanner
+
+    py_c = _PyContractScanner.extract(
+        "def f(self, x):\n"
+        "    assert x >= 0\n"
+        "    if x == 99:\n"
+        "        raise RuntimeError\n"
+        "    if x == 100:\n"
+        "        raise ValueError(1.5)\n"
+        "    self.items.append(x)\n"
+    )
+    assert py_c.requires[0] == ("x >= 0", "AssertionError")
+    assert ("RuntimeError", "RuntimeError") in py_c.raises
+    assert ("ValueError(1.5)", "ValueError") in py_c.raises
+    assert py_c.mutates == ("self.items",)
+
+    ts_c = _BraceContractScanner.extract(
+        "function check(x: number) {\n"
+        "  if (x === 0) { throw new HttpError(404); }\n"
+        "  if (x === 1) { throw new HttpError(`dyn_${x}`); }\n"
+        "}",
+        "src/api.ts",
+    )
+    assert ("HttpError(404)", "HttpError") in ts_c.raises
+    assert ("HttpError", "HttpError") in ts_c.raises
+
+    java_c = extract_direct_contract(
+        'public void check(int n) { if (n < 0) { throw new IllegalStateException("neg"); } this.total = n; }',
+        "src/Order.JAVA",
+    )
+    assert java_c == _BraceContractScanner.extract(
+        'public void check(int n) { if (n < 0) { throw new IllegalStateException("neg"); } this.total = n; }',
+        "src/Order.JAVA",
+    )
+    assert java_c.requires == (("not (n < 0)", "IllegalStateException"),)
+    assert java_c.mutates == ("this.total",)
+
+
+

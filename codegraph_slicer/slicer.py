@@ -2038,17 +2038,13 @@ def _resolve_anchor_batch(store, anchors) -> dict:
     return chosen
 
 
-def _resolve_contracts_flag(contracts: bool | None) -> bool:
-    if contracts is not None:
-        return bool(contracts)
-    return os.environ.get("CODEGRAPH_CONTRACTS") == "1"
-
-
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
     render_estimator=None, database=None, target_mode="full", dedup_session=False,
     contracts: bool | None = None,
 ):
+    from .contracts import is_contracts_enabled
+
     if (
         not isinstance(max_tokens, int)
         or isinstance(max_tokens, bool)
@@ -2059,7 +2055,7 @@ def slice_context(
         raise ValueError(f"Unsupported target_mode: {target_mode}")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
-    use_contracts = _resolve_contracts_flag(contracts)
+    use_contracts = is_contracts_enabled(contracts)
     with store.read_snapshot():
         return _slice_context_in_snapshot(
             store,
