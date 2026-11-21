@@ -839,7 +839,7 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.12")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.13")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",
