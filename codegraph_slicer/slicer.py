@@ -17,6 +17,7 @@ from .ast_extractor import (
     is_supported_source_path,
     is_test_path,
 )
+from .data_contracts import extract_slice_data_contracts
 from .treesitter_support import node_text, parser_for, scoped_descendants
 from .ts_extractor import _TS_FUNCTION_NODES, _TS_TYPE_NODES
 
@@ -2336,6 +2337,9 @@ def _slice_context_in_snapshot(
 
     def result():
         payload = {"tokens": 0, "sections": sections}
+        data_contracts = extract_slice_data_contracts(store, sections)
+        if data_contracts:
+            payload["data_contracts"] = data_contracts
         if unresolved_anchors:
             payload["unresolved_anchors"] = list(unresolved_anchors)
         dropped = {
