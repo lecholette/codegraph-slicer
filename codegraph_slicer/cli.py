@@ -35,13 +35,15 @@ _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
 
 
-_XML_ILLEGAL_CTRL = str.maketrans(
-    "", "", "".join(chr(c) for c in (*range(0, 9), 11, 12, *range(14, 32), 127))
-)
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]")
+
+
+def _clean_xml10(raw: str) -> str:
+    return _XML_ILLEGAL_RE.sub("", raw)
 
 
 def _xml_text(raw: str) -> str:
-    return _saxutils.escape(raw.translate(_XML_ILLEGAL_CTRL))
+    return _saxutils.escape(_clean_xml10(raw))
 
 
 def _fence_lang(path: str) -> str:
@@ -203,7 +205,7 @@ def _flow_markdown(result):
 
 
 def _xml_attr(val):
-    return _saxutils.quoteattr(str(val))
+    return _saxutils.quoteattr(_clean_xml10(str(val)))
 
 
 @dataclass(frozen=True)

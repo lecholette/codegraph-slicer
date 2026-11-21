@@ -76,6 +76,10 @@ def _find_repo_files_index(root: Path) -> dict[str, list[str]]:
     return by_suffix
 
 
+def _is_safe_in_root(root_resolved: Path, full: Path) -> bool:
+    return not full.is_symlink() and full.is_file() and full.resolve().is_relative_to(root_resolved)
+
+
 def _grep_candidate_files(root: Path, needle: str, limit: int = 15) -> list[str]:
     if not needle or len(needle) < 2:
         return []
@@ -120,7 +124,10 @@ def _grep_candidate_files(root: Path, needle: str, limit: int = 15) -> list[str]
                         break
         return out
     needle_bytes = needle.encode("utf-8")
+    root_resolved = root.resolve()
     for path in _iter_workspace_files(root):
+        if not _is_safe_in_root(root_resolved, path):
+            continue
         rel = path.relative_to(root).as_posix()
         if _should_skip_rel_path(PurePosixPath(rel).parts):
             continue
@@ -267,9 +274,6 @@ def _populate_lazy_store(
     frontier: list[str] = []
     truncated = False
 
-    def _is_safe_in_root(full: Path) -> bool:
-        return not full.is_symlink() and full.is_file() and full.resolve().is_relative_to(root)
-
     def _enqueue(rel_p: str) -> None:
         nonlocal truncated
         if rel_p in explored_raw or rel_p in frontier:
@@ -278,7 +282,7 @@ def _populate_lazy_store(
             truncated = True
             return
         full = root / rel_p
-        if _is_safe_in_root(full) and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
+        if _is_safe_in_root(root, full) and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
             frontier.append(rel_p)
 
     for sp in seed_paths:
@@ -330,7 +334,7 @@ def _populate_lazy_store(
                 break
             remaining = max_files - len(explored_raw)
             for cand in _grep_candidate_files(root, needle, limit=min(15, remaining)):
-                if cand not in explored_raw and _is_safe_in_root(root / cand):
+                if cand not in explored_raw and _is_safe_in_root(root, root / cand):
                     explored_raw[cand] = (root / cand).read_bytes()
 
     # Re-extract with unified layout and insert into an in-memory GraphStore

@@ -2059,17 +2059,32 @@ def slice_context(
         raise AnchorNotFoundError("at least one anchor is required")
     use_contracts = is_contracts_enabled(contracts)
     with store.read_snapshot():
-        return _slice_context_in_snapshot(
-            store,
-            anchors,
-            max_tokens=max_tokens,
-            include_callee_bodies=include_callee_bodies,
-            render_estimator=render_estimator,
-            database=database,
-            target_mode=target_mode,
-            dedup_session=dedup_session,
-            contracts=use_contracts,
-        )
+        try:
+            return _slice_context_in_snapshot(
+                store,
+                anchors,
+                max_tokens=max_tokens,
+                include_callee_bodies=include_callee_bodies,
+                render_estimator=render_estimator,
+                database=database,
+                target_mode=target_mode,
+                dedup_session=dedup_session,
+                contracts=use_contracts,
+            )
+        except RequiredAnchorOverflow:
+            if not use_contracts:
+                raise
+            return _slice_context_in_snapshot(
+                store,
+                anchors,
+                max_tokens=max_tokens,
+                include_callee_bodies=include_callee_bodies,
+                render_estimator=render_estimator,
+                database=database,
+                target_mode=target_mode,
+                dedup_session=dedup_session,
+                contracts=False,
+            )
 
 
 def _condense_depth2_types_to_signatures(

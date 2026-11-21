@@ -57,6 +57,7 @@ class ConfigStore:
         return entry
 
     def get_resolved(self, name: str, scope_key: str) -> dict[str, Any]:
+        assert scope_key != ""
         if (name, scope_key) in self._cache:
             return dict(self._cache[(name, scope_key)])
         entry = self._get_entry(name, scope_key)
@@ -503,24 +504,23 @@ def test_stub_contract_domain_methods_and_flag_state_partition() -> None:
     assert is_contracts_enabled(False, env_val="1") is False
     assert is_contracts_enabled(True, env_val="0") is True
 
-    # L1 StubContract domain behavior: catches, merge_callees, render_lines
+    # L1 StubContract domain behavior: per-call-site catches, 1-hop @raises only (no 1-hop @requires!)
     callee_ok = StubContract(
         requires=(("x > 0", "ValueError"), ("y > 0", "KeyError")),
         raises=(('ValueError("bad_x")', "ValueError"), ('KeyError("missing_y")', "KeyError")),
     )
     own = StubContract(
         requires=(("z is not None", "AssertionError"),),
-        caught_types=frozenset({"ValueError"}),
+        caught_by_callee=(("helper", frozenset({"ValueError"})),),
         mutates=("self._cache",),
     )
-    assert own.catches("ValueError") is True
-    assert own.catches("") is True
-    assert own.catches("KeyError") is False
-    assert StubContract(caught_types=frozenset({"Exception"})).catches("KeyError") is True
+    assert own.callee_catches("helper", "ValueError") is True
+    assert own.callee_catches("helper", "") is True
+    assert own.callee_catches("helper", "KeyError") is False
+    assert own.callee_catches("unprotected_fn", "ValueError") is False
     lines = own.render_with_callees([("helper", callee_ok)], comment_pfx="#", indent="    ")
     assert lines == [
         "    # @requires: z is not None",
-        "    # @requires: y > 0 [via helper]",
         '    # @raises: KeyError("missing_y") [via helper]',
         "    # @mutates: self._cache",
     ]
@@ -668,6 +668,102 @@ export function boot(): boolean {
     res = lazy_slice_context(repo, ["src/main.ts:boot"], max_tokens=8000, contracts=True)
     txt = "\n".join(e["text"] for g in res["sections"].values() for e in g)
     assert "bulkArchiveRequest_required" not in txt
+
+
+def test_astra_and_fable_adversarial_slicer_regressions(tmp_path: Path) -> None:
+    import xml.etree.ElementTree as ET
+    from codegraph_slicer.cli import _xml_attr, _xml_text
+    from codegraph_slicer.contracts import extract_direct_contract
+
+    # 1. Effectful call (`items.clear()`) before `if` stops entry `@requires` scan (Fable #11 / Astra #9)
+    eff = extract_direct_contract(
+        "def f(items: list) -> None:\n    items.clear()\n    if items:\n        raise ValueError('never')\n",
+        "m.py",
+    )
+    assert eff.requires == ()
+    assert ('ValueError("never")', "ValueError") in eff.raises
+
+    # 2. Value-less `self.count: int` and `lambda: self.items.clear()` do NOT trigger `@mutates` (Astra #15)
+    deferred = extract_direct_contract(
+        "def f(self):\n    self.count: int\n    return lambda: self.items.clear()\n",
+        "m.py",
+    )
+    assert deferred.mutates == ()
+
+    # 3. TS/JS default arrow parameter `cb = () => { throw ... }` is NOT mistaken for method body (Fable #8)
+    ts_arrow = extract_direct_contract(
+        'run(cb = () => { throw new Error("from_default_param"); }) {\n'
+        "  if (!cb) { throw new RangeError(\"real_guard\"); }\n"
+        "  this.items.push(1);\n"
+        "}",
+        "svc.ts",
+    )
+    assert ts_arrow.requires == (("not (!cb)", "RangeError"),)
+    assert ('RangeError("real_guard")', "RangeError") in ts_arrow.raises
+    assert all("from_default_param" not in r[0] for r in ts_arrow.raises)
+    assert ts_arrow.mutates == ("this.items",)
+
+    # 4. Unrelated `try/except` in caller does NOT erase `@raises [via risky]` & no 1-hop `@requires` leak (Astra #9/#10, Fable #4/#5)
+    repo = tmp_path / "caller_try"
+    _write(
+        repo,
+        "pkg/mod.py",
+        '''def lookup(key: str) -> str:
+    if not key:
+        raise ValueError("empty_key")
+    return key
+
+
+def service_op(user_id: str) -> str:
+    """Service op with an unrelated try block followed by an unprotected lookup call."""
+    try:
+        _ = int("0")
+    except ValueError:
+        pass
+    a = user_id.strip()
+    b = a.lower()
+    return lookup(b)
+
+
+def entry(user_id: str) -> str:
+    return service_op(user_id)
+''',
+    )
+    db_path = tmp_path / "ct.sqlite"
+    sync_atomically(db_path, lambda s: s.sync_workspace(repo))
+    with GraphStore(db_path, readonly=True) as store:
+        sliced = slice_context(store, ["pkg.mod:entry"], max_tokens=8000, contracts=True)
+    dep_txt = "\n".join(e["text"] for e in sliced["sections"]["downstream_dependencies"])
+    assert '@raises: ValueError("empty_key") [via lookup]' in dep_txt
+    assert "[via lookup]" not in "\n".join(
+        ln for ln in dep_txt.splitlines() if "@requires:" in ln
+    )
+
+    # 5. Tight max_tokens budget where contracts would overflow falls open cleanly to non-contract slice (Fable #7)
+    big_repo = tmp_path / "tight_budget"
+    methods = "\n".join(
+        f'    def m{i}(self, x: int) -> int:\n        if x < {i}:\n            raise ValueError("err_{i}")\n        self._v{i} = x\n        return x\n'
+        for i in range(12)
+    )
+    _write(
+        big_repo,
+        "app.py",
+        f"class BigSvc:\n{methods}\n\ndef run(s: BigSvc) -> int:\n    return s.m0(1)\n",
+    )
+    tight_db = tmp_path / "tight.sqlite"
+    sync_atomically(tight_db, lambda s: s.sync_workspace(big_repo))
+    with GraphStore(tight_db, readonly=True) as store:
+        plain = slice_context(store, ["app:run"], max_tokens=8000, contracts=False)
+        min_budget = plain["tokens"] + 15
+        res_tight = slice_context(store, ["app:run"], max_tokens=min_budget, contracts=True)
+    assert res_tight["tokens"] <= min_budget
+
+    # 6. XML 1.0 U+FFFE / U+FFFF / surrogate stripping in both _xml_text and _xml_attr (Astra #16)
+    frag = f"<slice path={_xml_attr('a\uffffb.py')}>{_xml_text('hi\ufffe\uffff')}</slice>"
+    parsed = ET.fromstring(frag)
+    assert parsed.attrib["path"] == "ab.py"
+    assert parsed.text == "hi"
+
 
 
 

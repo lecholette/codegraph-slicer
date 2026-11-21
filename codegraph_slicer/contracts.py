@@ -6,6 +6,7 @@ import os
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .treesitter_support import (
     child_of_type,
@@ -33,6 +34,16 @@ _TS_SKIP_SCOPES = frozenset(
 _JAVA_SKIP_SCOPES = frozenset(
     {"class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "lambda_expression"}
 )
+_BRACE_FN_NODES = frozenset(
+    {
+        "method_declaration",
+        "constructor_declaration",
+        "method_definition",
+        "function_declaration",
+        "generator_function_declaration",
+    }
+)
+_PY_SKIP_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.GeneratorExp)
 _BROAD_CATCH_NAMES = frozenset({"*", "Exception", "BaseException", "Throwable", "Error", "RuntimeException"})
 _COMMENT_NODES = frozenset({"comment", "line_comment", "block_comment"})
 _GRAMMAR_BY_EXT = {".java": "java", ".ts": "tsx", ".tsx": "tsx", ".jsx": "tsx"}
@@ -107,46 +118,45 @@ def _dedupe_pairs(pairs: list[tuple[str, str]], limit: int) -> tuple[tuple[str, 
     return tuple(out)
 
 
+def _caught_covers(caught_set: frozenset[str], exc_short: str) -> bool:
+    if not caught_set:
+        return False
+    if not exc_short or (caught_set & _BROAD_CATCH_NAMES):
+        return True
+    return exc_short in caught_set
+
+
 def _append_uncaught_raise(
     raises: list[tuple[str, str]],
     formatted: tuple[str, str] | None,
     active_caught: frozenset[str],
 ) -> None:
-    if formatted and not StubContract(caught_types=active_caught).catches(formatted[1]):
+    if formatted and not _caught_covers(active_caught, formatted[1]):
         raises.append(formatted)
+
+
+def _record_call_site_caught(
+    sites: dict[str, frozenset[str]],
+    callee_name: str,
+    active_caught: frozenset[str],
+) -> None:
+    if not callee_name:
+        return
+    sites[callee_name] = active_caught if callee_name not in sites else (sites[callee_name] & active_caught)
 
 
 @dataclass(frozen=True, slots=True)
 class StubContract:
     requires: tuple[tuple[str, str], ...] = ()
     raises: tuple[tuple[str, str], ...] = ()
-    caught_types: frozenset[str] = frozenset()
+    caught_by_callee: tuple[tuple[str, frozenset[str]], ...] = ()
     mutates: tuple[str, ...] = ()
 
-    def catches(self, exc_short: str) -> bool:
-        if not self.caught_types:
-            return False
-        if not exc_short or (self.caught_types & _BROAD_CATCH_NAMES):
-            return True
-        return exc_short in self.caught_types
-
-    def _merge_callee_into(
-        self,
-        callee_short: str,
-        callee: StubContract,
-        req_lines: list[str],
-        seen_reqs: set[str],
-        raise_lines: list[str],
-        seen_raises: set[str],
-    ) -> None:
-        for req_expr, req_exc in callee.requires:
-            if len(req_lines) < 2 and not self.catches(req_exc) and req_expr not in seen_reqs:
-                seen_reqs.add(req_expr)
-                req_lines.append(f"{req_expr} [via {callee_short}]")
-        for expr, exc_short in callee.raises:
-            if len(raise_lines) < 3 and not self.catches(exc_short) and expr not in seen_raises:
-                seen_raises.add(expr)
-                raise_lines.append(f"{expr} [via {callee_short}]")
+    def callee_catches(self, callee_short: str, exc_short: str) -> bool:
+        for name, cset in self.caught_by_callee:
+            if name == callee_short:
+                return _caught_covers(cset, exc_short)
+        return False
 
     def render_with_callees(
         self,
@@ -154,14 +164,16 @@ class StubContract:
         comment_pfx: str,
         indent: str = "    ",
     ) -> list[str]:
-        req_lines = [expr for expr, _ in self.requires]
-        seen_reqs = set(req_lines)
+        req_lines = [expr for expr, _ in self.requires[:2]]
         raise_lines = [expr for expr, _ in self.raises]
         seen_raises = set(raise_lines)
         for callee_short, ccontract in callees:
-            self._merge_callee_into(callee_short, ccontract, req_lines, seen_reqs, raise_lines, seen_raises)
+            for expr, exc_short in ccontract.raises:
+                if len(raise_lines) < 3 and not self.callee_catches(callee_short, exc_short) and expr not in seen_raises:
+                    seen_raises.add(expr)
+                    raise_lines.append(f"{expr} [via {callee_short}]")
 
-        lines = [f"{indent}{comment_pfx} @requires: {req}" for req in req_lines[:2]]
+        lines = [f"{indent}{comment_pfx} @requires: {req}" for req in req_lines]
         lines.extend(f"{indent}{comment_pfx} @raises: {r_expr}" for r_expr in raise_lines[:3])
         if self.mutates:
             lines.append(f"{indent}{comment_pfx} @mutates: {', '.join(self.mutates)}")
@@ -169,7 +181,7 @@ class StubContract:
 
 
 class _PyContractScanner:
-    """Extracts @requires, @raises, caught types, and self.<field> @mutates from Python ASTs."""
+    """Extracts @requires, @raises, per-call caught types, and self.<field> @mutates from Python ASTs."""
 
     @staticmethod
     def _safe_unparse(node: ast.AST) -> str | None:
@@ -228,17 +240,21 @@ class _PyContractScanner:
             return f"self.{curr.attr}"
         return None
 
+    @staticmethod
+    def _mutation_targets(node: ast.AST) -> list[ast.AST]:
+        if isinstance(node, ast.Assign):
+            return list(node.targets)
+        if isinstance(node, ast.AugAssign):
+            return [node.target]
+        if isinstance(node, ast.AnnAssign) and node.value is not None:
+            return [node.target]
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in _PY_MUTATING_METHODS:
+            return [node.func.value]
+        return []
+
     @classmethod
     def _node_mutations(cls, node: ast.AST) -> list[str]:
-        if isinstance(node, ast.Assign):
-            return [a for tgt in node.targets if (a := cls._self_attr(tgt))]
-        if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
-            attr = cls._self_attr(node.target)
-            return [attr] if attr else []
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            if node.func.attr in _PY_MUTATING_METHODS and (attr := cls._self_attr(node.func.value)):
-                return [attr]
-        return []
+        return [a for tgt in cls._mutation_targets(node) if (a := cls._self_attr(tgt))]
 
     @classmethod
     def _caught_types(cls, handler: ast.ExceptHandler) -> set[str]:
@@ -249,11 +265,15 @@ class _PyContractScanner:
         elts = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
         return {_short_exc_name(u) for elt in elts if (u := cls._safe_unparse(elt))}
 
+    @staticmethod
+    def _is_docstring_stmt(stmt: ast.stmt) -> bool:
+        return isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str)
+
     @classmethod
     def _leading_requires(cls, fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[tuple[str, str]]:
         reqs: list[tuple[str, str]] = []
-        for stmt in fn_node.body:
-            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Call)):
+        for idx, stmt in enumerate(fn_node.body):
+            if idx == 0 and cls._is_docstring_stmt(stmt):
                 continue
             pre = cls._node_precondition(stmt)
             if pre is None:
@@ -261,18 +281,22 @@ class _PyContractScanner:
             reqs.append(pre)
         return reqs
 
+    @staticmethod
+    def _call_short_name(call: ast.Call) -> str:
+        if isinstance(call.func, ast.Attribute):
+            return call.func.attr
+        return call.func.id if isinstance(call.func, ast.Name) else ""
+
     @classmethod
     def _push_try_children(
         cls,
         stack: list[tuple[ast.AST, frozenset[str]]],
         node: ast.Try,
         active_caught: frozenset[str],
-        all_caught: set[str],
     ) -> None:
         own: set[str] = set()
         for handler in node.handlers:
             own.update(cls._caught_types(handler))
-        all_caught.update(own)
         inner_caught = active_caught | frozenset(own)
         for child in reversed([*node.finalbody, *node.orelse, *node.handlers]):
             stack.append((child, active_caught))
@@ -280,27 +304,42 @@ class _PyContractScanner:
             stack.append((stmt, inner_caught))
 
     @classmethod
+    def _visit_py_node(
+        cls,
+        node: ast.AST,
+        active_caught: frozenset[str],
+        is_ctor: bool,
+        raises: list[tuple[str, str]],
+        call_sites: dict[str, frozenset[str]],
+        muts: list[str],
+    ) -> None:
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            _append_uncaught_raise(raises, cls._format_raise(node.exc), active_caught)
+            return
+        if isinstance(node, ast.Call):
+            _record_call_site_caught(call_sites, cls._call_short_name(node), active_caught)
+        if not is_ctor:
+            muts.extend(cls._node_mutations(node))
+
+    @classmethod
     def _scan_body(
         cls, fn_node: ast.FunctionDef | ast.AsyncFunctionDef, is_ctor: bool
-    ) -> tuple[list[tuple[str, str]], set[str], list[str]]:
+    ) -> tuple[list[tuple[str, str]], dict[str, frozenset[str]], list[str]]:
         raises: list[tuple[str, str]] = []
-        all_caught: set[str] = set()
+        call_sites: dict[str, frozenset[str]] = {}
         muts: list[str] = []
         stack: list[tuple[ast.AST, frozenset[str]]] = [(s, frozenset()) for s in reversed(fn_node.body)]
         while stack:
             node, active_caught = stack.pop()
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(node, _PY_SKIP_SCOPES):
                 continue
             if isinstance(node, ast.Try):
-                cls._push_try_children(stack, node, active_caught, all_caught)
+                cls._push_try_children(stack, node, active_caught)
                 continue
-            if isinstance(node, ast.Raise) and node.exc is not None:
-                _append_uncaught_raise(raises, cls._format_raise(node.exc), active_caught)
-            elif not is_ctor:
-                muts.extend(cls._node_mutations(node))
+            cls._visit_py_node(node, active_caught, is_ctor, raises, call_sites, muts)
             for child in reversed(list(ast.iter_child_nodes(node))):
                 stack.append((child, active_caught))
-        return raises, all_caught, muts
+        return raises, call_sites, muts
 
     @classmethod
     def extract(cls, body: str) -> StubContract:
@@ -314,18 +353,18 @@ class _PyContractScanner:
 
         reqs = cls._leading_requires(fn_node)
         is_ctor = fn_node.name in {"__init__", "__new__"}
-        raises, caught, muts = cls._scan_body(fn_node, is_ctor)
+        raises, call_sites, muts = cls._scan_body(fn_node, is_ctor)
 
         return StubContract(
             requires=_dedupe_pairs(reqs, 2),
             raises=_dedupe_pairs(raises, 3),
-            caught_types=frozenset(caught),
+            caught_by_callee=tuple(sorted(call_sites.items())),
             mutates=_dedupe_cap(muts, 3),
         )
 
 
 class _BraceContractScanner:
-    """Extracts @requires, @raises, caught types, and this.<field> @mutates for Java/TS/JS."""
+    """Extracts @requires, @raises, per-call caught types, and this.<field> @mutates for Java/TS/JS."""
 
     @staticmethod
     def _is_ctor_node(data: bytes, node, grammar: str) -> bool:
@@ -344,13 +383,10 @@ class _BraceContractScanner:
         if root.has_error:
             data = f"class _ {{\n{body}\n}}".encode("utf-8")
             root = parser.parse(data).root_node
-        block_type = "block" if grammar == "java" else "statement_block"
-        is_ctor = False
         for node in scoped_descendants(root, set()):
-            if cls._is_ctor_node(data, node, grammar):
-                is_ctor = True
-            if node.type == block_type:
-                return data, node, is_ctor
+            if node.type in _BRACE_FN_NODES:
+                fbody = node.child_by_field_name("body") or child_of_type(node, "block", "statement_block")
+                return data, fbody, cls._is_ctor_node(data, node, grammar)
         return data, None, False
 
     @staticmethod
@@ -461,18 +497,11 @@ class _BraceContractScanner:
             return {"*"}
         return {_short_exc_name(p.strip()) for p in node_text(data, catch_type).split("|") if p.strip()}
 
-    @staticmethod
-    def _is_pure_call_stmt(node) -> bool:
-        if node.type != "expression_statement":
-            return False
-        exprs = [c for c in node.children if c.type not in {";", *_COMMENT_NODES}]
-        return len(exprs) == 1 and exprs[0].type in {"call_expression", "method_invocation"}
-
     @classmethod
     def _leading_requires(cls, data: bytes, fbody) -> list[tuple[str, str]]:
         reqs: list[tuple[str, str]] = []
         for child in fbody.children:
-            if child.type in {"{", "}", ";", *_COMMENT_NODES} or cls._is_pure_call_stmt(child):
+            if child.type in {"{", "}", ";", *_COMMENT_NODES}:
                 continue
             guard = cls._if_guard_pair(data, child) if child.type == "if_statement" else None
             if guard is None:
@@ -487,26 +516,50 @@ class _BraceContractScanner:
         node,
         grammar: str,
         active_caught: frozenset[str],
-        all_caught: set[str],
         stack: list[tuple[object, frozenset[str]]],
     ) -> None:
         own: set[str] = set()
         for child in node.children:
             if child.type == "catch_clause":
                 own.update(cls._catch_types(data, child, grammar))
-        all_caught.update(own)
         try_body = child_of_type(node, "block", "statement_block")
         inner_caught = active_caught | frozenset(own)
         for child in reversed(node.children):
             c_set = inner_caught if (try_body is not None and child.id == try_body.id) else active_caught
             stack.append((child, c_set))
 
+    @staticmethod
+    def _brace_call_short_name(data: bytes, node) -> str:
+        head = node_text(data, node).split("(", 1)[0].split("<", 1)[0].strip()
+        short = head.rsplit(".", 1)[-1].strip()
+        return short if short.isidentifier() else ""
+
+    @classmethod
+    def _visit_brace_node(
+        cls,
+        data: bytes,
+        node,
+        active_caught: frozenset[str],
+        is_ctor: bool,
+        raises: list[tuple[str, str]],
+        call_sites: dict[str, frozenset[str]],
+        muts: list[str],
+    ) -> None:
+        if node.type == "throw_statement":
+            _append_uncaught_raise(raises, cls._format_throw(data, node), active_caught)
+            return
+        if node.type in {"call_expression", "method_invocation"}:
+            _record_call_site_caught(call_sites, cls._brace_call_short_name(data, node), active_caught)
+        if not is_ctor:
+            if mut := cls._this_mutation(data, node):
+                muts.append(mut)
+
     @classmethod
     def _scan_brace_body(
         cls, data: bytes, fbody, grammar: str, skip: frozenset[str], is_ctor: bool
-    ) -> tuple[list[tuple[str, str]], set[str], list[str]]:
+    ) -> tuple[list[tuple[str, str]], dict[str, frozenset[str]], list[str]]:
         raises: list[tuple[str, str]] = []
-        all_caught: set[str] = set()
+        call_sites: dict[str, frozenset[str]] = {}
         muts: list[str] = []
         stack: list[tuple[object, frozenset[str]]] = [(c, frozenset()) for c in reversed(fbody.children)]
         while stack:
@@ -514,16 +567,12 @@ class _BraceContractScanner:
             if node.type in skip:  # type: ignore[attr-defined]
                 continue
             if node.type == "try_statement":  # type: ignore[attr-defined]
-                cls._push_brace_try(data, node, grammar, active_caught, all_caught, stack)
+                cls._push_brace_try(data, node, grammar, active_caught, stack)
                 continue
-            if node.type == "throw_statement":  # type: ignore[attr-defined]
-                _append_uncaught_raise(raises, cls._format_throw(data, node), active_caught)
-            elif not is_ctor:
-                if mut := cls._this_mutation(data, node):
-                    muts.append(mut)
+            cls._visit_brace_node(data, node, active_caught, is_ctor, raises, call_sites, muts)
             for child in reversed(node.children):  # type: ignore[attr-defined]
                 stack.append((child, active_caught))
-        return raises, all_caught, muts
+        return raises, call_sites, muts
 
     @classmethod
     def extract(cls, body: str, file_path: str) -> StubContract:
@@ -533,12 +582,12 @@ class _BraceContractScanner:
             return StubContract()
         skip = _JAVA_SKIP_SCOPES if grammar == "java" else _TS_SKIP_SCOPES
         reqs = cls._leading_requires(data, fbody)
-        raises, caught, muts = cls._scan_brace_body(data, fbody, grammar, skip, is_ctor)
+        raises, call_sites, muts = cls._scan_brace_body(data, fbody, grammar, skip, is_ctor)
 
         return StubContract(
             requires=_dedupe_pairs(reqs, 2),
             raises=_dedupe_pairs(raises, 3),
-            caught_types=frozenset(caught),
+            caught_by_callee=tuple(sorted(call_sites.items())),
             mutates=_dedupe_cap(muts, 3),
         )
 
@@ -551,20 +600,11 @@ def extract_direct_contract(body: str, file_path: str) -> StubContract:
     return _BraceContractScanner.extract(body, file_path)
 
 
-def format_symbol_contract_lines(
-    store,
-    row,
-    comment_pfx: str,
-    indent: str = "    ",
-    cache: dict[str, StubContract] | None = None,
-) -> list[str]:
-    sid = row["symbol_id"]
-    memo = cache if cache is not None else {}
-    own = memo.get(sid)
-    if own is None:
-        own = extract_direct_contract(row["body"], row["file_path"])
-        memo[sid] = own
-
+def _resolve_callees(store, sid: str, memo: dict[Any, Any]) -> list[tuple[str, StubContract]]:
+    callees_key = ("callees", sid)
+    cached = memo.get(callees_key)
+    if cached is not None:
+        return cached
     callee_rows = store.rows(
         """SELECT DISTINCT s.symbol_id, s.qualname, s.file_path, s.body
            FROM symbols s JOIN edges e ON s.symbol_id = e.target_id
@@ -582,5 +622,22 @@ def format_symbol_contract_lines(
             ccontract = extract_direct_contract(crow["body"], crow["file_path"])
             memo[csid] = ccontract
         callees.append((crow["qualname"].rsplit(".", 1)[-1], ccontract))
+    memo[callees_key] = callees
+    return callees
 
+
+def format_symbol_contract_lines(
+    store,
+    row,
+    comment_pfx: str,
+    indent: str = "    ",
+    cache: dict[Any, Any] | None = None,
+) -> list[str]:
+    sid = row["symbol_id"]
+    memo = cache if cache is not None else {}
+    own = memo.get(sid)
+    if own is None:
+        own = extract_direct_contract(row["body"], row["file_path"])
+        memo[sid] = own
+    callees = _resolve_callees(store, sid, memo)
     return own.render_with_callees(callees, comment_pfx=comment_pfx, indent=indent)
