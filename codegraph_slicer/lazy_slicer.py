@@ -76,6 +76,10 @@ def _find_repo_files_index(root: Path) -> dict[str, list[str]]:
     return by_suffix
 
 
+def _is_safe_in_root(root_resolved: Path, full: Path) -> bool:
+    return not full.is_symlink() and full.is_file() and full.resolve().is_relative_to(root_resolved)
+
+
 def _grep_candidate_files(root: Path, needle: str, limit: int = 15) -> list[str]:
     if not needle or len(needle) < 2:
         return []
@@ -120,7 +124,10 @@ def _grep_candidate_files(root: Path, needle: str, limit: int = 15) -> list[str]
                         break
         return out
     needle_bytes = needle.encode("utf-8")
+    root_resolved = root.resolve()
     for path in _iter_workspace_files(root):
+        if not _is_safe_in_root(root_resolved, path):
+            continue
         rel = path.relative_to(root).as_posix()
         if _should_skip_rel_path(PurePosixPath(rel).parts):
             continue
@@ -173,6 +180,12 @@ def _resolve_target_to_paths(
     files_by_name: dict[str, list[str]],
 ) -> list[str]:
     clean = target.split(MODULE_END, 1)[0].split(":", 1)[0].strip()
+    if from_file.endswith(".java") and MODULE_END in target:
+        sym_tail = target.split(MODULE_END, 1)[1].split(":", 1)[0].strip()
+        head_ident = sym_tail.split(".", 1)[0]
+        if head_ident[:1].isupper():
+            pkg_prefix = clean.rpartition(".")[0]
+            clean = f"{pkg_prefix}.{head_ident}" if pkg_prefix else head_ident
     if not clean or clean.startswith("?"):
         return []
     found: list[str] = []
@@ -269,7 +282,7 @@ def _populate_lazy_store(
             truncated = True
             return
         full = root / rel_p
-        if full.is_file() and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
+        if _is_safe_in_root(root, full) and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
             frontier.append(rel_p)
 
     for sp in seed_paths:
@@ -321,7 +334,7 @@ def _populate_lazy_store(
                 break
             remaining = max_files - len(explored_raw)
             for cand in _grep_candidate_files(root, needle, limit=min(15, remaining)):
-                if cand not in explored_raw:
+                if cand not in explored_raw and _is_safe_in_root(root, root / cand):
                     explored_raw[cand] = (root / cand).read_bytes()
 
     # Re-extract with unified layout and insert into an in-memory GraphStore
@@ -436,6 +449,7 @@ def lazy_slice_context(
     render_estimator=None,
     target_mode: str = "full",
     dedup_session: bool | str = False,
+    contracts: bool | None = None,
 ):
     store, coverage = _populate_lazy_store(
         Path(root),
@@ -454,6 +468,7 @@ def lazy_slice_context(
             render_estimator=wrapped,
             target_mode=target_mode,
             dedup_session=dedup_session,
+            contracts=contracts,
         )
         result["coverage"] = coverage
         if wrapped is not None:

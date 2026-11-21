@@ -35,6 +35,17 @@ _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
 
 
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]")
+
+
+def _clean_xml10(raw: str) -> str:
+    return _XML_ILLEGAL_RE.sub("", raw)
+
+
+def _xml_text(raw: str) -> str:
+    return _saxutils.escape(_clean_xml10(raw))
+
+
 def _fence_lang(path: str) -> str:
     if path.endswith(".java"):
         return "java"
@@ -194,7 +205,7 @@ def _flow_markdown(result):
 
 
 def _xml_attr(val):
-    return _saxutils.quoteattr(str(val))
+    return _saxutils.quoteattr(_clean_xml10(str(val)))
 
 
 @dataclass(frozen=True)
@@ -461,7 +472,7 @@ def render_xml_report(result):
                 end = item.get("end_line")
                 lines_attr = f' lines="{start}-{end}"' if start and end else (f' lines="{lines_span}"' if lines_span else "")
                 blocks.append(f'    <code_slice{sym_attr}{file_attr}{lines_attr}>')
-                blocks.append(_saxutils.escape(raw_text))
+                blocks.append(_xml_text(raw_text))
                 blocks.append("    </code_slice>")
             blocks.append(f"  </{section_name}>")
         blocks.append("</context>")
@@ -480,12 +491,12 @@ def render_xml_report(result):
             file_attr = f' path={_xml_attr(file_path)}' if file_path else ""
             sym_attr = f' symbol={_xml_attr(item["symbol"])}' if "symbol" in item else ""
             blocks.append(f'  <file{file_attr}{sym_attr}>')
-            blocks.append(_saxutils.escape(item.get("text", "").rstrip()))
+            blocks.append(_xml_text(item.get("text", "").rstrip()))
             blocks.append("  </file>")
         blocks.append("</repository_map>")
         return "\n".join(blocks)
 
-    return f"<codegraph_report>\n{_saxutils.escape(json.dumps(result, indent=2))}\n</codegraph_report>"
+    return f"<codegraph_report>\n{_xml_text(json.dumps(result, indent=2))}\n</codegraph_report>"
 
 
 def _file_language(path: str) -> str:
@@ -828,7 +839,7 @@ def main(argv=None):
         epilog=f"Full cookbook and limitations: {Path(__file__).resolve().parent.parent / 'HELP.md'}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.3.12")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.3.13")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sync = sub.add_parser(
         "sync",
@@ -888,6 +899,7 @@ def main(argv=None):
     slicing.add_argument("--target-mode", choices=("full", "skeleton"), default="full", help="target implementation detail level (default: full)")
     slicing.add_argument("--dedup-session", action="store_true", help="compact repeated types and callers across slice calls in the same session")
     slicing.add_argument("--dedup-session-id", default=None, help="explicit session identifier for --dedup-session")
+    slicing.add_argument("--contracts", action="store_true", help="annotate compressed method and callee stubs with @requires, @raises, and @mutates")
     impact = sub.add_parser(
         "impact",
         help="find bounded transitive callers over resolved call edges",
@@ -1047,6 +1059,7 @@ def main(argv=None):
                         render_estimator=_render_budget_estimator(args.format),
                         target_mode=args.target_mode,
                         dedup_session=args.dedup_session_id or args.dedup_session,
+                        contracts=True if args.contracts else None,
                     )
             else:
                 if args.cmd == "slice" and not args.db:
@@ -1139,6 +1152,7 @@ def main(argv=None):
                             render_estimator=_render_budget_estimator(args.format),
                             target_mode=args.target_mode,
                             dedup_session=args.dedup_session_id or args.dedup_session,
+                            contracts=True if args.contracts else None,
                         )
         if args.format == "markdown":
             rendered = _markdown(result)

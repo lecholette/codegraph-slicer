@@ -212,7 +212,7 @@ codegraph-slicer route --db /tmp/project.sqlite \
 codegraph-slicer slice (--db DATABASE | --root ROOT) ANCHOR [ANCHOR ...]
                        [--max-tokens N] [--include-callee-bodies] [--outline]
                        [--include-imports] [--target-mode full|skeleton]
-                       [--dedup-session] [--dedup-session-id ID]
+                       [--dedup-session] [--dedup-session-id ID] [--contracts]
                        [--max-files N] [--max-hops N] [--no-callers]
                        [--snapshot] [--format json|markdown|xml]
 ```
@@ -231,6 +231,11 @@ outside that coverage are unexplored, not absent. `--snapshot` has no effect in
 when you plan to read the target files anyway). `--dedup-session` compacts
 types and callers already emitted by an earlier `slice` call in the same
 session; pass `--dedup-session-id ID` to name the session explicitly.
+`--contracts` (or `CODEGRAPH_CONTRACTS=1`) annotates compressed method and
+callee stubs with deterministic `@requires`, `@raises` (including 1-hop
+`[via callee]` propagation), and `@mutates` clauses across Python, Java,
+TypeScript, and JavaScript, failing open to unannotated stubs if tight
+`--max-tokens` budgets would otherwise overflow.
 
 Supply one or more anchors in any of these forms:
 
