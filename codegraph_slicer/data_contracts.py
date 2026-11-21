@@ -10,14 +10,13 @@ _PII_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-_ANNOTATION_TABLE_RE = re.compile(
-    r"""@(?:Table|Entity)\s*\([^)]*\bname\s*=\s*["']([^"']+)["']""",
-)
 _RESTRICTION_RE = re.compile(
-    r"""@(?:SQLRestriction|Where)\s*\(\s*(?:clause\s*=\s*)?["']([^"']+)["']""",
+    r'@(?:SQLRestriction|Where)\s*\(\s*(?:clause\s*=\s*)?"((?:[^"\\]|\\.)*)"',
+    re.DOTALL,
 )
 _COL_ANN_RE = re.compile(
-    r"""@(?:Column|JoinColumn)\s*\([^)]*\bname\s*=\s*["']([^"']+)["']""",
+    r'@(?:Column|JoinColumn)\s*\([^)]*\bname\s*=\s*"((?:[^"\\]|\\.)*)"',
+    re.DOTALL,
 )
 _REL_ANN_RE = re.compile(r"@(OneToMany|ManyToMany|ManyToOne|OneToOne)\b")
 _FIELD_DECL_RE = re.compile(
@@ -129,25 +128,98 @@ def _record_java_field(
         pii.append(col_name)
 
 
+def _scan_balanced_parens(text: str, open_idx: int) -> tuple[int, int]:
+    """Return (end_idx_after_close, unclosed_depth) starting at '(' while skipping string literals."""
+    depth = 1
+    pos = open_idx + 1
+    n = len(text)
+    quote = ""
+    while pos < n and depth > 0:
+        ch = text[pos]
+        if quote:
+            if ch == "\\" and pos + 1 < n:
+                pos += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in ('"', "'"):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        pos += 1
+    return pos, depth
+
+
+def _strip_leading_annotations(line: str) -> str:
+    """Strip leading @Annotation(...) prefixes from a Java declaration line."""
+    pos = 0
+    n = len(line)
+    while pos < n and line[pos] == "@":
+        pos += 1
+        while pos < n and (line[pos].isalnum() or line[pos] in "._"):
+            pos += 1
+        while pos < n and line[pos].isspace():
+            pos += 1
+        if pos < n and line[pos] == "(":
+            pos, _ = _scan_balanced_parens(line, pos)
+            while pos < n and line[pos].isspace():
+                pos += 1
+    return line[pos:].strip()
+
+
+def _has_unclosed_ann_paren(line: str) -> bool:
+    idx = line.find("(")
+    while idx >= 0:
+        end_pos, depth = _scan_balanced_parens(line, idx)
+        if depth > 0:
+            return True
+        idx = line.find("(", end_pos)
+    return False
+
+
 def _scan_java_fields(body: str) -> tuple[dict[str, str], tuple[str, ...], tuple[str, ...]]:
     columns: dict[str, str] = {}
     relations: list[str] = []
     pii: list[str] = []
     pending_col: str | None = None
     pending_rel: str | None = None
+    ann_buf = ""
 
     for raw_line in body.splitlines():
         line = raw_line.strip()
+        if ann_buf:
+            ann_buf = f"{ann_buf} {line}".strip()
+            if _has_unclosed_ann_paren(ann_buf):
+                continue
+            line, ann_buf = ann_buf, ""
+        elif line.startswith("@") and _has_unclosed_ann_paren(line):
+            ann_buf = line
+            continue
         if col_m := _COL_ANN_RE.search(line):
             pending_col = col_m.group(1)
         if rel_m := _REL_ANN_RE.search(line):
             pending_rel = rel_m.group(1)
-        if not line or line.startswith("@") or line.endswith("{"):
+        decl = _strip_leading_annotations(line)
+        if not decl or decl.endswith("{"):
             continue
-        _record_java_field(line, pending_col, pending_rel, columns, relations, pii)
+        _record_java_field(decl, pending_col, pending_rel, columns, relations, pii)
         pending_col = None
         pending_rel = None
-    return columns, tuple(relations), tuple(dict.fromkeys(pii))
+    return dict(list(columns.items())[:12]), tuple(relations), tuple(dict.fromkeys(pii))
+
+
+def _extract_table_name(header_text: str, symbol: str) -> str:
+    m = re.search(r"@Table\s*\(", header_text)
+    if m:
+        end_pos, _ = _scan_balanced_parens(header_text, m.end() - 1)
+        table_args = header_text[m.end() : end_pos - 1]
+        # Strip nested {...} (e.g., indexes={@Index(name="...")}) before matching name=
+        top_args = re.sub(r"\{[^{}]*\}", "", table_args, flags=re.DOTALL)
+        if nm := re.search(r'\bname\s*=\s*"((?:[^"\\]|\\.)*)"', top_args):
+            return nm.group(1)
+    return symbol.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
 
 
 def _extract_java_entity_contract(
@@ -155,8 +227,7 @@ def _extract_java_entity_contract(
 ) -> DataContract | None:
     if "@Entity" not in header_text and "@Table" not in header_text:
         return None
-    table_m = _ANNOTATION_TABLE_RE.search(header_text)
-    table = table_m.group(1) if table_m else symbol.rsplit(".", 1)[-1]
+    table = _extract_table_name(header_text, symbol)
     filters = tuple(_RESTRICTION_RE.findall(header_text))
     columns, relations, pii = _scan_java_fields(body)
     return DataContract(
@@ -170,15 +241,43 @@ def _extract_java_entity_contract(
     )
 
 
-def _py_stmt_col_and_table(stmt: ast.stmt) -> tuple[str | None, str | None]:
+def _py_call_name(call: ast.Call) -> str:
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return ""
+
+
+def _py_orm_col_name(attr_name: str, value: ast.expr | None) -> str | None:
+    if attr_name.startswith("__"):
+        return None
+    if isinstance(value, ast.Call):
+        cname = _py_call_name(value)
+        if cname in {"relationship", "association_proxy"}:
+            return None
+        if cname in {"Column", "mapped_column"}:
+            if value.args and isinstance(value.args[0], ast.Constant) and isinstance(value.args[0].value, str):
+                return value.args[0].value
+            for kw in value.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                    return kw.value.value
+    return attr_name
+
+
+def _py_stmt_col_and_table(stmt: ast.stmt) -> tuple[str | None, tuple[str, str] | None]:
+    attr_name: str | None = None
+    value: ast.expr | None = None
     if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-        name = stmt.targets[0].id
-        if name == "__tablename__" and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
-            return stmt.value.value, None
-        return None, name
-    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-        return None, stmt.target.id
-    return None, None
+        attr_name, value = stmt.targets[0].id, stmt.value
+    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        attr_name, value = stmt.target.id, stmt.value
+    if not attr_name:
+        return None, None
+    if attr_name == "__tablename__" and isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return value.value, None
+    col_name = _py_orm_col_name(attr_name, value)
+    return None, (attr_name, col_name) if col_name else None
 
 
 def _parse_first_classdef(body: str) -> ast.ClassDef | None:
@@ -201,12 +300,13 @@ def _extract_python_orm_contract(symbol: str, path: str, body: str) -> DataContr
     columns: dict[str, str] = {}
     pii: list[str] = []
     for stmt in cls_node.body:
-        tbl_val, col_name = _py_stmt_col_and_table(stmt)
+        tbl_val, col_pair = _py_stmt_col_and_table(stmt)
         if tbl_val:
             table = tbl_val
-        elif col_name:
-            columns[col_name] = col_name
-            if _is_pii_name(col_name):
+        elif col_pair:
+            attr_name, col_name = col_pair
+            columns[attr_name] = col_name
+            if _is_pii_name(attr_name) or _is_pii_name(col_name):
                 pii.append(col_name)
     if not table:
         return None
@@ -215,7 +315,7 @@ def _extract_python_orm_contract(symbol: str, path: str, body: str) -> DataContr
         path=path,
         table=table,
         filters=(),
-        columns=columns,
+        columns=dict(list(columns.items())[:12]),
         relations=(),
         pii_columns=tuple(dict.fromkeys(pii)),
     )

@@ -18,15 +18,22 @@ def test_jpa_entity_contracts_and_annotations_preserved_in_slice_xml(tmp_path, c
         "import jakarta.persistence.*;\n"
         "import java.util.List;\n"
         "import org.hibernate.annotations.SQLRestriction;\n"
-        "@Entity\n"
-        "@Table(name = \"dw_invoices\")\n"
-        "@SQLRestriction(\"deleted_at IS NULL AND is_test = FALSE\")\n"
+        "@Entity(name = \"LogicalInvoice\")\n"
+        "@Table(name = \"dw_invoices\", indexes = {@Index(name = \"idx_email\", columnList = \"tax_id\")})\n"
+        "@SQLRestriction(\"status = 'ACTIVE' AND deleted_at IS NULL\")\n"
         "public class InvoiceEntity {\n"
         "    @Id\n"
         "    @Column(name = \"invoice_id\")\n"
         "    private Long invoiceId;\n"
-        "    @Column(name = \"net_amount_usd_cents\", nullable = false)\n"
+        "    @Column(name = \"net_amount_usd_cents\", columnDefinition = \"NUMERIC(10,2\")\n"
         "    private Long netAmountCents;\n"
+        "    @Column(name = \"inline_cents\") private Long inlineCents;\n"
+        "    private String plainMemo;\n"
+        "    @Column(\n"
+        "        name = \"multiline_cents\",\n"
+        "        nullable = false\n"
+        "    )\n"
+        "    private Long multilineCents;\n"
         "    @Column(name = \"tax_id\")\n"
         "    private String taxId;\n"
         "    @OneToMany(mappedBy = \"invoice\")\n"
@@ -73,8 +80,11 @@ def test_jpa_entity_contracts_and_annotations_preserved_in_slice_xml(tmp_path, c
         contracts = res.get("data_contracts")
         assert contracts
         inv_c = next(c for c in contracts if c["table"] == "dw_invoices")
-        assert inv_c["filters"] == ["deleted_at IS NULL AND is_test = FALSE"]
+        assert inv_c["filters"] == ["status = 'ACTIVE' AND deleted_at IS NULL"]
         assert inv_c["columns"]["netAmountCents"] == "net_amount_usd_cents"
+        assert inv_c["columns"]["inlineCents"] == "inline_cents"
+        assert "plainMemo" not in inv_c["columns"]
+        assert inv_c["columns"]["multilineCents"] == "multiline_cents"
         assert "tax_id" in inv_c["pii_columns"]
         assert any("1:N" in rel and "paymentAttempts" in rel for rel in inv_c["relations"])
 
@@ -91,7 +101,7 @@ def test_jpa_entity_contracts_and_annotations_preserved_in_slice_xml(tmp_path, c
     xml_out = capsys.readouterr().out
     assert "<data_contracts>" in xml_out
     assert 'table="dw_invoices"' in xml_out
-    assert "deleted_at IS NULL AND is_test = FALSE" in xml_out
+    assert "status = &#x27;ACTIVE&#x27; AND deleted_at IS NULL" in xml_out or "status = 'ACTIVE' AND deleted_at IS NULL" in xml_out
     assert "netAmountCents=net_amount_usd_cents" in xml_out
     assert "1:N paymentAttempts" in xml_out
 
@@ -108,7 +118,7 @@ def test_jpa_entity_contracts_and_annotations_preserved_in_slice_xml(tmp_path, c
     md_out = capsys.readouterr().out
     assert "## Data Contracts" in md_out
     assert "table `dw_invoices`" in md_out
-    assert "filters: `deleted_at IS NULL AND is_test = FALSE`" in md_out
+    assert "filters: `status = 'ACTIVE' AND deleted_at IS NULL`" in md_out
     assert "`netAmountCents=net_amount_usd_cents`" in md_out
     assert "`1:N paymentAttempts -> List<PaymentAttemptEntity>`" in md_out
     assert "pii: `tax_id`" in md_out
@@ -119,9 +129,11 @@ def test_python_sqlalchemy_model_emits_data_contract_and_plain_code_omits_it(tmp
     root.mkdir()
     (root / "models.py").write_text(
         "class OrderModel:\n"
-        "    __tablename__ = 'dw_orders'\n"
+        "    __tablename__: str = 'dw_orders'\n"
+        "    __table_args__ = ({'schema': 'billing'},)\n"
         "    order_id = 1\n"
-        "    billing_email: str = ''\n"
+        "    billing_email = Column('email_address', str)\n"
+        "    items = relationship('Item')\n"
         "    def helper(self) -> int:\n"
         "        return self.order_id\n\n"
         "def load_order(o: OrderModel) -> int:\n"
@@ -137,8 +149,10 @@ def test_python_sqlalchemy_model_emits_data_contract_and_plain_code_omits_it(tmp
         contract = orm_res["data_contracts"][0]
         assert contract["table"] == "dw_orders"
         assert contract["columns"]["order_id"] == "order_id"
-        assert contract["columns"]["billing_email"] == "billing_email"
-        assert "billing_email" in contract["pii_columns"]
+        assert contract["columns"]["billing_email"] == "email_address"
+        assert "__table_args__" not in contract["columns"]
+        assert "items" not in contract["columns"]
+        assert "email_address" in contract["pii_columns"]
 
         plain_res = slice_context(store, ["models:plain_math"], max_tokens=2000)
         assert "data_contracts" not in plain_res
