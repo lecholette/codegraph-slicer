@@ -8,7 +8,7 @@ Ask a coding agent to change a method in a large repository and it can spend its
 
 Install the CLI and bundled skill, and your agent automatically checks repository structure before drowning in raw file reads. Small, straightforward tasks bypass slicing and go directly to the files; large monoliths and cross-package changes get structural context first—either from a fast local SQLite index (`sync` + `slice --db`) or immediately with zero upfront indexing via target-seeded lazy slicing (`slice --root .`).
 
-**`v0.3.11`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
+**`v0.3.12`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
 
 ---
 
@@ -32,7 +32,7 @@ Install the CLI and bundled skill, and your agent automatically checks repositor
 ### Step 1: Install the CLI (Python 3.12+)
 
 ```sh
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.11"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.12"
 ```
 
 ### Step 2: Install the Agent Skill (Pick Your Harness)
@@ -40,7 +40,7 @@ uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.11"
 ```sh
 # Claude Code:
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.11/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.12/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 
 # Cursor (Global):
@@ -423,7 +423,7 @@ On small repositories with no monoliths (`ScaleRecommendation` reports `bypass_s
 | **`sync`** | Index a workspace directory or Git `--revision` into SQLite (`--scope <dir>` repeatable for monorepo subtrees; `--skip-unparseable` for legacy files; incremental & parallel on re-sync). |
 | **`map`** | Ranked PageRank repository map (`--seed` to focus on a package/path; `--recommend-workflow` for scale/monolith advisory; `--outline` for entity/edge schema; JSON/Markdown/XML). |
 | **`route`** | Fast (`< 25 ms` warm on 1M-LOC graphs) task prompt router returning `workflow_mode`, `resolved_anchors`, `target_files`, and ranked `slice_targets`. |
-| **`slice`** | Bounded XML/Markdown/JSON context slice (`--db` for indexed snapshots or `--root` for zero-setup lazy slicing with `--max-files`, `--max-hops`, `--no-callers`; `--target-mode full\|skeleton`; `--dedup-session`; `--outline`). |
+| **`slice`** | Bounded XML/Markdown/JSON context slice (`--db` for indexed snapshots or `--root` for zero-setup lazy slicing with `--max-files`, `--max-hops`, `--no-callers`; `--target-mode full\|skeleton`; `--dedup-session`; `--outline`), including lightweight JPA/ORM `<data_contracts>` (table, filters, columns, relations, PII) when entity schemas appear in the slice. |
 | **`impact`** | Bounded transitive caller reachability (`--max-depth`, `--max-nodes`, `--unknown-boundaries`; JSON/Markdown/XML). |
 | **`flow`** | Intraprocedural Python control/data-flow slice (`--variable`, `--line`, `--direction backward\|forward`, `--data-only`, `--compact`). Python anchors only. |
 | **`delta`** | Base-vs-head snapshot diff reporting modified symbols, added/removed edges, new cycles, complexity drift, and `--forbid-import` violations (`--projection legacy\|v2`). |

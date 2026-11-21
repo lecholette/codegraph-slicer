@@ -266,6 +266,45 @@ def _markdown_coverage(coverage: dict) -> str:
     return "\n".join(lines)
 
 
+def _xml_data_contracts(contracts: list[dict]) -> list[str]:
+    lines = ["  <data_contracts>"]
+    for c in contracts:
+        lines.append(
+            f'    <data_contract symbol={_xml_attr(c["symbol"])} '
+            f'path={_xml_attr(c["path"])} table={_xml_attr(c["table"])}>'
+        )
+        for flt in c.get("filters", ()):
+            lines.append(f"      <filter>{_saxutils.escape(flt)}</filter>")
+        if c.get("columns"):
+            mapped = ", ".join(f"{k}={v}" for k, v in c["columns"].items())
+            lines.append(f"      <columns>{_saxutils.escape(mapped)}</columns>")
+        for rel in c.get("relations", ()):
+            lines.append(f"      <relation>{_saxutils.escape(rel)}</relation>")
+        if c.get("pii_columns"):
+            lines.append(
+                f"      <pii_columns>{_saxutils.escape(', '.join(c['pii_columns']))}</pii_columns>"
+            )
+        lines.append("    </data_contract>")
+    lines.append("  </data_contracts>")
+    return lines
+
+
+def _markdown_data_contracts(contracts: list[dict]) -> str:
+    lines = ["## Data Contracts"]
+    for c in contracts:
+        parts = [f"- `{c['symbol']}` -> table `{c['table']}` (`{c['path']}`)"]
+        if c.get("filters"):
+            parts.append("  filters: " + "; ".join(f"`{f}`" for f in c["filters"]))
+        if c.get("columns"):
+            parts.append("  columns: " + ", ".join(f"`{k}={v}`" for k, v in c["columns"].items()))
+        if c.get("relations"):
+            parts.append("  relations: " + "; ".join(f"`{r}`" for r in c["relations"]))
+        if c.get("pii_columns"):
+            parts.append("  pii: " + ", ".join(f"`{p}`" for p in c["pii_columns"]))
+        lines.extend(parts)
+    return "\n".join(lines)
+
+
 def _xml(result):
     return render_xml_report(result)
 
@@ -326,6 +365,8 @@ def render_xml_report(result):
             blocks.append("  </omitted>")
         if result.get("coverage"):
             blocks.extend(_xml_coverage(result["coverage"]))
+        if result.get("data_contracts"):
+            blocks.extend(_xml_data_contracts(result["data_contracts"]))
         blocks.append("</slice_outline>")
         return "\n".join(blocks)
 
@@ -382,6 +423,8 @@ def render_xml_report(result):
         blocks = [f'<context tokens="{result.get("tokens", 0)}">']
         if result.get("coverage"):
             blocks.extend(_xml_coverage(result["coverage"]))
+        if result.get("data_contracts"):
+            blocks.extend(_xml_data_contracts(result["data_contracts"]))
         if result.get("unresolved_anchors"):
             blocks.append("  <unresolved_anchors>")
             for anchor in result["unresolved_anchors"]:
@@ -595,6 +638,8 @@ def render_markdown_report(result):
             )
         if result.get("coverage"):
             blocks.append(_markdown_coverage(result["coverage"]))
+        if result.get("data_contracts"):
+            blocks.append(_markdown_data_contracts(result["data_contracts"]))
         return "\n\n".join(blocks)
     if "schema_version" in result and "files" in result and "edges" in result:
         blocks = [f"# Repository outline (schema v{result['schema_version']})"]
@@ -716,6 +761,8 @@ def render_markdown_report(result):
         blocks = [f"Estimated context tokens: {result['tokens']}"]
         if result.get("coverage"):
             blocks.append(_markdown_coverage(result["coverage"]))
+        if result.get("data_contracts"):
+            blocks.append(_markdown_data_contracts(result["data_contracts"]))
         if result.get("unresolved_anchors"):
             blocks.append(
                 "## unresolved anchors\n\n"
