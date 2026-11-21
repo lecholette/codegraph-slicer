@@ -2,9 +2,9 @@
 
 import ast
 import builtins
-import copy
 import hashlib
 import io
+import re
 import tokenize
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -169,9 +169,33 @@ def module_name(path: str, source_root: str = "") -> str:
     return name.removesuffix(".__init__") if name != "__init__" else "__init__"
 
 
-def _signature(node, text: str) -> str:
+_SOURCE_LINE = re.compile(r"(.*?(?:\r\n|\n|\r|$))")
+
+
+def _source_lines(text: str) -> list[str]:
+    """Split like the parser does (no form feed), keeping line ends; the `ast.get_source_segment` split."""
+    return [m[0] for m in _SOURCE_LINE.finditer(text)]
+
+
+def _source_segment(lines: list[str], node) -> str | None:
+    """`ast.get_source_segment` over pre-split lines; col offsets are UTF-8 byte offsets."""
+    try:
+        if node.end_lineno is None or node.end_col_offset is None:
+            return None
+        lineno, end_lineno = node.lineno - 1, node.end_lineno - 1
+        col_offset, end_col_offset = node.col_offset, node.end_col_offset
+    except AttributeError:
+        return None
+    if end_lineno == lineno:
+        return lines[lineno].encode()[col_offset:end_col_offset].decode()
+    first = lines[lineno].encode()[col_offset:].decode()
+    last = lines[end_lineno].encode()[:end_col_offset].decode()
+    return "".join([first, *lines[lineno + 1 : end_lineno], last])
+
+
+def _signature(node, source_lines: list[str]) -> str:
     """Take the original header up to its depth-zero colon, including multiline annotations."""
-    segment = ast.get_source_segment(text, node) or ""
+    segment = _source_segment(source_lines, node) or ""
     depth = 0
     for token in tokenize.generate_tokens(io.StringIO(segment).readline):
         if token.type == tokenize.OP:
@@ -263,6 +287,7 @@ def extract_file(
     module = module_name(path, source_root)
     package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
     lines = text.splitlines()
+    source_lines = _source_lines(text)
     symbols: list[Symbol] = []
     edges: list[Edge] = []
     scope: list[str] = []
@@ -846,7 +871,7 @@ def extract_file(
                 Symbol(
                     sid,
                     kind,
-                    _signature(node, text),
+                    _signature(node, source_lines),
                     "\n".join(lines[start - 1 : end]),
                     start,
                     end,
@@ -1396,7 +1421,8 @@ def extract_file(
                     edges.append(Edge(f"{csid}.{fname}", ft, "FIELD_TYPE", 0))
 
     Visitor().visit(tree)
-    skeleton = ast.unparse(_Strip().visit(copy.deepcopy(tree))) + "\n"
+    # _Strip mutates in place; `tree` is not read after this point, so no defensive deepcopy.
+    skeleton = ast.unparse(_Strip().visit(tree)) + "\n"
     symbols.insert(
         0, Symbol(module + ":", "module", module, text, 1, max(1, len(lines)), 1)
     )
