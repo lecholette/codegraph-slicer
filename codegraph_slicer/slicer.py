@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import difflib
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ from .ast_extractor import (
     is_supported_source_path,
     is_test_path,
 )
+from .data_contracts import extract_slice_data_contracts
 from .treesitter_support import node_text, parser_for, scoped_descendants
 from .ts_extractor import _TS_FUNCTION_NODES, _TS_TYPE_NODES
 
@@ -2365,8 +2367,21 @@ def _slice_context_in_snapshot(
     body_fallbacks = {}
     omitted_detail_limit = None
 
-    def result():
+    allow_contracts = True
+
+    def result(include_data_contracts: bool | None = None):
         payload = {"tokens": 0, "sections": sections}
+        use_contracts = allow_contracts if include_data_contracts is None else include_data_contracts
+        if use_contracts:
+            try:
+                data_contracts = extract_slice_data_contracts(store, sections)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "data_contracts extraction failed (fail-open): %s", exc
+                )
+                data_contracts = []
+            if data_contracts:
+                payload["data_contracts"] = data_contracts
         if unresolved_anchors:
             payload["unresolved_anchors"] = list(unresolved_anchors)
         dropped = {
@@ -2554,6 +2569,9 @@ def _slice_context_in_snapshot(
             if required["tokens"] > max_tokens:
                 omitted_detail_limit -= 1
     if required["tokens"] > max_tokens:
+        allow_contracts = False
+        required = result()
+    if required["tokens"] > max_tokens:
         needed_budget = (
             required["tokens"]
             if _probing_overflow
@@ -2598,6 +2616,9 @@ def _slice_context_in_snapshot(
         _stage_session_dedup(sections, base_seen) if cache_path is not None else (set(), {})
     )
     final = result()
+    if final["tokens"] > max_tokens and allow_contracts:
+        allow_contracts = False
+        final = result()
     if final["tokens"] > max_tokens:
         needed_budget = (
             final["tokens"]
