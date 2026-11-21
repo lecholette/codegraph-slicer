@@ -33,21 +33,34 @@ _JAVA_SKIP_SCOPES = frozenset(
 )
 _BROAD_CATCH_NAMES = frozenset({"*", "Exception", "BaseException", "Throwable", "Error", "RuntimeException"})
 _COMMENT_NODES = frozenset({"comment", "line_comment", "block_comment"})
+_MAX_LITERAL_LEN = 80
 
 
 @dataclass(frozen=True, slots=True)
 class StubContract:
-    requires: tuple[str, ...] = ()
+    requires: tuple[tuple[str, str], ...] = ()
     raises: tuple[tuple[str, str], ...] = ()
     caught_types: frozenset[str] = frozenset()
     mutates: tuple[str, ...] = ()
+
+
+def _sanitize_text(raw: str, max_len: int = 120) -> str:
+    chars: list[str] = []
+    for ch in raw:
+        code = ord(ch)
+        if code < 32 or code == 127:
+            chars.append(" " if ch in {"\t", "\n", "\r"} else f"\\x{code:02x}")
+        else:
+            chars.append(ch)
+    collapsed = " ".join("".join(chars).split())
+    return (collapsed[: max_len - 3] + "...") if len(collapsed) > max_len else collapsed
 
 
 def _dedupe_cap(items: list[str], limit: int) -> tuple[str, ...]:
     seen: set[str] = set()
     out: list[str] = []
     for item in items:
-        cleaned = " ".join(item.split())
+        cleaned = _sanitize_text(item)
         if cleaned and cleaned not in seen:
             seen.add(cleaned)
             out.append(cleaned)
@@ -56,11 +69,11 @@ def _dedupe_cap(items: list[str], limit: int) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _dedupe_raises(raises: list[tuple[str, str]], limit: int) -> tuple[tuple[str, str], ...]:
+def _dedupe_pairs(pairs: list[tuple[str, str]], limit: int) -> tuple[tuple[str, str], ...]:
     seen: set[str] = set()
     out: list[tuple[str, str]] = []
-    for expr, short in raises:
-        norm = " ".join(expr.split())
+    for expr, short in pairs:
+        norm = _sanitize_text(expr)
         if norm and norm not in seen:
             seen.add(norm)
             out.append((norm, short))
@@ -73,26 +86,56 @@ def _short_exc_name(expr_name: str) -> str:
     return expr_name.split("(")[0].strip().rsplit(".", 1)[-1]
 
 
+def _escape_str_literal(val: str) -> str:
+    trimmed = (val[: _MAX_LITERAL_LEN - 3] + "...") if len(val) > _MAX_LITERAL_LEN else val
+    parts: list[str] = []
+    for ch in trimmed:
+        code = ord(ch)
+        if ch == "\\":
+            parts.append("\\\\")
+        elif ch == '"':
+            parts.append('\\"')
+        elif code < 32 or code == 127:
+            parts.append(f"\\x{code:02x}")
+        else:
+            parts.append(ch)
+    return f'"{"".join(parts)}"'
+
+
 def _format_py_literal_arg(node: ast.AST) -> str | None:
     if not isinstance(node, ast.Constant):
         return None
     if isinstance(node.value, str):
-        escaped = node.value.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+        return _escape_str_literal(node.value)
+    if type(node.value) is int and abs(node.value).bit_length() <= 256:
+        return repr(node.value)
+    if isinstance(node.value, float):
         return repr(node.value)
     return None
 
 
+def _safe_unparse(node: ast.AST) -> str | None:
+    try:
+        return ast.unparse(node).strip()
+    except (ValueError, RecursionError):
+        return None
+
+
+def _format_py_call_raise(exc: ast.Call) -> tuple[str, str] | None:
+    callee = _safe_unparse(exc.func)
+    if not callee:
+        return None
+    lit = _format_py_literal_arg(exc.args[0]) if exc.args else None
+    rendered = f"{callee}({lit})" if lit is not None else callee
+    return rendered, _short_exc_name(callee)
+
+
 def _format_py_raise(exc: ast.AST) -> tuple[str, str] | None:
     if isinstance(exc, ast.Call):
-        callee = ast.unparse(exc.func).strip()
-        lit = _format_py_literal_arg(exc.args[0]) if exc.args else None
-        rendered = f"{callee}({lit})" if lit is not None else callee
-        return rendered, _short_exc_name(callee)
+        return _format_py_call_raise(exc)
     if isinstance(exc, (ast.Name, ast.Attribute)):
-        callee = ast.unparse(exc).strip()
-        return callee, _short_exc_name(callee)
+        callee = _safe_unparse(exc)
+        return (callee, _short_exc_name(callee)) if callee else None
     return None
 
 
@@ -110,16 +153,34 @@ def _collect_py_caught_types(handler: ast.ExceptHandler) -> set[str]:
         return set()
     if handler.type is None:
         return {"*"}
-    if isinstance(handler.type, ast.Tuple):
-        return {_short_exc_name(ast.unparse(elt)) for elt in handler.type.elts}
-    return {_short_exc_name(ast.unparse(handler.type))}
+    elts = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return {_short_exc_name(u) for elt in elts if (u := _safe_unparse(elt))}
 
 
-def _py_node_precondition(node: ast.AST) -> str | None:
+def _is_single_raise_if(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.If)
+        and not node.orelse
+        and len(node.body) == 1
+        and isinstance(node.body[0], ast.Raise)
+    )
+
+
+def _if_raise_precondition(node: ast.If) -> tuple[str, str] | None:
+    cond = _safe_unparse(node.test)
+    if not cond:
+        return None
+    exc_node = node.body[0].exc  # type: ignore[attr-defined]
+    exc_pair = _format_py_raise(exc_node) if exc_node is not None else None
+    return (f"not ({cond})", exc_pair[1] if exc_pair else "")
+
+
+def _py_node_precondition(node: ast.AST) -> tuple[str, str] | None:
     if isinstance(node, ast.Assert):
-        return ast.unparse(node.test)
-    if isinstance(node, ast.If) and not node.orelse and len(node.body) == 1 and isinstance(node.body[0], ast.Raise):
-        return f"not ({ast.unparse(node.test)})"
+        txt = _safe_unparse(node.test)
+        return (txt, "AssertionError") if txt else None
+    if _is_single_raise_if(node):
+        return _if_raise_precondition(node)  # type: ignore[arg-type]
     return None
 
 
@@ -152,7 +213,7 @@ def _walk_py_fn_nodes(fn_node: ast.FunctionDef | ast.AsyncFunctionDef):
 
 
 def _scan_py_fn(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> StubContract:
-    reqs: list[str] = []
+    reqs: list[tuple[str, str]] = []
     raises: list[tuple[str, str]] = []
     caught: set[str] = set()
     muts: list[str] = []
@@ -173,8 +234,8 @@ def _scan_py_fn(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> StubContract
             muts.extend(_py_node_mutations(node))
 
     return StubContract(
-        requires=_dedupe_cap(reqs, 2),
-        raises=_dedupe_raises(raises, 3),
+        requires=_dedupe_pairs(reqs, 2),
+        raises=_dedupe_pairs(raises, 3),
         caught_types=frozenset(caught),
         mutates=_dedupe_cap(muts, 3),
     )
@@ -183,7 +244,7 @@ def _scan_py_fn(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> StubContract
 def _extract_py_contract(body: str) -> StubContract:
     try:
         tree = ast.parse(textwrap.dedent(body))
-    except SyntaxError:
+    except (SyntaxError, ValueError, RecursionError):
         return StubContract()
     for stmt in tree.body:
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -226,10 +287,9 @@ def _parse_brace_method_body(body: str, grammar: str) -> tuple[bytes, object | N
 
 
 def _normalize_brace_literal(raw: str) -> str:
-    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
-        inner = raw[1:-1].replace('"', '\\"')
-        return f'"{inner}"'
-    return raw
+    if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0]:
+        return _escape_str_literal(raw[1:-1])
+    return _sanitize_text(raw, _MAX_LITERAL_LEN)
 
 
 def _first_brace_literal_arg(data: bytes, args_node) -> str | None:
@@ -261,15 +321,15 @@ def _format_brace_throw(data: bytes, throw_node) -> tuple[str, str] | None:
     return rendered, _short_exc_name(exc_type)
 
 
-def _is_single_throw_consequence(node) -> bool:
+def _single_throw_from_consequence(node):
     if node is None:
-        return False
+        return None
     if node.type == "throw_statement":
-        return True
+        return node
     if node.type not in {"block", "statement_block"}:
-        return False
+        return None
     stmts = [c for c in node.children if c.type not in {"{", "}", *_COMMENT_NODES}]
-    return len(stmts) == 1 and stmts[0].type == "throw_statement"
+    return stmts[0] if len(stmts) == 1 and stmts[0].type == "throw_statement" else None
 
 
 def _consequence_after_cond(if_node, cond_node):
@@ -282,16 +342,18 @@ def _consequence_after_cond(if_node, cond_node):
     return None
 
 
-def _extract_if_guard_text(data: bytes, if_node) -> str | None:
+def _extract_if_guard_pair(data: bytes, if_node) -> tuple[str, str] | None:
     if any(c.type in {"else", "else_clause"} for c in if_node.children):
         return None
     cond_node = child_of_type(if_node, "parenthesized_expression")
-    if cond_node is None or not _is_single_throw_consequence(_consequence_after_cond(if_node, cond_node)):
+    throw_stmt = _single_throw_from_consequence(_consequence_after_cond(if_node, cond_node)) if cond_node else None
+    if cond_node is None or throw_stmt is None:
         return None
     inner = node_text(data, cond_node).strip()
     if inner.startswith("(") and inner.endswith(")"):
         inner = inner[1:-1].strip()
-    return f"not ({inner})"
+    throw_pair = _format_brace_throw(data, throw_stmt)
+    return (f"not ({inner})", throw_pair[1] if throw_pair else "")
 
 
 def _this_field_from_lhs(lhs: str) -> str | None:
@@ -347,13 +409,13 @@ def _visit_brace_contract_node(
     node,
     grammar: str,
     is_ctor: bool,
-    reqs: list[str],
+    reqs: list[tuple[str, str]],
     raises: list[tuple[str, str]],
     caught: set[str],
     muts: list[str],
 ) -> None:
     if node.type == "if_statement":
-        guard = _extract_if_guard_text(data, node)
+        guard = _extract_if_guard_pair(data, node)
         if guard:
             reqs.append(guard)
     elif node.type == "throw_statement":
@@ -374,7 +436,7 @@ def _extract_brace_contract(body: str, file_path: str) -> StubContract:
     if fbody is None:
         return StubContract()
     skip = _JAVA_SKIP_SCOPES if grammar == "java" else _TS_SKIP_SCOPES
-    reqs: list[str] = []
+    reqs: list[tuple[str, str]] = []
     raises: list[tuple[str, str]] = []
     caught: set[str] = set()
     muts: list[str] = []
@@ -383,8 +445,8 @@ def _extract_brace_contract(body: str, file_path: str) -> StubContract:
         _visit_brace_contract_node(data, node, grammar, is_ctor, reqs, raises, caught, muts)
 
     return StubContract(
-        requires=_dedupe_cap(reqs, 2),
-        raises=_dedupe_raises(raises, 3),
+        requires=_dedupe_pairs(reqs, 2),
+        raises=_dedupe_pairs(raises, 3),
         caught_types=frozenset(caught),
         mutates=_dedupe_cap(muts, 3),
     )
@@ -397,7 +459,11 @@ def extract_direct_contract(body: str, file_path: str) -> StubContract:
 
 
 def _is_caught(exc_short: str, caught_types: frozenset[str]) -> bool:
-    return bool(caught_types and ((caught_types & _BROAD_CATCH_NAMES) or exc_short in caught_types))
+    if not caught_types:
+        return False
+    if not exc_short or (caught_types & _BROAD_CATCH_NAMES):
+        return True
+    return exc_short in caught_types
 
 
 def _append_callee_contracts(
@@ -409,11 +475,10 @@ def _append_callee_contracts(
     raise_lines: list[str],
     seen_raises: set[str],
 ) -> None:
-    if not (own.caught_types & _BROAD_CATCH_NAMES):
-        for req in callee_contract.requires:
-            if len(req_lines) < 2 and req not in seen_reqs:
-                seen_reqs.add(req)
-                req_lines.append(f"{req} [via {callee_short}]")
+    for req_expr, req_exc in callee_contract.requires:
+        if len(req_lines) < 2 and not _is_caught(req_exc, own.caught_types) and req_expr not in seen_reqs:
+            seen_reqs.add(req_expr)
+            req_lines.append(f"{req_expr} [via {callee_short}]")
     for expr, exc_short in callee_contract.raises:
         if len(raise_lines) < 3 and not _is_caught(exc_short, own.caught_types) and expr not in seen_raises:
             seen_raises.add(expr)
@@ -436,7 +501,7 @@ def format_symbol_contract_lines(
     sid = row["symbol_id"]
     memo = cache if cache is not None else {}
     own = _get_cached_contract(memo, sid, row["body"], row["file_path"])
-    req_lines = list(own.requires)
+    req_lines = [expr for expr, _ in own.requires]
     seen_reqs = set(req_lines)
     raise_lines = [expr for expr, _ in own.raises]
     seen_raises = set(raise_lines)

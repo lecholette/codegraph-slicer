@@ -267,6 +267,9 @@ def _populate_lazy_store(
     frontier: list[str] = []
     truncated = False
 
+    def _is_safe_in_root(full: Path) -> bool:
+        return not full.is_symlink() and full.is_file() and full.resolve().is_relative_to(root)
+
     def _enqueue(rel_p: str) -> None:
         nonlocal truncated
         if rel_p in explored_raw or rel_p in frontier:
@@ -275,7 +278,7 @@ def _populate_lazy_store(
             truncated = True
             return
         full = root / rel_p
-        if full.is_file() and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
+        if _is_safe_in_root(full) and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
             frontier.append(rel_p)
 
     for sp in seed_paths:
@@ -327,7 +330,7 @@ def _populate_lazy_store(
                 break
             remaining = max_files - len(explored_raw)
             for cand in _grep_candidate_files(root, needle, limit=min(15, remaining)):
-                if cand not in explored_raw:
+                if cand not in explored_raw and _is_safe_in_root(root / cand):
                     explored_raw[cand] = (root / cand).read_bytes()
 
     # Re-extract with unified layout and insert into an in-memory GraphStore

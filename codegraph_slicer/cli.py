@@ -35,6 +35,15 @@ _DEPENDENCIES = (("DATA_DEP", "data ←"), ("CONTROL_DEP", "control ←"))
 _ENDPOINTS = ("entry", "exit")
 
 
+_XML_ILLEGAL_CTRL = str.maketrans(
+    "", "", "".join(chr(c) for c in (*range(0, 9), 11, 12, *range(14, 32), 127))
+)
+
+
+def _xml_text(raw: str) -> str:
+    return _saxutils.escape(raw.translate(_XML_ILLEGAL_CTRL))
+
+
 def _fence_lang(path: str) -> str:
     if path.endswith(".java"):
         return "java"
@@ -418,7 +427,7 @@ def render_xml_report(result):
                 end = item.get("end_line")
                 lines_attr = f' lines="{start}-{end}"' if start and end else (f' lines="{lines_span}"' if lines_span else "")
                 blocks.append(f'    <code_slice{sym_attr}{file_attr}{lines_attr}>')
-                blocks.append(_saxutils.escape(raw_text))
+                blocks.append(_xml_text(raw_text))
                 blocks.append("    </code_slice>")
             blocks.append(f"  </{section_name}>")
         blocks.append("</context>")
@@ -437,12 +446,12 @@ def render_xml_report(result):
             file_attr = f' path={_xml_attr(file_path)}' if file_path else ""
             sym_attr = f' symbol={_xml_attr(item["symbol"])}' if "symbol" in item else ""
             blocks.append(f'  <file{file_attr}{sym_attr}>')
-            blocks.append(_saxutils.escape(item.get("text", "").rstrip()))
+            blocks.append(_xml_text(item.get("text", "").rstrip()))
             blocks.append("  </file>")
         blocks.append("</repository_map>")
         return "\n".join(blocks)
 
-    return f"<codegraph_report>\n{_saxutils.escape(json.dumps(result, indent=2))}\n</codegraph_report>"
+    return f"<codegraph_report>\n{_xml_text(json.dumps(result, indent=2))}\n</codegraph_report>"
 
 
 def _file_language(path: str) -> str:

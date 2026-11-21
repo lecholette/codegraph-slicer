@@ -165,6 +165,7 @@ def handle(raw: str) -> int:
 
     dep_texts = "\n".join(e["text"] for e in on_res["sections"]["downstream_dependencies"])
     assert "ValueError" not in dep_texts
+    assert "@requires:" not in dep_texts
 
 
 def test_java_contracts_stub_in_db_and_lazy_root(tmp_path: Path) -> None:
@@ -418,5 +419,73 @@ public class App {
     )
     txt = "\n".join(e["text"] for group in res["sections"].values() for e in group)
     assert "bad_x" not in txt
+    assert "@requires:" not in txt
     assert "// @mutates: this.count" in txt
+
+
+def test_xml_c0_control_sanitization_huge_int_safety_and_symlink_refusal(tmp_path: Path) -> None:
+    import xml.etree.ElementTree as ET
+
+    outside = tmp_path / "outside_secret.py"
+    outside.write_text("SECRET = 'leak'\n", encoding="utf-8")
+
+    repo = tmp_path / "sec_repo"
+    hex_huge = "0x1" + ("0" * 1200)
+    _write(
+        repo,
+        "pkg/callee.py",
+        f'''def bad_callee(x: int) -> int:
+    if x < 0:
+        raise ValueError("bad\\x00null\\x1besc")
+    if x > 999:
+        raise RuntimeError({hex_huge})
+    a = x + 1
+    return a
+''',
+    )
+    _write(
+        repo,
+        "pkg/entry.py",
+        '''from pkg.callee import bad_callee
+from pkg.escape_link import something
+
+
+def run_entry(x: int) -> int:
+    return bad_callee(x)
+''',
+    )
+    (repo / "pkg" / "escape_link.py").symlink_to(outside)
+
+    lazy_res = lazy_slice_context(repo, ["pkg/entry.py:run_entry"], max_tokens=8000, contracts=True)
+    full_txt = "\n".join(e["text"] for g in lazy_res["sections"].values() for e in g)
+    assert "SECRET" not in full_txt
+
+    db_path = tmp_path / "sec.sqlite"
+    (repo / "pkg" / "escape_link.py").unlink()
+    _write(repo, "pkg/escape_link.py", "something = 1\n")
+    sync_atomically(db_path, lambda s: s.sync_workspace(repo))
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "codegraph_slicer",
+            "slice",
+            "--db",
+            str(db_path),
+            "--contracts",
+            "--format",
+            "xml",
+            "pkg.entry:run_entry",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    # Must parse as valid XML 1.0 with zero C0 control char errors
+    root_el = ET.fromstring(proc.stdout)
+    assert root_el.tag == "context"
+    assert "\x00" not in proc.stdout
+    assert "\x1b" not in proc.stdout
+
 
