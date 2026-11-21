@@ -173,6 +173,12 @@ def _resolve_target_to_paths(
     files_by_name: dict[str, list[str]],
 ) -> list[str]:
     clean = target.split(MODULE_END, 1)[0].split(":", 1)[0].strip()
+    if from_file.endswith(".java") and MODULE_END in target:
+        sym_tail = target.split(MODULE_END, 1)[1].split(":", 1)[0].strip()
+        head_ident = sym_tail.split(".", 1)[0]
+        if head_ident[:1].isupper():
+            pkg_prefix = clean.rpartition(".")[0]
+            clean = f"{pkg_prefix}.{head_ident}" if pkg_prefix else head_ident
     if not clean or clean.startswith("?"):
         return []
     found: list[str] = []
@@ -436,6 +442,7 @@ def lazy_slice_context(
     render_estimator=None,
     target_mode: str = "full",
     dedup_session: bool | str = False,
+    contracts: bool | None = None,
 ):
     store, coverage = _populate_lazy_store(
         Path(root),
@@ -454,6 +461,7 @@ def lazy_slice_context(
             render_estimator=wrapped,
             target_mode=target_mode,
             dedup_session=dedup_session,
+            contracts=contracts,
         )
         result["coverage"] = coverage
         if wrapped is not None:

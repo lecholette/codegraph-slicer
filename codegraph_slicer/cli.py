@@ -841,6 +841,7 @@ def main(argv=None):
     slicing.add_argument("--target-mode", choices=("full", "skeleton"), default="full", help="target implementation detail level (default: full)")
     slicing.add_argument("--dedup-session", action="store_true", help="compact repeated types and callers across slice calls in the same session")
     slicing.add_argument("--dedup-session-id", default=None, help="explicit session identifier for --dedup-session")
+    slicing.add_argument("--contracts", action="store_true", help="annotate compressed method and callee stubs with @requires, @raises, and @mutates")
     impact = sub.add_parser(
         "impact",
         help="find bounded transitive callers over resolved call edges",
@@ -1000,6 +1001,7 @@ def main(argv=None):
                         render_estimator=_render_budget_estimator(args.format),
                         target_mode=args.target_mode,
                         dedup_session=args.dedup_session_id or args.dedup_session,
+                        contracts=True if args.contracts else None,
                     )
             else:
                 if args.cmd == "slice" and not args.db:
@@ -1092,6 +1094,7 @@ def main(argv=None):
                             render_estimator=_render_budget_estimator(args.format),
                             target_mode=args.target_mode,
                             dedup_session=args.dedup_session_id or args.dedup_session,
+                            contracts=True if args.contracts else None,
                         )
         if args.format == "markdown":
             rendered = _markdown(result)

@@ -1390,7 +1390,11 @@ def _build_type_summaries(
     max_tokens,
     target_self_attrs: set[str] | None = None,
     enclosing_py_classes: set[str] | None = None,
+    contracts: bool = False,
+    contract_cache: dict | None = None,
 ):
+    from .contracts import format_symbol_contract_lines
+
     summaries = {}
     compact_summaries = {}
     auto_summarize_ids = set()
@@ -1426,11 +1430,20 @@ def _build_type_summaries(
         if doc_line:
             lines.append(doc_line)
         lines.extend(py_class_fields)
+        comment_pfx = _comment_prefix(row["file_path"])
+        class_short_hdr = row["qualname"].rsplit(".", 1)[-1]
+        ctor_hdr_names = {"__init__", "__new__", "constructor", class_short_hdr}
         for method in methods:
             lines.append(f"{method['file_path']}:{method['start_line']}-{method['end_line']} {method['signature']}")
             method_doc = _first_docstring_line(method["body"])
             if method_doc:
                 lines.append(method_doc)
+            if contracts and method["qualname"].rsplit(".", 1)[-1] not in ctor_hdr_names:
+                lines.extend(
+                    format_symbol_contract_lines(
+                        store, method, comment_pfx, indent="    ", cache=contract_cache
+                    )
+                )
         item_record = _slice_item(row, False)
         full_size = tokens_for_length(len(row["body"]))
         item_record["text"] = (
@@ -1470,8 +1483,15 @@ def _build_type_summaries(
         py_init_fields = _extract_py_init_fields(methods) if row["file_path"].endswith(".py") else []
         for method in kept_methods:
             compact_lines.append(f"    {method['signature']}")
-            if method["qualname"].rsplit(".", 1)[-1] == "__init__" and py_init_fields:
+            m_short = method["qualname"].rsplit(".", 1)[-1]
+            if m_short == "__init__" and py_init_fields:
                 compact_lines.extend(py_init_fields)
+            elif contracts and m_short not in ctor_names:
+                compact_lines.extend(
+                    format_symbol_contract_lines(
+                        store, method, comment_pfx, indent="        ", cache=contract_cache
+                    )
+                )
         omitted_m = len(methods) - len(kept_methods)
         if omitted_m > 0:
             comment_pfx = _comment_prefix(row["file_path"])
@@ -2018,9 +2038,16 @@ def _resolve_anchor_batch(store, anchors) -> dict:
     return chosen
 
 
+def _resolve_contracts_flag(contracts: bool | None) -> bool:
+    if contracts is not None:
+        return bool(contracts)
+    return os.environ.get("CODEGRAPH_CONTRACTS") == "1"
+
+
 def slice_context(
     store, anchors, max_tokens=8000, include_callee_bodies=False, *,
     render_estimator=None, database=None, target_mode="full", dedup_session=False,
+    contracts: bool | None = None,
 ):
     if (
         not isinstance(max_tokens, int)
@@ -2032,6 +2059,7 @@ def slice_context(
         raise ValueError(f"Unsupported target_mode: {target_mode}")
     if not anchors:
         raise AnchorNotFoundError("at least one anchor is required")
+    use_contracts = _resolve_contracts_flag(contracts)
     with store.read_snapshot():
         return _slice_context_in_snapshot(
             store,
@@ -2042,6 +2070,7 @@ def slice_context(
             database=database,
             target_mode=target_mode,
             dedup_session=dedup_session,
+            contracts=use_contracts,
         )
 
 
@@ -2123,6 +2152,7 @@ def _verified_overflow_budget(
     render_estimator,
     target_mode: str,
     dedup_session,
+    contracts: bool = False,
 ) -> int:
     for _ in range(4):
         try:
@@ -2135,6 +2165,7 @@ def _verified_overflow_budget(
                 database=database,
                 target_mode=target_mode,
                 dedup_session=dedup_session,
+                contracts=contracts,
                 _probing_overflow=True,
             )
             return needed
@@ -2157,6 +2188,7 @@ def _slice_context_in_snapshot(
     database=None,
     target_mode="full",
     dedup_session=False,
+    contracts: bool = False,
     _probing_overflow: bool = False,
 ):
     chosen, unresolved_anchors = _resolve_anchor_batch_with_status(store, anchors)
@@ -2312,6 +2344,7 @@ def _slice_context_in_snapshot(
     sections["types_and_schemas"] = [
         _type_item_with_doc(row) for _, row in sorted(types.items())
     ]
+    contract_cache: dict = {}
     class_types = [(sid, row) for sid, row in sorted(types.items()) if row["kind"] == "class"]
     summaries, compact_summaries, auto_summarize_ids = _build_type_summaries(
         store,
@@ -2321,6 +2354,8 @@ def _slice_context_in_snapshot(
         max_tokens,
         target_self_attrs=target_self_attrs,
         enclosing_py_classes=enclosing_py_classes,
+        contracts=contracts,
+        contract_cache=contract_cache,
     )
     from .pagerank import rank
 
@@ -2412,10 +2447,21 @@ def _slice_context_in_snapshot(
     def _callee_item(cand_row, full: bool):
         base = item(cand_row, full)
         if not full:
+            comment_pfx = _comment_prefix(cand_row["file_path"])
+            extra_lines: list[str] = []
+            if contracts:
+                from .contracts import format_symbol_contract_lines
+
+                extra_lines.extend(
+                    format_symbol_contract_lines(
+                        store, cand_row, comment_pfx, indent="    ", cache=contract_cache
+                    )
+                )
             ret_expr = _extract_outer_return_hint(cand_row["body"])
             if ret_expr:
-                comment_pfx = _comment_prefix(cand_row["file_path"])
-                base["text"] = f"{base['text']}\n    {comment_pfx} returns: {ret_expr}"
+                extra_lines.append(f"    {comment_pfx} returns: {ret_expr}")
+            if extra_lines:
+                base["text"] = base["text"] + "\n" + "\n".join(extra_lines)
         return base
 
     for name, candidates in (
@@ -2524,6 +2570,7 @@ def _slice_context_in_snapshot(
                 render_estimator,
                 target_mode,
                 dedup_session,
+                contracts,
             )
         )
         raise RequiredAnchorOverflow(
@@ -2568,6 +2615,7 @@ def _slice_context_in_snapshot(
                 render_estimator,
                 target_mode,
                 dedup_session,
+                contracts,
             )
         )
         raise RequiredAnchorOverflow(
