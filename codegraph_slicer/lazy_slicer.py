@@ -27,133 +27,37 @@ from .slicer import (
     rendered_tokens,
     slice_context,
 )
+from .source_provider import LocalGitProvider, SourceProvider
 from .store import (
     GraphStore,
     _dedupe_analysis_symbols,
     _disambiguate_analysis,
-    _iter_workspace_files,
     _read_ts_or_js_config,
     _should_skip_rel_path,
-    git_env,
 )
 
 _JAVA_ROOT_MARKERS = ("src/main/java/", "src/test/java/", "src/", "app/", "java/")
 
 
-def _find_repo_files_index(root: Path) -> dict[str, list[str]]:
-    """Build a basename/suffix index of source files using git ls-files or rg --files."""
-    paths: list[str] = []
-    if (root / ".git").exists():
-        res = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-z"],
-            env=git_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if res.returncode == 0:
-            for raw in res.stdout.split(b"\0"):
-                if not raw:
-                    continue
-                p = raw.decode("utf-8", "replace")
-                if is_supported_source_path(p) and not _should_skip_rel_path(PurePosixPath(p).parts):
-                    paths.append(p)
-    if not paths and shutil.which("rg"):
-        res = subprocess.run(
-            ["rg", "--files", "--hidden", "-g", "!.git"],
-            cwd=str(root),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if res.returncode == 0:
-            for line in res.stdout.decode("utf-8", "replace").splitlines():
-                if is_supported_source_path(line) and not _should_skip_rel_path(PurePosixPath(line).parts):
-                    paths.append(line)
+def _find_repo_files_index(provider: SourceProvider) -> dict[str, list[str]]:
+    """Build a basename/suffix index of source files from the provider."""
     by_suffix: dict[str, list[str]] = {}
-    for p in paths:
+    for p in provider.list_files():
         by_suffix.setdefault(PurePosixPath(p).name, []).append(p)
     return by_suffix
 
 
-def _is_safe_in_root(root_resolved: Path, full: Path) -> bool:
-    return not full.is_symlink() and full.is_file() and full.resolve().is_relative_to(root_resolved)
-
-
-def _grep_candidate_files(root: Path, needle: str, limit: int = 15) -> list[str]:
-    if not needle or len(needle) < 2:
-        return []
-    rg_bin = shutil.which("rg")
-    out: list[str] = []
-    if rg_bin:
-        cmd = [
-            rg_bin,
-            "-l",
-            "--fixed-strings",
-            "--no-messages",
-            "--max-count",
-            "1",
-            needle,
-            str(root),
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if res.returncode in (0, 1):
-            for raw in res.stdout.decode("utf-8", "replace").splitlines():
-                try:
-                    rel = Path(raw).resolve().relative_to(root).as_posix()
-                except ValueError:
-                    continue
-                if is_supported_source_path(rel) and not _should_skip_rel_path(PurePosixPath(rel).parts):
-                    out.append(rel)
-                    if len(out) >= limit:
-                        break
-        return out
-    if (root / ".git").exists():
-        res = subprocess.run(
-            ["git", "-C", str(root), "grep", "-l", "-F", needle],
-            env=git_env(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if res.returncode in (0, 1):
-            for raw in res.stdout.decode("utf-8", "replace").splitlines():
-                if is_supported_source_path(raw) and not _should_skip_rel_path(PurePosixPath(raw).parts):
-                    out.append(raw)
-                    if len(out) >= limit:
-                        break
-        return out
-    needle_bytes = needle.encode("utf-8")
-    root_resolved = root.resolve()
-    for path in _iter_workspace_files(root):
-        if not _is_safe_in_root(root_resolved, path):
-            continue
-        rel = path.relative_to(root).as_posix()
-        if _should_skip_rel_path(PurePosixPath(rel).parts):
-            continue
-        try:
-            if needle_bytes in path.read_bytes():
-                out.append(rel)
-                if len(out) >= limit:
-                    break
-        except OSError:
-            continue
-    return out
-
-
-def _anchor_seed_info(root: Path, anchor: str) -> tuple[str | None, str]:
+def _anchor_seed_info(provider: SourceProvider, anchor: str) -> tuple[str | None, str]:
     """Return (direct_rel_path_or_None, search_needle) for an anchor string."""
     if ":" in anchor:
         head, tail = anchor.split(":", 1)
-        cand = root / head
-        if cand.is_file():
-            return cand.resolve().relative_to(root).as_posix(), tail.split(".")[-1] if tail and not tail.isdigit() else ""
+        if provider.file_exists(head):
+            return head, tail.split(".")[-1] if tail and not tail.isdigit() else ""
         # module:qualname or dotted class
         leaf = tail.split(".")[-1] if tail else head.split(".")[-1]
         return None, leaf
-    cand = root / anchor
-    if cand.is_file():
-        return cand.resolve().relative_to(root).as_posix(), PurePosixPath(anchor).stem
+    if provider.file_exists(anchor):
+        return anchor, PurePosixPath(anchor).stem
     return None, anchor.split(".")[-1]
 
 
@@ -173,7 +77,7 @@ def _java_source_prefixes(seed_paths: list[str]) -> list[str]:
 
 
 def _resolve_target_to_paths(
-    root: Path,
+    provider: SourceProvider,
     target: str,
     from_file: str,
     java_prefixes: list[str],
@@ -197,7 +101,7 @@ def _resolve_target_to_paths(
             rel_tail = "/".join(sub) + ".java"
             for pfx in java_prefixes:
                 cand = pfx + rel_tail
-                if (root / cand).is_file():
+                if provider.file_exists(cand):
                     found.append(cand)
                     return found
             leaf_name = sub[-1] + ".java"
@@ -209,7 +113,7 @@ def _resolve_target_to_paths(
         rel_mod = clean.replace(".", "/")
         for suffix in (".py", "/__init__.py"):
             cand = rel_mod + suffix
-            if (root / cand).is_file():
+            if provider.file_exists(cand):
                 found.append(cand)
                 return found
     elif from_file.endswith(TS_JS_EXTENSIONS):
@@ -220,24 +124,26 @@ def _resolve_target_to_paths(
             joined = clean.replace(".", "/")
         for ext in ("", *TS_JS_EXTENSIONS, *(f"/index{e}" for e in TS_JS_EXTENSIONS)):
             cand = joined + ext
-            if (root / cand).is_file():
+            if provider.file_exists(cand):
                 found.append(cand)
                 return found
     return found
 
 
 def _populate_lazy_store(
-    root: Path,
+    root: Path | None,
     anchors: list[str],
     *,
     max_files: int = 40,
     max_hops: int = 2,
     include_callers: bool = True,
+    provider: SourceProvider | None = None,
 ) -> tuple[GraphStore, dict]:
     started = monotonic()
-    root = Path(root).resolve(strict=True)
-    if not root.is_dir():
-        raise CodeGraphError(f"workspace root is not a directory: {root}")
+    if provider is None:
+        if root is None:
+            raise CodeGraphError("lazy slice requires root or provider")
+        provider = LocalGitProvider(root)
     max_files = max(1, max_files)
     max_hops = max(0, max_hops)
 
@@ -245,7 +151,7 @@ def _populate_lazy_store(
     direct_seed_paths: set[str] = set()
     needles: list[str] = []
     for anchor in anchors:
-        direct_path, needle = _anchor_seed_info(root, anchor)
+        direct_path, needle = _anchor_seed_info(provider, anchor)
         if direct_path:
             direct_seed_paths.add(direct_path)
             if direct_path not in seed_paths:
@@ -253,17 +159,23 @@ def _populate_lazy_store(
         if needle and needle not in needles:
             needles.append(needle)
         if not direct_path and needle:
-            for cand in _grep_candidate_files(root, needle, limit=min(5, max_files)):
+            for cand in provider.grep(needle, limit=min(5, max_files)):
                 if cand not in seed_paths:
                     seed_paths.append(cand)
 
     if not seed_paths:
         raise CodeGraphError(f"could not locate any seed files for anchors: {anchors!r}")
 
-    files_by_name = _find_repo_files_index(root) if any(p.endswith(".java") for p in seed_paths) else {}
+    files_by_name = _find_repo_files_index(provider) if any(p.endswith(".java") for p in seed_paths) else {}
     java_prefixes = _java_source_prefixes(seed_paths)
 
-    tsconfig_bytes = _read_ts_or_js_config(root)
+    if isinstance(provider, LocalGitProvider):
+        tsconfig_bytes = _read_ts_or_js_config(provider.root)
+    else:
+        cfg_map = provider.read_files_batch(
+            [p for p in ("tsconfig.json", "jsconfig.json") if provider.file_exists(p)]
+        )
+        tsconfig_bytes = cfg_map.get("tsconfig.json") or cfg_map.get("jsconfig.json") or b""
     path_aliases = None
     if tsconfig_bytes:
         from .ts_extractor import parse_tsconfig_paths
@@ -281,8 +193,7 @@ def _populate_lazy_store(
         if len(explored_raw) + len(frontier) >= max_files:
             truncated = True
             return
-        full = root / rel_p
-        if _is_safe_in_root(root, full) and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
+        if provider.file_exists(rel_p) and is_supported_source_path(rel_p) and not _should_skip_rel_path(PurePosixPath(rel_p).parts):
             frontier.append(rel_p)
 
     for sp in seed_paths:
@@ -296,10 +207,14 @@ def _populate_lazy_store(
             break
         batch = frontier[:]
         frontier.clear()
+        batch_bytes = provider.read_files_batch(batch)
         for rel_p in batch:
-            explored_raw[rel_p] = (root / rel_p).read_bytes()
+            if rel_p in batch_bytes:
+                explored_raw[rel_p] = batch_bytes[rel_p]
         source_root, packages = detect_layout(explored_raw.keys())
         for rel_p in batch:
+            if rel_p not in explored_raw:
+                continue
             try:
                 analysis = extract_file(
                     rel_p,
@@ -322,20 +237,23 @@ def _populate_lazy_store(
                 for edge in analysis.edges:
                     if edge.kind in ("ALIAS", "USES_TYPE", "INHERITS", "CALLS", "WILDCARD_IMPORT"):
                         for dep in _resolve_target_to_paths(
-                            root, edge.target, rel_p, java_prefixes, files_by_name
+                            provider, edge.target, rel_p, java_prefixes, files_by_name
                         ):
                             _enqueue(dep)
 
     # Bounded candidate caller discovery via grep
     if include_callers and len(explored_raw) < max_files:
+        caller_cands: list[str] = []
         for needle in needles:
-            if len(explored_raw) >= max_files:
+            if len(explored_raw) + len(caller_cands) >= max_files:
                 truncated = True
                 break
-            remaining = max_files - len(explored_raw)
-            for cand in _grep_candidate_files(root, needle, limit=min(15, remaining)):
-                if cand not in explored_raw and _is_safe_in_root(root, root / cand):
-                    explored_raw[cand] = (root / cand).read_bytes()
+            remaining = max_files - (len(explored_raw) + len(caller_cands))
+            for cand in provider.grep(needle, limit=min(15, remaining)):
+                if cand not in explored_raw and cand not in caller_cands and provider.file_exists(cand):
+                    caller_cands.append(cand)
+        if caller_cands:
+            explored_raw.update(provider.read_files_batch(caller_cands))
 
     # Re-extract with unified layout and insert into an in-memory GraphStore
     source_root, packages = detect_layout(explored_raw.keys())
@@ -394,10 +312,13 @@ def _populate_lazy_store(
             )
             indexed_count += 1
         store._rebind(source_root=source_root)
+        provider_meta = provider.coverage_metadata()
+        snapshot_root = str(provider.root) if isinstance(provider, LocalGitProvider) else str(provider_meta.get("repo", ""))
+        snapshot_revision = str(provider_meta.get("commit", ""))
         for key, value in (
-            ("snapshot_root", str(root)),
+            ("snapshot_root", snapshot_root),
             ("snapshot_kind", "lazy"),
-            ("snapshot_revision", ""),
+            ("snapshot_revision", snapshot_revision),
             ("source_root", source_root),
             ("packages", ",".join(sorted(packages))),
         ):
@@ -409,6 +330,7 @@ def _populate_lazy_store(
 
     coverage = {
         "mode": "lazy_target_seeded",
+        **provider_meta,
         "explored_files": len(explored_raw),
         "indexed_files": indexed_count,
         "failed_files": [
@@ -438,7 +360,7 @@ def _wrap_coverage_estimator(render_estimator, coverage: dict):
 
 
 def lazy_slice_context(
-    root: str | Path,
+    root: str | Path | None,
     anchors: list[str],
     max_tokens: int = 8000,
     include_callee_bodies: bool = False,
@@ -450,13 +372,15 @@ def lazy_slice_context(
     target_mode: str = "full",
     dedup_session: bool | str = False,
     contracts: bool | None = None,
+    provider: SourceProvider | None = None,
 ):
     store, coverage = _populate_lazy_store(
-        Path(root),
+        Path(root) if root is not None else None,
         anchors,
         max_files=max_files,
         max_hops=max_hops,
         include_callers=include_callers,
+        provider=provider,
     )
     try:
         wrapped = _wrap_coverage_estimator(render_estimator, coverage)
@@ -479,7 +403,7 @@ def lazy_slice_context(
 
 
 def lazy_slice_outline(
-    root: str | Path,
+    root: str | Path | None,
     anchors: list[str],
     max_tokens: int = 8000,
     *,
@@ -488,13 +412,15 @@ def lazy_slice_outline(
     max_hops: int = 2,
     include_callers: bool = True,
     render_estimator=None,
+    provider: SourceProvider | None = None,
 ):
     store, coverage = _populate_lazy_store(
-        Path(root),
+        Path(root) if root is not None else None,
         anchors,
         max_files=max_files,
         max_hops=max_hops,
         include_callers=include_callers,
+        provider=provider,
     )
     try:
         wrapped = _wrap_coverage_estimator(render_estimator, coverage)

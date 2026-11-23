@@ -218,6 +218,10 @@ class _CoverageView:
     truncated: bool
     failed_files: tuple[tuple[str, str], ...]
     note: str
+    provider: str = ""
+    commit: str = ""
+    api_calls: int | None = None
+    cache_hits: int | None = None
 
     @classmethod
     def from_dict(cls, raw: dict) -> "_CoverageView":
@@ -234,13 +238,26 @@ class _CoverageView:
             truncated=bool(raw.get("truncated", False)),
             failed_files=failed,
             note=str(raw.get("note", "")),
+            provider=str(raw.get("provider", "")),
+            commit=str(raw.get("commit", "")),
+            api_calls=int(raw["api_calls"]) if "api_calls" in raw else None,
+            cache_hits=int(raw["cache_hits"]) if "cache_hits" in raw else None,
         )
 
 
 def _xml_coverage(coverage: dict) -> list[str]:
     cov = _CoverageView.from_dict(coverage)
+    extra = ""
+    if cov.provider:
+        extra += f" provider={_xml_attr(cov.provider)}"
+    if cov.commit:
+        extra += f" commit={_xml_attr(cov.commit)}"
+    if cov.api_calls is not None:
+        extra += f' api_calls="{cov.api_calls}"'
+    if cov.cache_hits is not None:
+        extra += f' cache_hits="{cov.cache_hits}"'
     lines = [
-        f'  <coverage mode={_xml_attr(cov.mode)} '
+        f'  <coverage mode={_xml_attr(cov.mode)}{extra} '
         f'explored_files="{cov.explored_files}" '
         f'indexed_files="{cov.indexed_files}" '
         f'max_files="{cov.max_files}" '
@@ -263,10 +280,19 @@ def _markdown_coverage(coverage: dict) -> str:
     lines = [
         "## Coverage",
         f"- Mode: `{cov.mode}`",
+    ]
+    if cov.provider:
+        detail = f"`{cov.provider}`"
+        if cov.commit:
+            detail += f" (`{cov.commit[:12]}`)"
+        if cov.api_calls is not None:
+            detail += f", api_calls={cov.api_calls}, cache_hits={cov.cache_hits or 0}"
+        lines.append(f"- Source provider: {detail}")
+    lines.append(
         f"- Files: {cov.indexed_files} indexed / {cov.explored_files} explored "
         f"(budget: max_files={cov.max_files}, max_hops={cov.max_hops}, "
-        f"truncated={str(cov.truncated).lower()})",
-    ]
+        f"truncated={str(cov.truncated).lower()})"
+    )
     if cov.failed_files:
         lines.append(
             f"- Parse failures ({len(cov.failed_files)}): "
@@ -887,6 +913,8 @@ def main(argv=None):
     )
     slicing.add_argument("--db", "--database", dest="db", default=None, help="existing indexed SQLite database")
     slicing.add_argument("--root", default=None, help="workspace root for target-seeded lazy slicing without a prebuilt --db")
+    slicing.add_argument("--repo", default=None, help="GitHub repository (owner/name or URL) for lazy slicing via gh CLI")
+    slicing.add_argument("--ref", default="HEAD", help="Git commit SHA, branch, or tag when slicing with --repo (default: HEAD)")
     slicing.add_argument("--max-files", type=int, default=40, help="max files to explore in lazy --root mode (default: 40)")
     slicing.add_argument("--max-hops", type=int, default=2, help="max dependency hops in lazy --root mode (default: 2)")
     slicing.add_argument("--no-callers", action="store_true", help="skip grep-based caller discovery in lazy --root mode")
@@ -994,6 +1022,8 @@ def main(argv=None):
         parser.error("--edge-sample-limit must be at least 1")
     if args.cmd == "slice" and args.include_imports and not args.outline:
         parser.error("--include-imports requires --outline")
+    if args.cmd == "slice" and args.db and args.repo:
+        parser.error("--db cannot be combined with --repo")
     opening_db = True
     opening_db_path = None
     try:
@@ -1032,8 +1062,19 @@ def main(argv=None):
                         selected_tests=bool(args.selected_test),
                         render_estimator=render_budget,
                     )
-            elif args.cmd == "slice" and args.root and not args.db:
+            elif args.cmd == "slice" and (args.root or args.repo) and not args.db:
                 from .lazy_slicer import lazy_slice_context, lazy_slice_outline
+                from .source_provider import GitHubCliProvider, LocalGitProvider
+
+                provider = None
+                if args.repo:
+                    if args.root and Path(args.root).is_dir():
+                        local = LocalGitProvider(args.root)
+                        local_sha = local.resolve_ref()
+                        if args.ref == "HEAD" or (local_sha and local_sha == args.ref):
+                            provider = local
+                    if provider is None:
+                        provider = GitHubCliProvider(args.repo, ref=args.ref)
 
                 opening_db = False
                 if args.outline:
@@ -1046,6 +1087,7 @@ def main(argv=None):
                         max_hops=args.max_hops,
                         include_callers=not args.no_callers,
                         render_estimator=_render_budget_estimator(args.format),
+                        provider=provider,
                     )
                 else:
                     result = lazy_slice_context(
@@ -1060,10 +1102,11 @@ def main(argv=None):
                         target_mode=args.target_mode,
                         dedup_session=args.dedup_session_id or args.dedup_session,
                         contracts=True if args.contracts else None,
+                        provider=provider,
                     )
             else:
                 if args.cmd == "slice" and not args.db:
-                    raise CodeGraphError("slice requires --db or --root")
+                    raise CodeGraphError("slice requires --db, --root, or --repo")
                 opening_db_path = str(Path(args.db).resolve())
                 if args.cmd != "sync":
                     store = stack.enter_context(GraphStore(args.db, readonly=True))
