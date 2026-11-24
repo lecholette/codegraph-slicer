@@ -28,7 +28,11 @@ def _make_java_files() -> dict[str, str]:
 
 
 def _mock_gh_for_files(monkeypatch, files: dict[str, str], commit: str):
+    real_run = subprocess.run
+
     def fake_run(cmd, **kwargs):
+        if not cmd or cmd[0] != "gh":
+            return real_run(cmd, **kwargs)
         if cmd[:3] == ["gh", "api", f"repos/acme/svc/commits/HEAD"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=commit + "\n", stderr="")
         if cmd[:3] == ["gh", "api", f"repos/acme/svc/git/trees/{commit}?recursive=1"]:
@@ -153,3 +157,52 @@ def test_cli_slice_root_and_repo_fallback(tmp_path: Path, monkeypatch, capsys) -
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["coverage"]["provider"] == "github_cli"
+
+
+def test_cli_source_mode_origin_mismatch_and_no_cache(tmp_path: Path, monkeypatch, capsys) -> None:
+    files = _make_java_files()
+    commit = "d" * 40
+    _mock_gh_for_files(monkeypatch, files, commit)
+
+    local_repo = tmp_path / "local_repo"
+    local_repo.mkdir()
+    subprocess.run(["git", "-C", str(local_repo), "init"], check=True, stdout=subprocess.PIPE)
+    subprocess.run(["git", "-C", str(local_repo), "remote", "add", "origin", "https://github.com/other/repo.git"], check=True)
+
+    # Mismatched origin fails closed in auto mode
+    with pytest.raises(SystemExit, match="2"):
+        main(["slice", "--root", str(local_repo), "--repo", "acme/svc", "--ref", commit, "Service.java:Service.run"])
+    assert "does not match --repo" in capsys.readouterr().err
+
+    # --source-mode remote bypasses mismatched --root, and --no-cache skips SQLite creation
+    cache_dir = tmp_path / "nocache"
+    rc = main(
+        [
+            "slice",
+            "--root",
+            str(local_repo),
+            "--repo",
+            "acme/svc",
+            "--ref",
+            commit,
+            "--source-mode",
+            "remote",
+            "--cache-dir",
+            str(cache_dir),
+            "--no-cache",
+            "--no-callers",
+            "src/main/java/com/acme/Service.java:Service.run",
+            "--format",
+            "json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["coverage"]["provider"] == "github_cli"
+    assert payload["coverage"]["caller_discovery"] == "skipped"
+    assert not (cache_dir / "index.sqlite").exists()
+
+    # --no-cache + --refresh-cache is rejected
+    with pytest.raises(SystemExit, match="2"):
+        main(["slice", "--repo", "acme/svc", "--no-cache", "--refresh-cache", "Service.java:Service.run"])
+    capsys.readouterr()

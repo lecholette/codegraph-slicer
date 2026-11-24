@@ -212,3 +212,33 @@ def test_retry_budget_succeeds_across_indexed_and_lazy_all_formats(
                         seen_json_alignments.add(len(out) % 4)
     assert seen_json_alignments == {0, 1, 2, 3}
 
+
+def test_lazy_slice_python_src_layout_hop_resolution(tmp_path: Path) -> None:
+    root = tmp_path / "py_src_repo"
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "src" / "pkg" / "helper.py").write_text(
+        "def compute(x: int) -> int:\n    return x + 1\n",
+        encoding="utf-8",
+    )
+    (root / "src" / "pkg" / "app.py").write_text(
+        "from pkg.helper import compute\n\ndef run(v: int) -> int:\n    return compute(v)\n",
+        encoding="utf-8",
+    )
+    res0 = lazy_slice_context(
+        root,
+        ["src/pkg/app.py:run"],
+        max_files=10,
+        max_hops=0,
+        include_callers=False,
+    )
+    assert res0["coverage"]["indexed_files"] == 1
+    res2 = lazy_slice_context(
+        root,
+        ["src/pkg/app.py:run"],
+        max_files=10,
+        max_hops=2,
+        include_callers=False,
+    )
+    assert res2["coverage"]["indexed_files"] == 2
+

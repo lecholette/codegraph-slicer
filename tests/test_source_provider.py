@@ -167,3 +167,109 @@ def test_local_git_provider_basic(tmp_path: Path) -> None:
     assert provider.file_exists("src/a.py") is True
     assert provider.read_files_batch(["src/a.py"]) == {"src/a.py": b"def hello():\n    return 1\n"}
     assert provider.grep("hello", limit=5) == ["src/a.py"]
+
+
+def test_local_git_provider_explicit_ref_reads_commit_not_dirty_workspace(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/a.py").write_text("def v1():\n    return 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, stdout=subprocess.PIPE)
+    sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+
+    # Dirty the workspace and add an untracked file
+    (repo / "src/a.py").write_text("def dirty():\n    return 2\n", encoding="utf-8")
+    (repo / "src/untracked.py").write_text("def untracked():\n    return 3\n", encoding="utf-8")
+
+    pinned = LocalGitProvider(repo, ref=sha)
+    assert pinned.resolve_ref() == sha
+    assert pinned.list_files() == ["src/a.py"]
+    assert pinned.file_exists("src/untracked.py") is False
+    assert pinned.read_files_batch(["src/a.py"]) == {"src/a.py": b"def v1():\n    return 1\n"}
+    assert pinned.grep("v1", limit=5) == ["src/a.py"]
+    assert pinned.grep("dirty", limit=5) == []
+
+    bad = LocalGitProvider(repo, ref="0" * 40)
+    with pytest.raises(CodeGraphError, match="failed to resolve --ref"):
+        bad.resolve_ref()
+
+
+def test_github_cli_provider_skips_search_on_non_default_branch(tmp_path: Path, monkeypatch) -> None:
+    branch_sha = "4" * 40
+    head_sha = "5" * 40
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:3] == ["gh", "api", "repos/acme/svc/commits/release/old"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=branch_sha + "\n", stderr="")
+        if cmd[:3] == ["gh", "api", "repos/acme/svc/commits/HEAD"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=head_sha + "\n", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr("codegraph_slicer.source_provider.subprocess.run", fake_run)
+    provider = GitHubCliProvider("acme/svc", ref="release/old", cache=BlobCache(tmp_path / "cache"))
+    assert provider.grep("needle", limit=5) == []
+    assert provider.grep_note is not None
+    assert "non-default ref" in provider.grep_note
+    assert all(c[:3] != ["gh", "search", "code"] for c in calls)
+
+
+def test_github_cli_provider_validates_graphql_errors_bytesize_sha1_and_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import hashlib
+
+    commit = "6" * 40
+    good_bytes = b"class Ok {}"
+    good_sha = hashlib.sha1(f"blob {len(good_bytes)}\0".encode("ascii") + good_bytes).hexdigest()
+
+    def run_errors(cmd, **kwargs):
+        if "graphql" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=json.dumps({"errors": [{"message": "rate limit ghp_secret123"}]}), stderr=""
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"sha": commit, "truncated": False, "tree": [{"path": "A.java", "type": "blob", "sha": good_sha}]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr("codegraph_slicer.source_provider.subprocess.run", run_errors)
+    p1 = GitHubCliProvider("acme/svc", ref=commit, cache=BlobCache(tmp_path / "c1"))
+    p1.list_files()
+    with pytest.raises(CodeGraphError, match=r"\[REDACTED\]"):
+        p1.read_files_batch(["A.java"])
+
+    def run_bad_sha(cmd, **kwargs):
+        if "graphql" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps({"data": {"repository": {"f0": {"text": "class Tampered {}", "byteSize": 17, "isBinary": False}}}}),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"sha": commit, "truncated": False, "tree": [{"path": "A.java", "type": "blob", "sha": good_sha}]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr("codegraph_slicer.source_provider.subprocess.run", run_bad_sha)
+    p2 = GitHubCliProvider("acme/svc", ref=commit, cache=BlobCache(tmp_path / "c2"))
+    p2.list_files()
+    with pytest.raises(CodeGraphError, match="blob SHA-1 mismatch"):
+        p2.read_files_batch(["A.java"])
+
+    def run_timeout(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=5.0)
+
+    monkeypatch.setattr("codegraph_slicer.source_provider.subprocess.run", run_timeout)
+    p3 = GitHubCliProvider("acme/svc", ref="main", cache=BlobCache(tmp_path / "c3"), timeout=5.0)
+    with pytest.raises(CodeGraphError, match="timed out"):
+        p3.resolve_ref()

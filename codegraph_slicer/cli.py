@@ -222,6 +222,9 @@ class _CoverageView:
     commit: str = ""
     api_calls: int | None = None
     cache_hits: int | None = None
+    tree_truncated: bool | None = None
+    grep_note: str = ""
+    caller_discovery: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict) -> "_CoverageView":
@@ -242,6 +245,9 @@ class _CoverageView:
             commit=str(raw.get("commit", "")),
             api_calls=int(raw["api_calls"]) if "api_calls" in raw else None,
             cache_hits=int(raw["cache_hits"]) if "cache_hits" in raw else None,
+            tree_truncated=bool(raw["tree_truncated"]) if "tree_truncated" in raw else None,
+            grep_note=str(raw.get("grep_note", "")),
+            caller_discovery=str(raw.get("caller_discovery", "")),
         )
 
 
@@ -256,6 +262,12 @@ def _xml_coverage(coverage: dict) -> list[str]:
         extra += f' api_calls="{cov.api_calls}"'
     if cov.cache_hits is not None:
         extra += f' cache_hits="{cov.cache_hits}"'
+    if cov.tree_truncated is not None:
+        extra += f' tree_truncated="{str(cov.tree_truncated).lower()}"'
+    if cov.caller_discovery:
+        extra += f" caller_discovery={_xml_attr(cov.caller_discovery)}"
+    if cov.grep_note:
+        extra += f" grep_note={_xml_attr(cov.grep_note)}"
     lines = [
         f'  <coverage mode={_xml_attr(cov.mode)}{extra} '
         f'explored_files="{cov.explored_files}" '
@@ -287,7 +299,11 @@ def _markdown_coverage(coverage: dict) -> str:
             detail += f" (`{cov.commit[:12]}`)"
         if cov.api_calls is not None:
             detail += f", api_calls={cov.api_calls}, cache_hits={cov.cache_hits or 0}"
+        if cov.tree_truncated is not None:
+            detail += f", tree_truncated={str(cov.tree_truncated).lower()}"
         lines.append(f"- Source provider: {detail}")
+    if cov.caller_discovery:
+        lines.append(f"- Caller discovery: `{cov.caller_discovery}`")
     lines.append(
         f"- Files: {cov.indexed_files} indexed / {cov.explored_files} explored "
         f"(budget: max_files={cov.max_files}, max_hops={cov.max_hops}, "
@@ -298,6 +314,8 @@ def _markdown_coverage(coverage: dict) -> str:
             f"- Parse failures ({len(cov.failed_files)}): "
             + ", ".join(f"`{path}`" for path, _ in cov.failed_files)
         )
+    if cov.grep_note:
+        lines.append(f"- Search note: {cov.grep_note}")
     if cov.note:
         lines.append(f"- Note: {cov.note}")
     return "\n".join(lines)
@@ -914,7 +932,16 @@ def main(argv=None):
     slicing.add_argument("--db", "--database", dest="db", default=None, help="existing indexed SQLite database")
     slicing.add_argument("--root", default=None, help="workspace root for target-seeded lazy slicing without a prebuilt --db")
     slicing.add_argument("--repo", default=None, help="GitHub repository (owner/name or URL) for lazy slicing via gh CLI")
-    slicing.add_argument("--ref", default="HEAD", help="Git commit SHA, branch, or tag when slicing with --repo (default: HEAD)")
+    slicing.add_argument("--ref", default=None, help="Git commit SHA, branch, or tag (with --root: reads commit objects; with --repo: defaults to HEAD)")
+    slicing.add_argument(
+        "--source-mode",
+        choices=("auto", "local", "remote"),
+        default="auto",
+        help="source acquisition mode when slicing without --db (default: auto)",
+    )
+    slicing.add_argument("--cache-dir", default=None, help="override remote source cache directory")
+    slicing.add_argument("--no-cache", action="store_true", help="disable persistent remote source cache reads and writes")
+    slicing.add_argument("--refresh-cache", action="store_true", help="re-fetch remote ref and tree metadata, ignoring cached tree TTL")
     slicing.add_argument("--max-files", type=int, default=40, help="max files to explore in lazy --root mode (default: 40)")
     slicing.add_argument("--max-hops", type=int, default=2, help="max dependency hops in lazy --root mode (default: 2)")
     slicing.add_argument("--no-callers", action="store_true", help="skip grep-based caller discovery in lazy --root mode")
@@ -1022,8 +1049,19 @@ def main(argv=None):
         parser.error("--edge-sample-limit must be at least 1")
     if args.cmd == "slice" and args.include_imports and not args.outline:
         parser.error("--include-imports requires --outline")
-    if args.cmd == "slice" and args.db and args.repo:
-        parser.error("--db cannot be combined with --repo")
+    if args.cmd == "slice":
+        if args.no_cache and args.refresh_cache:
+            parser.error("--no-cache cannot be combined with --refresh-cache")
+        if args.db:
+            if args.root or args.repo or args.ref is not None or args.source_mode != "auto":
+                parser.error("--db cannot be combined with --root, --repo, --ref, or --source-mode")
+            if args.cache_dir or args.no_cache or args.refresh_cache:
+                parser.error("--db cannot be combined with --cache-dir, --no-cache, or --refresh-cache")
+        else:
+            if args.source_mode == "local" and not args.root:
+                parser.error("--source-mode local requires --root")
+            if args.source_mode == "remote" and not args.repo:
+                parser.error("--source-mode remote requires --repo")
     opening_db = True
     opening_db_path = None
     try:
@@ -1064,17 +1102,53 @@ def main(argv=None):
                     )
             elif args.cmd == "slice" and (args.root or args.repo) and not args.db:
                 from .lazy_slicer import lazy_slice_context, lazy_slice_outline
-                from .source_provider import GitHubCliProvider, LocalGitProvider
+                from .source_provider import (
+                    BlobCache,
+                    GitHubCliProvider,
+                    LocalGitProvider,
+                    NoOpCache,
+                    parse_github_repo,
+                )
+
+                def _make_remote_provider() -> GitHubCliProvider:
+                    cache = NoOpCache() if args.no_cache else BlobCache(args.cache_dir)
+                    return GitHubCliProvider(
+                        args.repo,
+                        ref=args.ref or "HEAD",
+                        cache=cache,
+                        refresh_cache=args.refresh_cache,
+                    )
 
                 provider = None
-                if args.repo:
+                if args.source_mode == "remote":
+                    provider = _make_remote_provider()
+                elif args.source_mode == "local":
+                    local = LocalGitProvider(args.root, ref=args.ref)
+                    if args.repo:
+                        expected_repo = parse_github_repo(args.repo)
+                        origin_repo = local.origin_github_repo()
+                        if origin_repo is not None and origin_repo != expected_repo:
+                            raise CodeGraphError(
+                                f"--root {args.root} origin {origin_repo[0]}/{origin_repo[1]} "
+                                f"does not match --repo {expected_repo[0]}/{expected_repo[1]}"
+                            )
+                    provider = local
+                elif args.repo:
                     if args.root and Path(args.root).is_dir():
-                        local = LocalGitProvider(args.root)
-                        local_sha = local.resolve_ref()
-                        if args.ref == "HEAD" or (local_sha and local_sha == args.ref):
-                            provider = local
-                    if provider is None:
-                        provider = GitHubCliProvider(args.repo, ref=args.ref)
+                        local = LocalGitProvider(args.root, ref=args.ref)
+                        expected_repo = parse_github_repo(args.repo)
+                        origin_repo = local.origin_github_repo()
+                        if origin_repo is not None and origin_repo != expected_repo:
+                            raise CodeGraphError(
+                                f"--root {args.root} origin {origin_repo[0]}/{origin_repo[1]} "
+                                f"does not match --repo {expected_repo[0]}/{expected_repo[1]}; "
+                                "pass --source-mode remote to slice from GitHub"
+                            )
+                        provider = local
+                    else:
+                        provider = _make_remote_provider()
+                else:
+                    provider = LocalGitProvider(args.root, ref=args.ref)
 
                 opening_db = False
                 if args.outline:

@@ -111,11 +111,15 @@ def _resolve_target_to_paths(
                     return found
     elif from_file.endswith(".py"):
         rel_mod = clean.replace(".", "/")
-        for suffix in (".py", "/__init__.py"):
-            cand = rel_mod + suffix
-            if provider.file_exists(cand):
-                found.append(cand)
-                return found
+        prefixes = ["", "src/"]
+        if "/src/" in from_file:
+            prefixes.insert(0, from_file.split("/src/", 1)[0] + "/src/")
+        for pfx in prefixes:
+            for suffix in (".py", "/__init__.py"):
+                cand = pfx + rel_mod + suffix
+                if provider.file_exists(cand):
+                    found.append(cand)
+                    return found
     elif from_file.endswith(TS_JS_EXTENSIONS):
         base_dir = PurePosixPath(from_file).parent
         if clean.startswith("."):
@@ -242,18 +246,30 @@ def _populate_lazy_store(
                             _enqueue(dep)
 
     # Bounded candidate caller discovery via grep
-    if include_callers and len(explored_raw) < max_files:
-        caller_cands: list[str] = []
-        for needle in needles:
-            if len(explored_raw) + len(caller_cands) >= max_files:
-                truncated = True
-                break
-            remaining = max_files - (len(explored_raw) + len(caller_cands))
-            for cand in provider.grep(needle, limit=min(15, remaining)):
-                if cand not in explored_raw and cand not in caller_cands and provider.file_exists(cand):
-                    caller_cands.append(cand)
-        if caller_cands:
-            explored_raw.update(provider.read_files_batch(caller_cands))
+    caller_discovery = "skipped"
+    if include_callers:
+        if len(explored_raw) >= max_files:
+            caller_discovery = "budget_exhausted"
+            truncated = True
+        else:
+            caller_cands: list[str] = []
+            for needle in needles:
+                if len(explored_raw) + len(caller_cands) >= max_files:
+                    truncated = True
+                    break
+                remaining = max_files - (len(explored_raw) + len(caller_cands))
+                for cand in provider.grep(needle, limit=min(15, remaining)):
+                    if cand not in explored_raw and cand not in caller_cands and provider.file_exists(cand):
+                        caller_cands.append(cand)
+            if caller_cands:
+                explored_raw.update(provider.read_files_batch(caller_cands))
+            post_meta = provider.coverage_metadata()
+            if post_meta.get("grep_note"):
+                caller_discovery = "skipped_non_default_ref"
+            elif provider.provider_name == "github_cli":
+                caller_discovery = "default_branch_hint"
+            else:
+                caller_discovery = "local_grep"
 
     # Re-extract with unified layout and insert into an in-memory GraphStore
     source_root, packages = detect_layout(explored_raw.keys())
@@ -331,6 +347,7 @@ def _populate_lazy_store(
     coverage = {
         "mode": "lazy_target_seeded",
         **provider_meta,
+        "caller_discovery": caller_discovery,
         "explored_files": len(explored_raw),
         "indexed_files": indexed_count,
         "failed_files": [
