@@ -8,7 +8,7 @@ Ask a coding agent to change a method in a large repository and it can spend its
 
 Install the CLI and bundled skill, and your agent automatically checks repository structure before drowning in raw file reads. Small, straightforward tasks bypass slicing and go directly to the files; large monoliths and cross-package changes get structural context first—either from a fast local SQLite index (`sync` + `slice --db`) or immediately with zero upfront indexing via target-seeded lazy slicing (`slice --root .`).
 
-**`v0.3.13`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
+**`v0.3.14`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
 
 ---
 
@@ -32,7 +32,7 @@ Install the CLI and bundled skill, and your agent automatically checks repositor
 ### Step 1: Install the CLI (Python 3.12+)
 
 ```sh
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 ```
 
 ### Step 2: Install the Agent Skill (Pick Your Harness)
@@ -40,17 +40,17 @@ uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
 ```sh
 # Claude Code:
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 
 # Cursor (Global):
 mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Codex (User):
 mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -74,6 +74,10 @@ codegraph-slicer route --db "$GRAPH" \
 
 # Option B — Target-seeded lazy slice on huge unindexed monorepos (no upfront sync):
 codegraph-slicer slice --root . --max-tokens 8000 --format xml \
+  src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler.processOrder
+
+# Option C — Remote GitHub lazy slice via gh CLI (no git clone needed):
+codegraph-slicer slice --repo owner/name --ref main --no-callers --max-tokens 8000 --format xml \
   src/main/java/com/acme/checkout/CheckoutHandler.java:CheckoutHandler.processOrder
 ```
 
@@ -130,19 +134,19 @@ Requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and **Git** (to install fr
 
 ```sh
 # With uv (recommended):
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 
 # Or upgrade an existing uv tool installation:
-uv tool install --force "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+uv tool install --force "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 
 # Or with pip:
-python3 -m pip install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+python3 -m pip install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 ```
 
 Verify installation:
 
 ```sh
-codegraph-slicer --version   # codegraph-slicer 0.3.13
+codegraph-slicer --version   # codegraph-slicer 0.3.14
 codegraph-slicer --help
 ```
 
@@ -159,7 +163,7 @@ The bundled [`SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md) teaches your 
 
 ```sh
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -168,12 +172,12 @@ mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
 ```sh
 # Global user skill:
 mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
 mkdir -p .cursor/skills/codegraph-slicer && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o .cursor/skills/codegraph-slicer/SKILL.md
 ```
 
@@ -182,12 +186,12 @@ mkdir -p .cursor/skills/codegraph-slicer && \
 ```sh
 # User-scoped skill:
 mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
 mkdir -p .agents/skills/codegraph-slicer && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o .agents/skills/codegraph-slicer/SKILL.md
 ```
 
@@ -195,7 +199,7 @@ mkdir -p .agents/skills/codegraph-slicer && \
 
 ```sh
 mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.gemini/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -203,7 +207,7 @@ mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
 
 ```sh
 mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.gemini/config/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -211,7 +215,7 @@ mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
 
 ```sh
 mkdir -p "$HOME/.config/opencode/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.config/opencode/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -282,9 +286,9 @@ codegraph-slicer route --db "$GRAPH" \
 
 Skipped parse failures (when synced with `--skip-unparseable`) are reported as `skipped_files` and `skipped_languages`. They trigger `incomplete_index` only when skipped non-test files in an indexed production language exceed **2%** of production files, so one broken file in a large repository, or an unparseable script in a language the repo doesn't otherwise use, won't disable the graph. On a very small repository a single skipped file can cross 2%; fix or delete it and re-sync.
 
-### 3. Extract One Bounded XML Context Slice (`slice --db` or `slice --root`)
+### 3. Extract One Bounded XML Context Slice (`slice --db`, `slice --root`, or `slice --repo`)
 
-Batch 3–8 target anchors into a single call so shared types, interfaces, and callers are deduplicated. Pass `--db` (indexed snapshot) or `--root` (lazy, no index); if you pass both, `--db` wins:
+Batch 3–8 target anchors into a single call so shared types, interfaces, and callers are deduplicated. Pass `--db` (indexed snapshot), `--root` (local workspace or `--ref` Git commit), or `--repo` (remote GitHub repository via `gh` CLI; controlled by `--source-mode {auto,local,remote}`, `--cache-dir`, `--no-cache`, and `--refresh-cache`):
 
 ```sh
 # From an indexed SQLite snapshot (--db):
@@ -297,13 +301,17 @@ codegraph-slicer slice --db "$GRAPH" --max-tokens 8000 --format xml \
 codegraph-slicer slice --root . --max-tokens 8000 --format xml \
   src/main/java/com/acme/orders/OrderPipeline.java:OrderPipeline.dispatchDueOrders \
   --max-files 40 --max-hops 2        # add --no-callers to skip grep-based caller discovery
+
+# Or remote target-seeded lazy slicing from GitHub (--repo, cached in SHA-1-verified BlobCache):
+codegraph-slicer slice --repo owner/name --ref main --no-callers --max-tokens 8000 --format xml \
+  src/main/java/com/acme/orders/OrderPipeline.java:OrderPipeline.dispatchDueOrders
 ```
 
-The XML slice organizes structural context into four deterministic sections (plus `<coverage>` metadata in lazy `--root` mode):
+The XML slice organizes structural context into four deterministic sections (plus `<coverage>` metadata in lazy `--root` / `--repo` mode):
 
 | XML Section | Contents |
 | :--- | :--- |
-| **`<coverage>`** *(lazy `--root` mode)* | Reports `mode="lazy_target_seeded"`, `explored_files`, `indexed_files`, `max_files`, `max_hops`, `truncated`, and any `<failed_file>` parse errors. |
+| **`<coverage>`** *(lazy `--root` / `--repo` mode)* | Reports `mode="lazy_target_seeded"`, `explored_files`, `indexed_files`, `max_files`, `max_hops`, `truncated`, `caller_discovery`, `tree_truncated`, `grep_note`, and any `<failed_file>` parse errors. |
 | **`<types_and_schemas>`** | Enclosing class fields/constructors, interfaces, inherited types, `@property` getters, JSDoc types, and referenced DTOs (`USES_TYPE` / `INHERITS` up to 2 hops) with non-called methods folded to 1-line signatures. Multi-anchor slices automatically condense or drop depth-2 transitive types to stay within `--max-tokens`. |
 | **`<upstream_callers>`** | Direct 1-hop caller snippets and dispatch windows showing how targets are invoked. |
 | **`<downstream_dependencies>`** | Callee signatures, 1-line return hints, and compact same-file helper bodies (`<= 40` lines). |
