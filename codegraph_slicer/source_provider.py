@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -10,10 +11,12 @@ import shutil
 import sqlite3
 import subprocess
 import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Callable, Protocol
-from urllib.parse import quote
+from typing import Any, Callable, Protocol
+from urllib.parse import quote, urlencode
 
 from .ast_extractor import CodeGraphError, is_supported_source_path
 from .store import _iter_workspace_files, _should_skip_rel_path, git_env
@@ -583,10 +586,48 @@ class LocalGitProvider:
         return meta
 
 
-class GitHubCliProvider:
-    """Source provider backed by the `gh` CLI (REST tree + batched GraphQL blobs) and BlobCache."""
+GITHUB_API_BASE = "https://api.github.com"
+_GITHUB_API_VERSION = "2022-11-28"
+_GITHUB_USER_AGENT = "codegraph-slicer/0.3.14"
 
-    provider_name = "github_cli"
+
+def _verify_git_blob_sha1(rel_path: str, content: bytes, expected_sha: str | None) -> None:
+    if expected_sha and _SHA40_RE.fullmatch(expected_sha):
+        actual_sha = hashlib.sha1(f"blob {len(content)}\0".encode("ascii") + content).hexdigest()
+        if actual_sha != expected_sha:
+            raise CodeGraphError(
+                f"blob SHA-1 mismatch for {rel_path}: expected {expected_sha}, got {actual_sha}"
+            )
+
+
+def _extract_tree_entries(payload: dict[str, Any]) -> tuple[list[str], dict[str, str], bool]:
+    truncated = bool(payload.get("truncated", False))
+    raw_paths: list[str] = []
+    blob_shas: dict[str, str] = {}
+    for entry in payload.get("tree", []):
+        if entry.get("type") != "blob":
+            continue
+        p = str(entry.get("path", ""))
+        if not p:
+            continue
+        raw_paths.append(p)
+        if entry.get("sha"):
+            blob_shas[p] = str(entry["sha"])
+    return raw_paths, blob_shas, truncated
+
+
+def _build_graphql_blob_query(commit: str, chunk: list[str]) -> str:
+    aliases = [
+        f"f{i}: object(expression: {json.dumps(f'{commit}:{p}')}) {{ ... on Blob {{ text byteSize isBinary }} }}"
+        for i, p in enumerate(chunk)
+    ]
+    return f"query($owner:String!,$name:String!){{ repository(owner:$owner,name:$name){{ {' '.join(aliases)} }} }}"
+
+
+class _BaseGitHubProvider:
+    """Shared tree/blob caching, SHA-1 integrity verification, and ref logic for GitHub providers."""
+
+    provider_name = "github"
 
     def __init__(
         self,
@@ -614,6 +655,206 @@ class GitHubCliProvider:
         self.cache_hits = 0
         self.grep_note: str | None = None
 
+    def _fetch_commit_sha_remote(self, ref_name: str) -> str:
+        raise NotImplementedError
+
+    def _fetch_tree_payload_remote(self, commit: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _fetch_blobs_remote(self, commit: str, missing: list[str]) -> dict[str, bytes]:
+        raise NotImplementedError
+
+    def _search_code_remote(self, needle: str, limit: int) -> list[str]:
+        raise NotImplementedError
+
+    def resolve_ref(self) -> str:
+        if self._commit is not None:
+            return self._commit
+        sha = self._fetch_commit_sha_remote(self.ref).strip()
+        if not _SHA40_RE.fullmatch(sha):
+            raise CodeGraphError(
+                f"{self.provider_name} returned invalid commit SHA for {self.owner}/{self.repo}@{self.ref}: {sha!r}"
+            )
+        self._commit = sha
+        if self.ref == "HEAD":
+            self._default_head_commit = sha
+        return sha
+
+    def _resolve_default_head(self) -> str:
+        if self._default_head_commit is not None:
+            return self._default_head_commit
+        sha = self._fetch_commit_sha_remote("HEAD").strip()
+        if not _SHA40_RE.fullmatch(sha):
+            raise CodeGraphError(
+                f"{self.provider_name} returned invalid HEAD SHA for {self.owner}/{self.repo}: {sha!r}"
+            )
+        self._default_head_commit = sha
+        return sha
+
+    def _ensure_tree(self) -> None:
+        if self._paths is not None:
+            return
+        commit = self.resolve_ref()
+        cached = None if self.refresh_cache else self.cache.get_tree(self.owner, self.repo, commit)
+        if cached is not None:
+            self.cache_hits += 1
+            raw_paths = list(cached.get("paths", []))
+            self._blob_shas = dict(cached.get("blob_shas", {}))
+            self.tree_truncated = bool(cached.get("truncated", False))
+        else:
+            payload = self._fetch_tree_payload_remote(commit)
+            raw_paths, blob_shas, self.tree_truncated = _extract_tree_entries(payload)
+            self._blob_shas = blob_shas
+            self.cache.put_tree(
+                self.owner,
+                self.repo,
+                commit,
+                {"paths": raw_paths, "blob_shas": blob_shas, "truncated": self.tree_truncated},
+            )
+        self._paths = [
+            p
+            for p in raw_paths
+            if is_supported_source_path(p) and not _should_skip_rel_path(PurePosixPath(p).parts)
+        ]
+        self._path_set = set(raw_paths)
+
+    def list_files(self) -> list[str]:
+        self._ensure_tree()
+        return list(self._paths or ())
+
+    def file_exists(self, rel_path: str) -> bool:
+        self._ensure_tree()
+        return rel_path in (self._path_set or ())
+
+    def _blob_cache_key(self, commit: str, rel_path: str) -> str:
+        sha = self._blob_shas.get(rel_path)
+        if sha:
+            return f"git:{sha}"
+        return f"gh:{self.owner}/{self.repo}/{commit}/{rel_path}"
+
+    def _read_cached_blob(self, commit: str, rel_p: str) -> bytes | None:
+        cache_key = self._blob_cache_key(commit, rel_p)
+        cached = self.cache.get_blob(cache_key)
+        if cached is None:
+            return None
+        expected_sha = self._blob_shas.get(rel_p)
+        if expected_sha and _SHA40_RE.fullmatch(expected_sha):
+            actual_sha = hashlib.sha1(f"blob {len(cached)}\0".encode("ascii") + cached).hexdigest()
+            if actual_sha != expected_sha:
+                self.cache.delete_blob(cache_key)
+                return None
+        return cached
+
+    def _decode_graphql_entry(self, rel_p: str, blob: object) -> bytes | None:
+        if not isinstance(blob, dict) or blob.get("isBinary") or blob.get("text") is None:
+            return None
+        content = str(blob["text"]).encode("utf-8")
+        expected_size = blob.get("byteSize")
+        if expected_size is not None and len(content) != int(expected_size):
+            raise CodeGraphError(
+                f"github graphql byteSize mismatch for {rel_p}: expected {expected_size}, got {len(content)}"
+            )
+        _verify_git_blob_sha1(rel_p, content, self._blob_shas.get(rel_p))
+        return content
+
+    def _parse_graphql_blobs(self, chunk: list[str], parsed: dict[str, Any]) -> dict[str, bytes]:
+        errors = parsed.get("errors")
+        if isinstance(errors, list) and errors:
+            msgs = [str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in errors]
+            raise CodeGraphError(f"github graphql returned errors: {_redact('; '.join(msgs))}")
+        data = (parsed.get("data") or {}).get("repository") or {}
+        out: dict[str, bytes] = {}
+        for i, rel_p in enumerate(chunk):
+            content = self._decode_graphql_entry(rel_p, data.get(f"f{i}"))
+            if content is not None:
+                out[rel_p] = content
+        return out
+
+    def read_files_batch(self, rel_paths: list[str]) -> dict[str, bytes]:
+        commit = self.resolve_ref()
+        out: dict[str, bytes] = {}
+        missing: list[str] = []
+        for rel_p in dict.fromkeys(rel_paths):
+            if rel_p in self._mem_blobs:
+                out[rel_p] = self._mem_blobs[rel_p]
+                continue
+            cached = self._read_cached_blob(commit, rel_p)
+            if cached is not None:
+                self.cache_hits += 1
+                self._mem_blobs[rel_p] = cached
+                out[rel_p] = cached
+            else:
+                missing.append(rel_p)
+        if missing:
+            fetched = self._fetch_blobs_remote(commit, missing)
+            for rel_p, content in fetched.items():
+                self.cache.put_blob(self._blob_cache_key(commit, rel_p), content)
+                self._mem_blobs[rel_p] = content
+                out[rel_p] = content
+        return out
+
+    def _can_remote_grep(self) -> bool:
+        if self._pinned_sha:
+            self.grep_note = "github code search skipped on pinned commit SHA (GitHub indexes default branch only)"
+            return False
+        if self.ref != "HEAD":
+            if self.resolve_ref() != self._resolve_default_head():
+                self.grep_note = (
+                    f"github code search skipped for non-default ref {self.ref!r} "
+                    "(GitHub indexes default branch only)"
+                )
+                return False
+        return True
+
+    def _grep_mem_blobs(self, needle_bytes: bytes, limit: int) -> list[str]:
+        out: list[str] = []
+        for rel_p, raw in self._mem_blobs.items():
+            if is_supported_source_path(rel_p) and needle_bytes in raw:
+                out.append(rel_p)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _is_eligible_grep_hit(self, path: str, seen: list[str]) -> bool:
+        return bool(
+            path
+            and path not in seen
+            and is_supported_source_path(path)
+            and not _should_skip_rel_path(PurePosixPath(path).parts)
+        )
+
+    def grep(self, needle: str, limit: int = 15) -> list[str]:
+        if not needle or len(needle) < 2:
+            return []
+        out = self._grep_mem_blobs(needle.encode("utf-8"), limit)
+        if len(out) >= limit or not self._can_remote_grep():
+            return out
+        for p in self._search_code_remote(needle, limit):
+            if self._is_eligible_grep_hit(p, out):
+                out.append(p)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def coverage_metadata(self) -> dict:
+        meta: dict = {
+            "provider": self.provider_name,
+            "repo": f"{self.owner}/{self.repo}",
+            "commit": self._commit or "",
+            "api_calls": self.api_calls,
+            "cache_hits": self.cache_hits,
+            "tree_truncated": self.tree_truncated,
+        }
+        if self.grep_note:
+            meta["grep_note"] = self.grep_note
+        return meta
+
+
+class GitHubCliProvider(_BaseGitHubProvider):
+    """Source provider backed by the `gh` CLI (REST tree + batched GraphQL blobs) and BlobCache."""
+
+    provider_name = "github_cli"
+
     def _run_gh(self, args: list[str]) -> str:
         cmd = ["gh", *args]
         env = os.environ.copy()
@@ -638,119 +879,22 @@ class GitHubCliProvider:
             raise CodeGraphError(f"gh api failed ({res.returncode}): {err}")
         return res.stdout
 
-    def resolve_ref(self) -> str:
-        if self._commit is not None:
-            return self._commit
-        encoded_ref = quote(self.ref, safe="")
-        out = self._run_gh(["api", f"repos/{self.owner}/{self.repo}/commits/{encoded_ref}", "--jq", ".sha"]).strip()
-        if not _SHA40_RE.fullmatch(out):
-            raise CodeGraphError(f"gh api returned invalid commit SHA for {self.owner}/{self.repo}@{self.ref}: {out!r}")
-        self._commit = out
-        if self.ref == "HEAD":
-            self._default_head_commit = out
-        return out
+    def _fetch_commit_sha_remote(self, ref_name: str) -> str:
+        encoded_ref = quote(ref_name, safe="")
+        return self._run_gh(["api", f"repos/{self.owner}/{self.repo}/commits/{encoded_ref}", "--jq", ".sha"])
 
-    def _resolve_default_head(self) -> str:
-        if self._default_head_commit is not None:
-            return self._default_head_commit
-        out = self._run_gh(["api", f"repos/{self.owner}/{self.repo}/commits/HEAD", "--jq", ".sha"]).strip()
-        if not _SHA40_RE.fullmatch(out):
-            raise CodeGraphError(f"gh api returned invalid HEAD SHA for {self.owner}/{self.repo}: {out!r}")
-        self._default_head_commit = out
-        return out
+    def _fetch_tree_payload_remote(self, commit: str) -> dict[str, Any]:
+        raw = self._run_gh(["api", f"repos/{self.owner}/{self.repo}/git/trees/{commit}?recursive=1"])
+        try:
+            return json.loads(raw)
+        except ValueError as exc:
+            raise CodeGraphError(f"invalid JSON from gh tree API: {exc}") from exc
 
-    def _ensure_tree(self) -> None:
-        if self._paths is not None:
-            return
-        commit = self.resolve_ref()
-        cached = None if self.refresh_cache else self.cache.get_tree(self.owner, self.repo, commit)
-        if cached is not None:
-            self.cache_hits += 1
-            raw_paths = list(cached.get("paths", []))
-            self._blob_shas = dict(cached.get("blob_shas", {}))
-            self.tree_truncated = bool(cached.get("truncated", False))
-        else:
-            raw = self._run_gh(["api", f"repos/{self.owner}/{self.repo}/git/trees/{commit}?recursive=1"])
-            try:
-                payload = json.loads(raw)
-            except ValueError as exc:
-                raise CodeGraphError(f"invalid JSON from gh tree API: {exc}") from exc
-            self.tree_truncated = bool(payload.get("truncated", False))
-            raw_paths = []
-            blob_shas: dict[str, str] = {}
-            for entry in payload.get("tree", []):
-                if entry.get("type") != "blob":
-                    continue
-                p = str(entry.get("path", ""))
-                if not p:
-                    continue
-                raw_paths.append(p)
-                if entry.get("sha"):
-                    blob_shas[p] = str(entry["sha"])
-            self._blob_shas = blob_shas
-            self.cache.put_tree(
-                self.owner,
-                self.repo,
-                commit,
-                {"paths": raw_paths, "blob_shas": blob_shas, "truncated": self.tree_truncated},
-            )
-        filtered = [
-            p
-            for p in raw_paths
-            if is_supported_source_path(p) and not _should_skip_rel_path(PurePosixPath(p).parts)
-        ]
-        self._paths = filtered
-        self._path_set = set(raw_paths)
-
-    def list_files(self) -> list[str]:
-        self._ensure_tree()
-        return list(self._paths or ())
-
-    def file_exists(self, rel_path: str) -> bool:
-        self._ensure_tree()
-        return rel_path in (self._path_set or ())
-
-    def _blob_cache_key(self, commit: str, rel_path: str) -> str:
-        sha = self._blob_shas.get(rel_path)
-        if sha:
-            return f"git:{sha}"
-        return f"gh:{self.owner}/{self.repo}/{commit}/{rel_path}"
-
-    def read_files_batch(self, rel_paths: list[str]) -> dict[str, bytes]:
-        commit = self.resolve_ref()
+    def _fetch_blobs_remote(self, commit: str, missing: list[str]) -> dict[str, bytes]:
         out: dict[str, bytes] = {}
-        missing: list[str] = []
-        for rel_p in dict.fromkeys(rel_paths):
-            if rel_p in self._mem_blobs:
-                out[rel_p] = self._mem_blobs[rel_p]
-                continue
-            cache_key = self._blob_cache_key(commit, rel_p)
-            cached = self.cache.get_blob(cache_key)
-            if cached is not None:
-                expected_sha = self._blob_shas.get(rel_p)
-                if expected_sha and _SHA40_RE.fullmatch(expected_sha):
-                    actual_sha = hashlib.sha1(
-                        f"blob {len(cached)}\0".encode("ascii") + cached
-                    ).hexdigest()
-                    if actual_sha != expected_sha:
-                        self.cache.delete_blob(cache_key)
-                        cached = None
-            if cached is not None:
-                self.cache_hits += 1
-                self._mem_blobs[rel_p] = cached
-                out[rel_p] = cached
-            else:
-                missing.append(rel_p)
-
         for idx in range(0, len(missing), GRAPHQL_BATCH_SIZE):
             chunk = missing[idx : idx + GRAPHQL_BATCH_SIZE]
-            aliases = [
-                f"f{i}: object(expression: {json.dumps(f'{commit}:{p}')}) {{ ... on Blob {{ text byteSize isBinary }} }}"
-                for i, p in enumerate(chunk)
-            ]
-            query = (
-                f"query($owner:String!,$name:String!){{ repository(owner:$owner,name:$name){{ {' '.join(aliases)} }} }}"
-            )
+            query = _build_graphql_blob_query(commit, chunk)
             raw = self._run_gh(
                 [
                     "api",
@@ -767,57 +911,10 @@ class GitHubCliProvider:
                 parsed = json.loads(raw)
             except ValueError as exc:
                 raise CodeGraphError(f"invalid JSON from gh graphql API: {exc}") from exc
-            errors = parsed.get("errors")
-            if isinstance(errors, list) and errors:
-                msgs = [str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in errors]
-                raise CodeGraphError(f"gh graphql returned errors: {_redact('; '.join(msgs))}")
-            data = (parsed.get("data") or {}).get("repository") or {}
-            for i, rel_p in enumerate(chunk):
-                blob = data.get(f"f{i}")
-                if not isinstance(blob, dict) or blob.get("isBinary") or blob.get("text") is None:
-                    continue
-                content = str(blob["text"]).encode("utf-8")
-                expected_size = blob.get("byteSize")
-                if expected_size is not None and len(content) != int(expected_size):
-                    raise CodeGraphError(
-                        f"gh graphql byteSize mismatch for {rel_p}: expected {expected_size}, got {len(content)}"
-                    )
-                expected_sha = self._blob_shas.get(rel_p)
-                if expected_sha and _SHA40_RE.fullmatch(expected_sha):
-                    actual_sha = hashlib.sha1(
-                        f"blob {len(content)}\0".encode("ascii") + content
-                    ).hexdigest()
-                    if actual_sha != expected_sha:
-                        raise CodeGraphError(
-                            f"blob SHA-1 mismatch for {rel_p}: expected {expected_sha}, got {actual_sha}"
-                        )
-                self.cache.put_blob(self._blob_cache_key(commit, rel_p), content)
-                self._mem_blobs[rel_p] = content
-                out[rel_p] = content
+            out.update(self._parse_graphql_blobs(chunk, parsed))
         return out
 
-    def grep(self, needle: str, limit: int = 15) -> list[str]:
-        if not needle or len(needle) < 2:
-            return []
-        needle_bytes = needle.encode("utf-8")
-        out: list[str] = []
-        for rel_p, raw in self._mem_blobs.items():
-            if is_supported_source_path(rel_p) and needle_bytes in raw:
-                out.append(rel_p)
-                if len(out) >= limit:
-                    return out
-        if self._pinned_sha:
-            self.grep_note = "gh search code skipped on pinned commit SHA (GitHub indexes default branch only)"
-            return out
-        if self.ref != "HEAD":
-            commit = self.resolve_ref()
-            default_head = self._resolve_default_head()
-            if commit != default_head:
-                self.grep_note = (
-                    f"gh search code skipped for non-default ref {self.ref!r} "
-                    "(GitHub indexes default branch only)"
-                )
-                return out
+    def _search_code_remote(self, needle: str, limit: int) -> list[str]:
         raw_out = self._run_gh(
             [
                 "search",
@@ -834,29 +931,227 @@ class GitHubCliProvider:
         try:
             hits = json.loads(raw_out)
         except ValueError:
+            return []
+        return [str(hit.get("path", "")) for hit in hits if isinstance(hit, dict)]
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        raise CodeGraphError(f"GitHub API redirect refused (HTTP {code})")
+
+
+def _decode_rest_blob_payload(rel_path: str, payload: dict[str, Any], expected_sha: str | None) -> bytes | None:
+    if payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
+        return None
+    try:
+        raw = base64.b64decode(payload["content"], validate=False)
+    except ValueError:
+        return None
+    if b"\x00" in raw:
+        return None
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    _verify_git_blob_sha1(rel_path, raw, expected_sha)
+    return raw
+
+
+def _parse_github_json_object(raw: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        raise CodeGraphError(f"invalid JSON from GitHub API: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise CodeGraphError("unexpected non-object JSON from GitHub API")
+    return parsed
+
+
+class GitHubHttpProvider(_BaseGitHubProvider):
+    """Pure-Python GitHub API provider (httpx with urllib fallback) with per-instance token isolation."""
+
+    provider_name = "github_http"
+
+    def __init__(
+        self,
+        repo: str,
+        *,
+        ref: str = "HEAD",
+        token: str | None = None,
+        cache: BlobCache | NoOpCache | None = None,
+        refresh_cache: bool = False,
+        timeout: float | None = None,
+        client: Any | None = None,
+    ) -> None:
+        super().__init__(repo, ref=ref, cache=cache, refresh_cache=refresh_cache, timeout=timeout)
+        if token is not None:
+            if not token or any(ch.isspace() for ch in token):
+                raise CodeGraphError("invalid GitHub token")
+        self._token = token
+        self._client = client
+        self._owns_client = False
+
+    def __repr__(self) -> str:
+        auth = "authenticated" if self._token else "public"
+        return f"GitHubHttpProvider(repo={self.owner}/{self.repo!r}, ref={self.ref!r}, auth={auth})"
+
+    def close(self) -> None:
+        if self._owns_client and self._client is not None:
+            self._client.close()
+            self._client = None
+            self._owns_client = False
+
+    def __enter__(self) -> "GitHubHttpProvider":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def _headers(self) -> dict[str, str]:
+        hdrs = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": _GITHUB_API_VERSION,
+            "User-Agent": _GITHUB_USER_AGENT,
+        }
+        if self._token:
+            hdrs["Authorization"] = f"Bearer {self._token}"
+        return hdrs
+
+    def _get_httpx_client(self) -> Any | None:
+        if self._client is not None:
+            return self._client
+        try:
+            import httpx
+        except ImportError:
+            return None
+        self._client = httpx.Client(
+            base_url=GITHUB_API_BASE,
+            follow_redirects=False,
+            timeout=self.timeout,
+        )
+        self._owns_client = True
+        return self._client
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        client = self._get_httpx_client()
+        if client is not None:
+            return self._request_via_httpx(client, method, path, params=params, json_body=json_body)
+        return self._request_via_urllib(method, path, params=params, json_body=json_body)
+
+    def _request_via_httpx(
+        self,
+        client: Any,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{GITHUB_API_BASE}{path}"
+        try:
+            resp = client.request(
+                method,
+                url,
+                headers=self._headers(),
+                params=params,
+                json=json_body,
+                timeout=self.timeout,
+            )
+        except Exception as exc:
+            raise CodeGraphError(f"GitHub API request failed: {_redact(str(exc))}") from exc
+        self.api_calls += 1
+        if 300 <= resp.status_code < 400:
+            raise CodeGraphError(f"GitHub API redirect refused (HTTP {resp.status_code})")
+        if resp.status_code >= 400:
+            detail = _redact((resp.text or "").strip()[:300])
+            raise CodeGraphError(f"GitHub API failed ({resp.status_code}): {detail}")
+        return _parse_github_json_object(resp.text)
+
+    def _request_via_urllib(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, str] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = f"{GITHUB_API_BASE}{path}" + (f"?{urlencode(params)}" if params else "")
+        headers = self._headers()
+        data = json.dumps(json_body, ensure_ascii=False).encode("utf-8") if json_body is not None else None
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        opener = urllib.request.build_opener(_NoRedirectHandler)
+        self.api_calls += 1
+        try:
+            with opener.open(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            body = _redact(exc.read().decode("utf-8", "replace").strip()[:300])
+            raise CodeGraphError(f"GitHub API failed ({exc.code}): {body}") from exc
+        except CodeGraphError:
+            raise
+        except Exception as exc:
+            raise CodeGraphError(f"GitHub API request failed: {_redact(str(exc))}") from exc
+        return _parse_github_json_object(raw)
+
+    def _fetch_commit_sha_remote(self, ref_name: str) -> str:
+        encoded_ref = quote(ref_name, safe="")
+        payload = self._request_json("GET", f"/repos/{self.owner}/{self.repo}/commits/{encoded_ref}")
+        return str(payload.get("sha", ""))
+
+    def _fetch_tree_payload_remote(self, commit: str) -> dict[str, Any]:
+        return self._request_json(
+            "GET",
+            f"/repos/{self.owner}/{self.repo}/git/trees/{commit}",
+            params={"recursive": "1"},
+        )
+
+    def _fetch_blobs_remote(self, commit: str, missing: list[str]) -> dict[str, bytes]:
+        if self._token:
+            out: dict[str, bytes] = {}
+            for idx in range(0, len(missing), GRAPHQL_BATCH_SIZE):
+                chunk = missing[idx : idx + GRAPHQL_BATCH_SIZE]
+                query = _build_graphql_blob_query(commit, chunk)
+                parsed = self._request_json(
+                    "POST",
+                    "/graphql",
+                    json_body={"query": query, "variables": {"owner": self.owner, "name": self.repo}},
+                )
+                out.update(self._parse_graphql_blobs(chunk, parsed))
             return out
-        for hit in hits:
-            p = str(hit.get("path", ""))
-            if (
-                p
-                and p not in out
-                and is_supported_source_path(p)
-                and not _should_skip_rel_path(PurePosixPath(p).parts)
-            ):
-                out.append(p)
-                if len(out) >= limit:
-                    break
+        return self._fetch_blobs_rest_public(missing)
+
+    def _fetch_blobs_rest_public(self, missing: list[str]) -> dict[str, bytes]:
+        self._ensure_tree()
+        out: dict[str, bytes] = {}
+        for rel_p in missing:
+            blob_sha = self._blob_shas.get(rel_p)
+            if not blob_sha or not _SHA40_RE.fullmatch(blob_sha):
+                continue
+            payload = self._request_json("GET", f"/repos/{self.owner}/{self.repo}/git/blobs/{blob_sha}")
+            content = _decode_rest_blob_payload(rel_p, payload, blob_sha)
+            if content is not None:
+                out[rel_p] = content
         return out
 
-    def coverage_metadata(self) -> dict:
-        meta: dict = {
-            "provider": self.provider_name,
-            "repo": f"{self.owner}/{self.repo}",
-            "commit": self._commit or "",
-            "api_calls": self.api_calls,
-            "cache_hits": self.cache_hits,
-            "tree_truncated": self.tree_truncated,
-        }
-        if self.grep_note:
-            meta["grep_note"] = self.grep_note
-        return meta
+    def _search_code_remote(self, needle: str, limit: int) -> list[str]:
+        if not self._token:
+            self.grep_note = "github code search requires authentication; pass explicit file:symbol anchors"
+            return []
+        payload = self._request_json(
+            "GET",
+            "/search/code",
+            params={"q": f"{needle} repo:{self.owner}/{self.repo}", "per_page": str(max(1, min(limit, 100)))},
+        )
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return []
+        return [str(item.get("path", "")) for item in items if isinstance(item, dict)]

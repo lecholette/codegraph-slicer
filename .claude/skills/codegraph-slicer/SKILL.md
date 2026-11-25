@@ -4,7 +4,7 @@ description: >-
   Proactively use whenever `codegraph-slicer` is installed and you are implementing features, fixing bugs,
   refactoring, debugging, or answering structural questions in any Python (.py), Java (.java), TypeScript (.ts, .tsx),
   or JavaScript (.js, .jsx, .mjs, .cjs) codebase—before reading large source files (>=300 lines) or grepping across
-  packages. Static code graph (`v0.3.13`): sync, map (--recommend-workflow), route, slice (--db or zero-setup --root
+  packages. Static code graph (`v0.3.14`): sync, map (--recommend-workflow), route, slice (--db or zero-setup --root
   lazy mode, --contracts), impact, flow, and delta. Not for runtime behavior or running tests.
 ---
 
