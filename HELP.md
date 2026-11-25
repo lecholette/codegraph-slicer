@@ -209,7 +209,9 @@ codegraph-slicer route --db /tmp/project.sqlite \
 ### `slice`
 
 ```text
-codegraph-slicer slice (--db DATABASE | --root ROOT) ANCHOR [ANCHOR ...]
+codegraph-slicer slice (--db DATABASE | --root ROOT | --repo REPO) ANCHOR [ANCHOR ...]
+                       [--ref REF] [--source-mode auto|local|remote]
+                       [--cache-dir DIR] [--no-cache] [--refresh-cache]
                        [--max-tokens N] [--include-callee-bodies] [--outline]
                        [--include-imports] [--target-mode full|skeleton]
                        [--dedup-session] [--dedup-session-id ID] [--contracts]
@@ -217,15 +219,23 @@ codegraph-slicer slice (--db DATABASE | --root ROOT) ANCHOR [ANCHOR ...]
                        [--snapshot] [--format json|markdown|xml]
 ```
 
-Pass either `--db DATABASE` (an existing index opened read-only) or `--root ROOT`
-(target-seeded lazy slicing of an unindexed workspace directory). With neither,
-`slice` exits `2`; with both, `--db` is used. Lazy `--root` mode parses only the
-seed files, their resolved imports and types up to `--max-hops` (default 2),
-and grep-matched candidate callers (skipped with `--no-callers`), stopping at
-`--max-files` (default 40). It emits a `coverage` block (`explored_files`,
-`indexed_files`, `truncated`, and any failed files) in every format; callers
-outside that coverage are unexplored, not absent. `--snapshot` has no effect in
-`--root` mode because it reads current files directly.
+Pass `--db DATABASE` (an existing index opened read-only), `--root ROOT`
+(target-seeded lazy slicing of an unindexed workspace or `--ref` Git commit),
+or `--repo REPO` (target-seeded lazy slicing from GitHub via `gh` CLI). With
+none of them, `slice` exits `2`; `--db` cannot be combined with `--root`,
+`--repo`, `--ref`, `--source-mode`, or remote cache flags. `--source-mode`
+(`auto`, `local`, `remote`) controls whether local `--root` or remote `--repo`
+is used when both are provided (verifying `origin` matches `--repo` in `auto`
+and `local`). Lazy mode parses only the seed files, their resolved imports and
+types up to `--max-hops` (default 2), and grep-matched candidate callers
+(skipped with `--no-callers`), stopping at `--max-files` (default 40). It
+emits a `coverage` block (`explored_files`, `indexed_files`, `truncated`,
+`caller_discovery`, `tree_truncated`, `grep_note`, and any failed files) in
+every format; callers outside that coverage are unexplored, not absent. Remote
+`--repo` mode caches trees and SHA-1-verified blobs under `--cache-dir` (or
+`CODEGRAPH_SLICER_CACHE_DIR` / `~/.cache/codegraph-slicer`) unless `--no-cache`
+is set, and `--refresh-cache` bypasses cached tree TTL. `--snapshot` has no
+effect in lazy mode.
 
 `--target-mode skeleton` returns signature-only target implementations (useful
 when you plan to read the target files anyway). `--dedup-session` compacts
