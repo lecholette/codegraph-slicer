@@ -8,7 +8,7 @@ Ask a coding agent to change a method in a large repository and it can spend its
 
 Install the CLI and bundled skill, and your agent automatically checks repository structure before drowning in raw file reads. Small, straightforward tasks bypass slicing and go directly to the files; large monoliths and cross-package changes get structural context first—either from a fast local SQLite index (`sync` + `slice --db`) or immediately with zero upfront indexing via target-seeded lazy slicing (`slice --root .`).
 
-**`v0.3.13`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
+**`v0.3.14`** · Python 3.12+ · **Python, Java, TypeScript, and JavaScript** · Apache 2.0
 
 ---
 
@@ -32,7 +32,7 @@ Install the CLI and bundled skill, and your agent automatically checks repositor
 ### Step 1: Install the CLI (Python 3.12+)
 
 ```sh
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 ```
 
 ### Step 2: Install the Agent Skill (Pick Your Harness)
@@ -40,17 +40,17 @@ uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
 ```sh
 # Claude Code:
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 
 # Cursor (Global):
 mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Codex (User):
 mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -130,19 +130,19 @@ Requires **Python 3.12+** (`3.12`, `3.13`, or `3.14`) and **Git** (to install fr
 
 ```sh
 # With uv (recommended):
-uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+uv tool install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 
 # Or upgrade an existing uv tool installation:
-uv tool install --force "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+uv tool install --force "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 
 # Or with pip:
-python3 -m pip install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.13"
+python3 -m pip install "git+https://github.com/lecholette/codegraph-slicer.git@v0.3.14"
 ```
 
 Verify installation:
 
 ```sh
-codegraph-slicer --version   # codegraph-slicer 0.3.13
+codegraph-slicer --version   # codegraph-slicer 0.3.14
 codegraph-slicer --help
 ```
 
@@ -159,7 +159,7 @@ The bundled [`SKILL.md`](.claude/skills/codegraph-slicer/SKILL.md) teaches your 
 
 ```sh
 mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.claude/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -168,12 +168,12 @@ mkdir -p "$HOME/.claude/skills/codegraph-slicer" && \
 ```sh
 # Global user skill:
 mkdir -p "$HOME/.cursor/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.cursor/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
 mkdir -p .cursor/skills/codegraph-slicer && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o .cursor/skills/codegraph-slicer/SKILL.md
 ```
 
@@ -182,12 +182,12 @@ mkdir -p .cursor/skills/codegraph-slicer && \
 ```sh
 # User-scoped skill:
 mkdir -p "$HOME/.codex/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.codex/skills/codegraph-slicer/SKILL.md"
 
 # Or repository-scoped skill:
 mkdir -p .agents/skills/codegraph-slicer && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o .agents/skills/codegraph-slicer/SKILL.md
 ```
 
@@ -195,7 +195,7 @@ mkdir -p .agents/skills/codegraph-slicer && \
 
 ```sh
 mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.gemini/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -203,7 +203,7 @@ mkdir -p "$HOME/.gemini/skills/codegraph-slicer" && \
 
 ```sh
 mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.gemini/config/skills/codegraph-slicer/SKILL.md"
 ```
 
@@ -211,7 +211,7 @@ mkdir -p "$HOME/.gemini/config/skills/codegraph-slicer" && \
 
 ```sh
 mkdir -p "$HOME/.config/opencode/skills/codegraph-slicer" && \
-  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.13/.claude/skills/codegraph-slicer/SKILL.md" \
+  curl -fsSL "https://raw.githubusercontent.com/lecholette/codegraph-slicer/v0.3.14/.claude/skills/codegraph-slicer/SKILL.md" \
   -o "$HOME/.config/opencode/skills/codegraph-slicer/SKILL.md"
 ```
 

@@ -28,4 +28,10 @@ from .router import route_prompt as route_prompt
 from .store import GraphStore as GraphStore
 from .store import InvalidRevisionError as InvalidRevisionError
 
-__version__ = "0.3.13"
+from .source_provider import BlobCache as BlobCache
+from .source_provider import GitHubCliProvider as GitHubCliProvider
+from .source_provider import GitHubHttpProvider as GitHubHttpProvider
+from .source_provider import LocalGitProvider as LocalGitProvider
+from .source_provider import NoOpCache as NoOpCache
+
+__version__ = "0.3.14"
