@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Callable, Protocol
+from urllib.parse import quote
 
 from .ast_extractor import CodeGraphError, is_supported_source_path
 from .store import _iter_workspace_files, _should_skip_rel_path, git_env
@@ -94,6 +95,9 @@ class NoOpCache:
     def put_blob(self, key: str, data: bytes) -> None:
         return None
 
+    def delete_blob(self, key: str) -> None:
+        return None
+
 
 class BlobCache:
     """Disk-backed tree & blob cache with TTL expiration and LRU eviction."""
@@ -139,8 +143,12 @@ class BlobCache:
                 "CREATE TABLE IF NOT EXISTS trees ("
                 "cache_key TEXT PRIMARY KEY, "
                 "disk_rel TEXT NOT NULL, "
+                "size_bytes INTEGER NOT NULL DEFAULT 0, "
                 "created_at REAL NOT NULL)"
             )
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trees)").fetchall()}
+            if "size_bytes" not in cols:
+                conn.execute("ALTER TABLE trees ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0")
 
     def _tree_rel(self, owner: str, repo: str, commit: str) -> str:
         digest = hashlib.sha256(f"github.com/{owner}/{repo}/{commit}".encode("utf-8")).hexdigest()
@@ -173,23 +181,29 @@ class BlobCache:
                 return None
 
     def put_tree(self, owner: str, repo: str, commit: str, payload: dict) -> None:
+        raw_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw_bytes) > self.max_bytes:
+            return
         cache_key = f"github.com/{owner}/{repo}/{commit}"
         rel = self._tree_rel(owner, repo, commit)
         target = self.trees_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        try:
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-            tmp.replace(target)
-        finally:
-            tmp.unlink(missing_ok=True)
         now = self._clock()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_bytes(raw_bytes)
+                tmp.replace(target)
+            finally:
+                tmp.unlink(missing_ok=True)
             conn.execute(
-                "INSERT INTO trees(cache_key, disk_rel, created_at) VALUES(?,?,?) "
-                "ON CONFLICT(cache_key) DO UPDATE SET disk_rel=excluded.disk_rel, created_at=excluded.created_at",
-                (cache_key, rel, now),
+                "INSERT INTO trees(cache_key, disk_rel, size_bytes, created_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(cache_key) DO UPDATE SET disk_rel=excluded.disk_rel, "
+                "size_bytes=excluded.size_bytes, created_at=excluded.created_at",
+                (cache_key, rel, len(raw_bytes), now),
             )
+            self._evict_locked(conn, now)
 
     def get_blob(self, key: str) -> bytes | None:
         now = self._clock()
@@ -220,34 +234,67 @@ class BlobCache:
         rel = self._blob_rel(key)
         target = self.blobs_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-        try:
-            tmp.write_bytes(data)
-            tmp.replace(target)
-        finally:
-            tmp.unlink(missing_ok=True)
         now = self._clock()
         with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            tmp = target.with_name(f"{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+            try:
+                tmp.write_bytes(data)
+                tmp.replace(target)
+            finally:
+                tmp.unlink(missing_ok=True)
             conn.execute(
                 "INSERT INTO blobs(key, disk_rel, size_bytes, created_at, last_accessed_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(key) DO UPDATE SET disk_rel=excluded.disk_rel, "
                 "size_bytes=excluded.size_bytes, last_accessed_at=excluded.last_accessed_at",
                 (key, rel, len(data), now, now),
             )
-            self._evict_locked(conn)
+            self._evict_locked(conn, now)
 
-    def _evict_locked(self, conn: sqlite3.Connection) -> None:
-        total = conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM blobs").fetchone()[0]
-        if total <= self.max_bytes:
-            return
-        rows = conn.execute(
-            "SELECT key, disk_rel, size_bytes FROM blobs ORDER BY last_accessed_at ASC"
+    def delete_blob(self, key: str) -> None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT disk_rel FROM blobs WHERE key = ?", (key,)).fetchone()
+            if row is not None:
+                conn.execute("DELETE FROM blobs WHERE key = ?", (key,))
+                (self.blobs_dir / str(row["disk_rel"])).unlink(missing_ok=True)
+
+    def _evict_locked(self, conn: sqlite3.Connection, now: float) -> None:
+        expired_trees = conn.execute(
+            "SELECT cache_key, disk_rel FROM trees WHERE ? - created_at > ?",
+            (now, self.tree_ttl_seconds),
         ).fetchall()
-        for row in rows:
-            if total <= self.max_bytes:
-                break
+        for row in expired_trees:
+            conn.execute("DELETE FROM trees WHERE cache_key = ?", (row["cache_key"],))
+            (self.trees_dir / str(row["disk_rel"])).unlink(missing_ok=True)
+        expired_blobs = conn.execute(
+            "SELECT key, disk_rel FROM blobs WHERE ? - last_accessed_at > ?",
+            (now, self.blob_ttl_seconds),
+        ).fetchall()
+        for row in expired_blobs:
             conn.execute("DELETE FROM blobs WHERE key = ?", (row["key"],))
             (self.blobs_dir / str(row["disk_rel"])).unlink(missing_ok=True)
+
+        total = int(conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM blobs").fetchone()[0]) + int(
+            conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM trees").fetchone()[0]
+        )
+        if total <= self.max_bytes:
+            return
+        candidates = conn.execute(
+            "SELECT 'blob' AS kind, key AS id, disk_rel, size_bytes, last_accessed_at AS ts FROM blobs "
+            "UNION ALL "
+            "SELECT 'tree' AS kind, cache_key AS id, disk_rel, size_bytes, created_at AS ts FROM trees "
+            "ORDER BY ts ASC"
+        ).fetchall()
+        for row in candidates:
+            if total <= self.max_bytes:
+                break
+            if row["kind"] == "blob":
+                conn.execute("DELETE FROM blobs WHERE key = ?", (row["id"],))
+                (self.blobs_dir / str(row["disk_rel"])).unlink(missing_ok=True)
+            else:
+                conn.execute("DELETE FROM trees WHERE cache_key = ?", (row["id"],))
+                (self.trees_dir / str(row["disk_rel"])).unlink(missing_ok=True)
             total -= int(row["size_bytes"])
 
 
@@ -503,18 +550,29 @@ class LocalGitProvider:
             return out
         needle_bytes = needle.encode("utf-8")
         for path in _iter_workspace_files(self.root):
-            if not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(self.root):
-                rel = path.relative_to(self.root).as_posix()
-                if _should_skip_rel_path(PurePosixPath(rel).parts):
-                    continue
-                try:
-                    if needle_bytes in path.read_bytes():
-                        out.append(rel)
-                        if len(out) >= limit:
-                            break
-                except OSError:
-                    continue
+            entry = self._read_safe_workspace_bytes(path)
+            if entry is None:
+                continue
+            rel, raw_bytes = entry
+            if needle_bytes in raw_bytes:
+                out.append(rel)
+                if len(out) >= limit:
+                    break
         return out
+
+    def _read_safe_workspace_bytes(self, path: Path) -> tuple[str, bytes] | None:
+        if path.is_symlink() or not path.is_file():
+            return None
+        try:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(self.root):
+                return None
+            rel = path.relative_to(self.root).as_posix()
+            if _should_skip_rel_path(PurePosixPath(rel).parts):
+                return None
+            return rel, path.read_bytes()
+        except (OSError, ValueError):
+            return None
 
     def coverage_metadata(self) -> dict:
         meta: dict = {"provider": self.provider_name}
@@ -558,9 +616,12 @@ class GitHubCliProvider:
 
     def _run_gh(self, args: list[str]) -> str:
         cmd = ["gh", *args]
+        env = os.environ.copy()
+        env["GH_HOST"] = "github.com"
         try:
             res = subprocess.run(
                 cmd,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -580,7 +641,8 @@ class GitHubCliProvider:
     def resolve_ref(self) -> str:
         if self._commit is not None:
             return self._commit
-        out = self._run_gh(["api", f"repos/{self.owner}/{self.repo}/commits/{self.ref}", "--jq", ".sha"]).strip()
+        encoded_ref = quote(self.ref, safe="")
+        out = self._run_gh(["api", f"repos/{self.owner}/{self.repo}/commits/{encoded_ref}", "--jq", ".sha"]).strip()
         if not _SHA40_RE.fullmatch(out):
             raise CodeGraphError(f"gh api returned invalid commit SHA for {self.owner}/{self.repo}@{self.ref}: {out!r}")
         self._commit = out
@@ -662,7 +724,17 @@ class GitHubCliProvider:
             if rel_p in self._mem_blobs:
                 out[rel_p] = self._mem_blobs[rel_p]
                 continue
-            cached = self.cache.get_blob(self._blob_cache_key(commit, rel_p))
+            cache_key = self._blob_cache_key(commit, rel_p)
+            cached = self.cache.get_blob(cache_key)
+            if cached is not None:
+                expected_sha = self._blob_shas.get(rel_p)
+                if expected_sha and _SHA40_RE.fullmatch(expected_sha):
+                    actual_sha = hashlib.sha1(
+                        f"blob {len(cached)}\0".encode("ascii") + cached
+                    ).hexdigest()
+                    if actual_sha != expected_sha:
+                        self.cache.delete_blob(cache_key)
+                        cached = None
             if cached is not None:
                 self.cache_hits += 1
                 self._mem_blobs[rel_p] = cached

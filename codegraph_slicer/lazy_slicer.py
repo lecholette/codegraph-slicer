@@ -32,7 +32,6 @@ from .store import (
     GraphStore,
     _dedupe_analysis_symbols,
     _disambiguate_analysis,
-    _read_ts_or_js_config,
     _should_skip_rel_path,
 )
 
@@ -47,18 +46,63 @@ def _find_repo_files_index(provider: SourceProvider) -> dict[str, list[str]]:
     return by_suffix
 
 
+def _resolve_head_to_path(provider: SourceProvider, head: str) -> str | None:
+    """Resolve a dotted module/class head (e.g. pkg.mod or com.acme.Service) against provider."""
+    if not head or "/" in head or "\\" in head:
+        return None
+    rel_mod = head.replace(".", "/")
+    for pfx in ("", "src/"):
+        for suffix in (".py", "/__init__.py"):
+            cand = pfx + rel_mod + suffix
+            if provider.file_exists(cand):
+                return cand
+        for ext in TS_JS_EXTENSIONS:
+            for cand in (pfx + rel_mod + ext, pfx + rel_mod + f"/index{ext}"):
+                if provider.file_exists(cand):
+                    return cand
+    for pfx in (*_JAVA_ROOT_MARKERS, ""):
+        cand = f"{pfx}{rel_mod}.java"
+        if provider.file_exists(cand):
+            return cand
+    java_tail = f"{rel_mod}.java"
+    matches = [p for p in provider.list_files() if p == java_tail or p.endswith("/" + java_tail)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _anchor_seed_info(provider: SourceProvider, anchor: str) -> tuple[str | None, str]:
     """Return (direct_rel_path_or_None, search_needle) for an anchor string."""
     if ":" in anchor:
         head, tail = anchor.split(":", 1)
+        leaf = tail.split(".")[-1] if tail and not tail.isdigit() else ""
         if provider.file_exists(head):
-            return head, tail.split(".")[-1] if tail and not tail.isdigit() else ""
-        # module:qualname or dotted class
-        leaf = tail.split(".")[-1] if tail else head.split(".")[-1]
-        return None, leaf
+            return head, leaf
+        resolved = _resolve_head_to_path(provider, head)
+        if resolved:
+            return resolved, leaf
+        return None, tail.split(".")[-1] if tail else head.split(".")[-1]
     if provider.file_exists(anchor):
         return anchor, PurePosixPath(anchor).stem
     return None, anchor.split(".")[-1]
+
+
+def _read_ts_or_js_config_from_provider(provider: SourceProvider) -> bytes:
+    """Read tsconfig/jsconfig from the selected provider snapshot with tsconfig.base.json fallback."""
+    from .ts_extractor import parse_tsconfig_paths
+
+    candidates = [p for p in ("tsconfig.json", "tsconfig.base.json", "jsconfig.json") if provider.file_exists(p)]
+    if not candidates:
+        return b""
+    cfg_map = provider.read_files_batch(candidates)
+    for cfg_name in ("tsconfig.json", "tsconfig.base.json", "jsconfig.json"):
+        data = cfg_map.get(cfg_name)
+        if data is None:
+            continue
+        if cfg_name == "tsconfig.json" and not parse_tsconfig_paths(data):
+            base_data = cfg_map.get("tsconfig.base.json")
+            if base_data and parse_tsconfig_paths(base_data):
+                return base_data
+        return data
+    return b""
 
 
 def _java_source_prefixes(seed_paths: list[str]) -> list[str]:
@@ -173,13 +217,7 @@ def _populate_lazy_store(
     files_by_name = _find_repo_files_index(provider) if any(p.endswith(".java") for p in seed_paths) else {}
     java_prefixes = _java_source_prefixes(seed_paths)
 
-    if isinstance(provider, LocalGitProvider):
-        tsconfig_bytes = _read_ts_or_js_config(provider.root)
-    else:
-        cfg_map = provider.read_files_batch(
-            [p for p in ("tsconfig.json", "jsconfig.json") if provider.file_exists(p)]
-        )
-        tsconfig_bytes = cfg_map.get("tsconfig.json") or cfg_map.get("jsconfig.json") or b""
+    tsconfig_bytes = _read_ts_or_js_config_from_provider(provider)
     path_aliases = None
     if tsconfig_bytes:
         from .ts_extractor import parse_tsconfig_paths

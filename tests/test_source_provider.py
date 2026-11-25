@@ -32,16 +32,17 @@ def test_parse_github_repo_accepts_slug_and_urls() -> None:
 
 def test_blob_cache_roundtrip_ttl_and_lru_eviction(tmp_path: Path) -> None:
     now = 1_000_000.0
-    cache = BlobCache(tmp_path / "cache", max_bytes=20, clock=lambda: now)
+    tree_cache = BlobCache(tmp_path / "tree_cache", max_bytes=1024, clock=lambda: now)
 
-    cache.put_tree("acme", "svc", "a" * 40, {"paths": ["a.py"], "truncated": False})
-    assert cache.get_tree("acme", "svc", "a" * 40) == {"paths": ["a.py"], "truncated": False}
+    tree_cache.put_tree("acme", "svc", "a" * 40, {"paths": ["a.py"], "truncated": False})
+    assert tree_cache.get_tree("acme", "svc", "a" * 40) == {"paths": ["a.py"], "truncated": False}
 
     # Expire tree after 30 days
     now += 31 * 86400
-    assert cache.get_tree("acme", "svc", "a" * 40) is None
+    assert tree_cache.get_tree("acme", "svc", "a" * 40) is None
 
     # Blob LRU eviction under 20-byte budget
+    cache = BlobCache(tmp_path / "cache", max_bytes=20, clock=lambda: now)
     cache.put_blob("sha1", b"0123456789")  # 10 bytes
     now += 1
     cache.put_blob("sha2", b"abcdefghij")  # 10 bytes -> total 20
@@ -204,7 +205,7 @@ def test_github_cli_provider_skips_search_on_non_default_branch(tmp_path: Path, 
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        if cmd[:3] == ["gh", "api", "repos/acme/svc/commits/release/old"]:
+        if cmd[:3] == ["gh", "api", "repos/acme/svc/commits/release%2Fold"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=branch_sha + "\n", stderr="")
         if cmd[:3] == ["gh", "api", "repos/acme/svc/commits/HEAD"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=head_sha + "\n", stderr="")
@@ -273,3 +274,74 @@ def test_github_cli_provider_validates_graphql_errors_bytesize_sha1_and_timeout(
     p3 = GitHubCliProvider("acme/svc", ref="main", cache=BlobCache(tmp_path / "c3"), timeout=5.0)
     with pytest.raises(CodeGraphError, match="timed out"):
         p3.resolve_ref()
+
+
+def test_gh_provider_enforces_github_host_and_url_encodes_ref(tmp_path: Path, monkeypatch) -> None:
+    seen: list[tuple[list[str], str | None]] = []
+    commit = "d" * 40
+
+    def fake_run(cmd, **kwargs):
+        seen.append((list(cmd), (kwargs.get("env") or {}).get("GH_HOST")))
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{commit}\n", stderr="")
+
+    monkeypatch.setenv("GH_HOST", "ghe.internal.example")
+    monkeypatch.setattr("codegraph_slicer.source_provider.subprocess.run", fake_run)
+    p = GitHubCliProvider("acme/svc", ref="release#2/{repo}", cache=BlobCache(tmp_path / "c"))
+    assert p.resolve_ref() == commit
+    assert seen[0][1] == "github.com"
+    assert "commits/release%232%2F%7Brepo%7D" in seen[0][0][2]
+
+
+def test_gh_provider_invalidates_corrupted_cached_blob_and_refetches(tmp_path: Path, monkeypatch) -> None:
+    import hashlib
+
+    real_bytes = b"class A { int ok = 1; }\n"
+    real_sha = hashlib.sha1(f"blob {len(real_bytes)}\0".encode("ascii") + real_bytes).hexdigest()
+    commit = "e" * 40
+    cache = BlobCache(tmp_path / "cache")
+    cache.put_blob(f"git:{real_sha}", b"class A { int tampered = 2; }\n")
+
+    graphql_calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal graphql_calls
+        if "graphql" in cmd:
+            graphql_calls += 1
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=json.dumps(
+                    {"data": {"repository": {"f0": {"text": real_bytes.decode("utf-8"), "byteSize": len(real_bytes), "isBinary": False}}}}
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=json.dumps({"sha": commit, "truncated": False, "tree": [{"path": "A.java", "type": "blob", "sha": real_sha}]}),
+            stderr="",
+        )
+
+    monkeypatch.setattr("codegraph_slicer.source_provider.subprocess.run", fake_run)
+    p = GitHubCliProvider("acme/svc", ref=commit, cache=cache)
+    p.list_files()
+    files = p.read_files_batch(["A.java"])
+    assert files["A.java"] == real_bytes
+    assert graphql_calls == 1
+    assert cache.get_blob(f"git:{real_sha}") == real_bytes
+
+
+def test_blob_cache_accounts_for_tree_size_and_reclaims_expired_trees(tmp_path: Path) -> None:
+    now = 1000.0
+    cache = BlobCache(tmp_path / "cache", max_bytes=300, tree_ttl_seconds=10, clock=lambda: now)
+    for i in range(6):
+        cache.put_tree("acme", "svc", f"{i}" * 40, {"paths": [f"src/file_{i}_" + ("x" * 60) + ".py"]})
+    with cache._connect() as conn:
+        total_trees = conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM trees").fetchone()[0]
+    assert total_trees <= 300
+
+    now = 2000.0
+    cache.put_blob("git:" + "f" * 40, b"x" * 20)
+    with cache._connect() as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM trees").fetchone()[0]
+    assert remaining == 0

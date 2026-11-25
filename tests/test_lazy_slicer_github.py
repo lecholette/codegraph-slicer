@@ -8,7 +8,7 @@ import pytest
 
 from codegraph_slicer.cli import main
 from codegraph_slicer.lazy_slicer import lazy_slice_context
-from codegraph_slicer.source_provider import BlobCache, GitHubCliProvider
+from codegraph_slicer.source_provider import BlobCache, GitHubCliProvider, LocalGitProvider
 
 
 def _make_java_files() -> dict[str, str]:
@@ -206,3 +206,97 @@ def test_cli_source_mode_origin_mismatch_and_no_cache(tmp_path: Path, monkeypatc
     with pytest.raises(SystemExit, match="2"):
         main(["slice", "--repo", "acme/svc", "--no-cache", "--refresh-cache", "Service.java:Service.run"])
     capsys.readouterr()
+
+
+def test_cli_unknown_origin_rejected_in_local_and_falls_back_in_auto(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    plain_dir = tmp_path / "plain_dir"
+    plain_dir.mkdir()
+    (plain_dir / "a.py").write_text("def hello():\n    return 1\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="2"):
+        main(
+            [
+                "slice",
+                "--root",
+                str(plain_dir),
+                "--repo",
+                "acme/svc",
+                "--source-mode",
+                "local",
+                "a.py:hello",
+            ]
+        )
+    assert "no verifiable GitHub origin" in capsys.readouterr().err
+
+    files = _make_java_files()
+    commit = "f" * 40
+    _mock_gh_for_files(monkeypatch, files, commit)
+    monkeypatch.setenv("CODEGRAPH_SLICER_CACHE_DIR", str(tmp_path / "cache"))
+    rc = main(
+        [
+            "slice",
+            "--root",
+            str(plain_dir),
+            "--repo",
+            "acme/svc",
+            "--ref",
+            commit,
+            "--no-callers",
+            "com.acme.Service:Service.run",
+            "--format",
+            "json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["coverage"]["provider"] == "github_cli"
+    assert payload["sections"]["target_implementations"][0]["symbol"] == "com.acme.Service:Service.run"
+
+
+def test_pinned_local_tsconfig_uses_commit_snapshot_and_remote_uses_base(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repo = tmp_path / "ts_repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", str(repo)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+    (repo / "old").mkdir()
+    (repo / "new").mkdir()
+    (repo / "old" / "helper.ts").write_text("export function getVal() { return 1; }\n", encoding="utf-8")
+    (repo / "new" / "helper.ts").write_text("export function getVal() { return 2; }\n", encoding="utf-8")
+    (repo / "tsconfig.json").write_text(
+        json.dumps({"compilerOptions": {"baseUrl": ".", "paths": {"@h/*": ["old/*"]}}}),
+        encoding="utf-8",
+    )
+    (repo / "app.ts").write_text(
+        "import { getVal } from '@h/helper';\nexport function run() { return getVal(); }\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+
+    # Mutate working-tree tsconfig.json without committing
+    (repo / "tsconfig.json").write_text(
+        json.dumps({"compilerOptions": {"baseUrl": ".", "paths": {"@h/*": ["new/*"]}}}),
+        encoding="utf-8",
+    )
+    res_local = lazy_slice_context(repo, ["app.ts:run"], include_callers=False, provider=LocalGitProvider(repo, ref=sha))
+    syms_local = {d["symbol"] for d in res_local["sections"]["downstream_dependencies"]}
+    assert "old.helper:getVal" in syms_local
+    assert "new.helper:getVal" not in syms_local
+
+    # Remote snapshot with tsconfig.json extending tsconfig.base.json
+    remote_files = {
+        "tsconfig.json": '{"extends": "./tsconfig.base.json"}',
+        "tsconfig.base.json": '{"compilerOptions": {"baseUrl": ".", "paths": {"@h/*": ["old/*"]}}}',
+        "old/helper.ts": "export function getVal() { return 1; }\n",
+        "app.ts": "import { getVal } from '@h/helper';\nexport function run() { return getVal(); }\n",
+    }
+    _mock_gh_for_files(monkeypatch, remote_files, sha)
+    p = GitHubCliProvider("acme/svc", ref=sha, cache=BlobCache(tmp_path / "rcache"))
+    res_remote = lazy_slice_context(None, ["app.ts:run"], provider=p, include_callers=False)
+    assert any(d["symbol"] == "old.helper:getVal" for d in res_remote["sections"]["downstream_dependencies"])

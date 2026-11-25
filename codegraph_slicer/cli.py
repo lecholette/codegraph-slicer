@@ -1127,7 +1127,12 @@ def main(argv=None):
                     if args.repo:
                         expected_repo = parse_github_repo(args.repo)
                         origin_repo = local.origin_github_repo()
-                        if origin_repo is not None and origin_repo != expected_repo:
+                        if origin_repo is None:
+                            raise CodeGraphError(
+                                f"--root {args.root} has no verifiable GitHub origin matching "
+                                f"{expected_repo[0]}/{expected_repo[1]}"
+                            )
+                        if origin_repo != expected_repo:
                             raise CodeGraphError(
                                 f"--root {args.root} origin {origin_repo[0]}/{origin_repo[1]} "
                                 f"does not match --repo {expected_repo[0]}/{expected_repo[1]}"
@@ -1135,16 +1140,18 @@ def main(argv=None):
                     provider = local
                 elif args.repo:
                     if args.root and Path(args.root).is_dir():
-                        local = LocalGitProvider(args.root, ref=args.ref)
                         expected_repo = parse_github_repo(args.repo)
-                        origin_repo = local.origin_github_repo()
-                        if origin_repo is not None and origin_repo != expected_repo:
+                        origin_repo = LocalGitProvider(args.root).origin_github_repo()
+                        if origin_repo is None:
+                            provider = _make_remote_provider()
+                        elif origin_repo != expected_repo:
                             raise CodeGraphError(
                                 f"--root {args.root} origin {origin_repo[0]}/{origin_repo[1]} "
                                 f"does not match --repo {expected_repo[0]}/{expected_repo[1]}; "
                                 "pass --source-mode remote to slice from GitHub"
                             )
-                        provider = local
+                        else:
+                            provider = LocalGitProvider(args.root, ref=args.ref)
                     else:
                         provider = _make_remote_provider()
                 else:
